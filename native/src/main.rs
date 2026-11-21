@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use convert_to_it_native::{convert_batch, OutputFormat};
+use convert_to_it_native::{convert_batch, supported_input_extensions, OutputFormat};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use rfd::FileDialog;
 
@@ -1484,13 +1484,9 @@ impl ConvertApp {
     }
 
     fn pick_files(&mut self) {
+        let extensions = supported_input_extensions();
         if let Some(files) = FileDialog::new()
-            .add_filter(
-                "Supported files",
-                &[
-                    "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "txt", "csv", "json", "zip",
-                ],
-            )
+            .add_filter("Supported files", extensions.as_slice())
             .pick_files()
         {
             self.add_files(files);

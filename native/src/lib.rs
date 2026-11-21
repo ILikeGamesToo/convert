@@ -9,6 +9,9 @@ use std::{
 use image::ImageEncoder;
 use thiserror::Error;
 
+mod input_extensions;
+pub use input_extensions::supported_input_extensions;
+
 const MAX_ARCHIVE_ENTRY_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 65_536;
@@ -794,44 +797,16 @@ fn unsupported(extension: &str, target: OutputFormat) -> ConvertError {
     }
 }
 
-fn is_raster_extension(extension: &str) -> bool {
-    matches!(
-        extension,
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "webp"
-            | "gif"
-            | "bmp"
-            | "tif"
-            | "tiff"
-            | "ico"
-            | "pnm"
-            | "pbm"
-            | "pgm"
-            | "ppm"
-            | "pam"
-            | "tga"
-            | "qoi"
-            | "hdr"
-            | "ff"
-            | "dds"
-    )
-}
-
 fn is_image_input_extension(extension: &str) -> bool {
-    is_raster_extension(extension) || extension == "svg"
+    input_extensions::IMAGE_INPUT_EXTENSIONS.contains(&extension)
 }
 
 fn is_data_extension(extension: &str) -> bool {
-    matches!(extension, "txt" | "csv" | "json" | "yaml" | "yml" | "toml")
+    input_extensions::DATA_INPUT_EXTENSIONS.contains(&extension)
 }
 
 fn is_audio_extension(extension: &str) -> bool {
-    matches!(
-        extension,
-        "wav" | "mp3" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "mp4" | "alac"
-    )
+    input_extensions::AUDIO_INPUT_EXTENSIONS.contains(&extension)
 }
 
 fn encode_image(
@@ -1936,5 +1911,53 @@ mod tests {
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
         assert!(OutputFormat::ExtractTarGz.supports_input("backup.tar.gz"));
         assert!(!OutputFormat::ExtractGzip.supports_input("backup.tar.gz"));
+    }
+
+    #[test]
+    fn file_picker_extensions_stay_in_sync_with_conversion_inputs() {
+        let extensions = supported_input_extensions();
+        let unique: std::collections::HashSet<_> = extensions.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            extensions.len(),
+            "the file picker lists a duplicate extension"
+        );
+
+        for extension in &extensions {
+            assert_eq!(
+                *extension,
+                extension.to_ascii_lowercase().as_str(),
+                "file picker extensions must be lowercase"
+            );
+            assert!(
+                OutputFormat::ALL
+                    .iter()
+                    .any(|format| format.supports_input(&format!("sample.{extension}"))),
+                "the file picker offers .{extension}, but no output format accepts it"
+            );
+        }
+
+        for format in OutputFormat::ALL.iter() {
+            if matches!(
+                *format,
+                OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip
+            ) {
+                continue;
+            }
+            assert!(
+                extensions
+                    .iter()
+                    .any(|extension| format.supports_input(&format!("sample.{extension}"))),
+                "{} has no input extension in the file picker",
+                format.label()
+            );
+        }
+
+        for extension in ["ogg", "m4a", "svg", "gz", "tar", "tar.gz", "tgz"] {
+            assert!(
+                extensions.contains(&extension),
+                "the file picker is missing .{extension}"
+            );
+        }
     }
 }
