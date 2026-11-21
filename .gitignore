@@ -8,3 +8,5 @@ release
 cache.json
 built
 dist-electron
+# Updated 2026-11-11 for native Rust build output.
+/native/target/

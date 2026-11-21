@@ -1,5 +1,8 @@
 # [Convert to it!](https://convert.to.it/)
 
+> This README was updated on 2026-11-11 to document the native Rust desktop rewrite.
+> The existing browser and Electron application remains available while native format coverage grows.
+
 **Truly universal online file converter.**
 
 Many online file conversion tools are **boring** and **insecure**. They only allow conversion between two formats in the same medium (images to images, videos to videos, etc.), and they require that you _upload your files to some server_.
@@ -18,6 +21,31 @@ For a semi-technical overview of this tool, check out the video: https://youtu.b
 4. Press "Next" and select your output format.
 5. Click **Convert**!
 6. Hopefully, after a bit (or a lot) of thinking, the program will spit out the file you wanted. If not, see the "Issues" section below.
+
+## Native Rust desktop app (in progress)
+
+The repository is being migrated toward a cross-platform native Rust desktop app. Everything runs on-device and offline: no file ever leaves the computer, and no conversion needs a network connection. The native build currently offers 33 output formats:
+
+- **Images:** PNG, JPEG, WebP, GIF, BMP, single-page TIFF, ICO, PPM/PNM, TGA, QOI, Radiance HDR, and Farbfeld. Inputs also include DDS and SVG (SVG is rasterized with the system fonts available on the machine).
+- **Text:** plain text plus UTF-8/16/32 encodings, following the behavior of the repository's `textEncoding` handler.
+- **Data:** CSV, JSON, YAML, and TOML, with conversion between them.
+- **Audio:** WAV and FLAC output from WAV, MP3, FLAC, OGG, M4A, and AAC input.
+- **Archives:** ZIP, TAR, TAR.GZ, and GZIP creation and extraction.
+
+The existing browser/Electron app remains the full-coverage reference until its remaining format handlers have been ported. Its interface embeds the Inter Variable font; see [`native/assets/OFL.txt`](native/assets/OFL.txt) for its license.
+
+To run the native app, install the Rust stable toolchain and use:
+
+```bash
+cd native
+cargo run --release
+```
+
+On Windows, the native app uses the GUI subsystem so the release `.exe` opens without a terminal window. If PowerShell cannot find `cargo`, add `%USERPROFILE%\.cargo\bin` to `PATH` or invoke Cargo by its full path.
+
+Converted files are saved to the user's `Downloads` folder by default (or the app's working directory if `Downloads` is unavailable). Change the destination from **App settings**.
+
+Run its conversion tests with `cargo test` from the `native/` directory. Format coverage will be expanded in stages; the native app does not yet replace the full existing converter.
 
 ## Issues
 
