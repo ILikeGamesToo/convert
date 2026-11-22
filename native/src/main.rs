@@ -313,6 +313,9 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Tiff
         | OutputFormat::Ico
         | OutputFormat::Ppm
+        | OutputFormat::Pbm
+        | OutputFormat::Pgm
+        | OutputFormat::Pam
         | OutputFormat::Tga
         | OutputFormat::Qoi
         | OutputFormat::Hdr
@@ -328,7 +331,9 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         OutputFormat::Csv | OutputFormat::Json | OutputFormat::Yaml | OutputFormat::Toml => {
             FormatCategory::Data
         }
-        OutputFormat::Wav | OutputFormat::Flac => FormatCategory::Audio,
+        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au => {
+            FormatCategory::Audio
+        }
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip => {
             FormatCategory::Archive
         }
@@ -345,6 +350,9 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Tiff => "TIFF",
         OutputFormat::Ico => "ICO",
         OutputFormat::Ppm => "PPM",
+        OutputFormat::Pbm => "PBM",
+        OutputFormat::Pgm => "PGM",
+        OutputFormat::Pam => "PAM",
         OutputFormat::Tga => "TGA",
         OutputFormat::Qoi => "QOI",
         OutputFormat::Hdr => "HDR",
@@ -363,6 +371,8 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Toml => "TOML",
         OutputFormat::Wav => "WAV",
         OutputFormat::Flac => "FLAC",
+        OutputFormat::Aiff => "AIFF",
+        OutputFormat::Au => "AU",
         OutputFormat::Zip => "ZIP",
         OutputFormat::Tar => "TAR",
         OutputFormat::TarGz => "TAR.GZ",
@@ -380,6 +390,9 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Tiff => "TIFF image",
         OutputFormat::Ico => "Windows icon",
         OutputFormat::Ppm => "Portable pixmap image",
+        OutputFormat::Pbm => "Portable bitmap image",
+        OutputFormat::Pgm => "Portable graymap image",
+        OutputFormat::Pam => "Portable anymap image",
         OutputFormat::Tga => "Truevision TGA image",
         OutputFormat::Qoi => "Quite OK Image",
         OutputFormat::Hdr => "Radiance HDR image",
@@ -398,6 +411,8 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Toml => "TOML data",
         OutputFormat::Wav => "WAV audio",
         OutputFormat::Flac => "FLAC audio",
+        OutputFormat::Aiff => "AIFF audio",
+        OutputFormat::Au => "AU audio",
         OutputFormat::Zip => "ZIP archive",
         OutputFormat::Tar => "TAR archive",
         OutputFormat::TarGz => "Gzipped TAR archive",
@@ -493,7 +508,7 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
         OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
             options.archive_compression.is_some()
         }
-        OutputFormat::Wav | OutputFormat::Flac => {
+        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au => {
             options.audio_sample_rate.is_some() || options.audio_channels.is_some()
         }
         OutputFormat::Pdf => {
@@ -1156,7 +1171,7 @@ impl ConvertApp {
                     ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
                 );
             }
-            OutputFormat::Wav | OutputFormat::Flac => {
+            OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au => {
                 settings_section_heading(ui, "Audio", None);
                 ui.add_space(10.0);
                 optional_sample_rate(ui, &mut self.conversion_options.audio_sample_rate);
@@ -3223,6 +3238,9 @@ mod tests {
                 OutputFormat::Tiff,
                 OutputFormat::Ico,
                 OutputFormat::Ppm,
+                OutputFormat::Pbm,
+                OutputFormat::Pgm,
+                OutputFormat::Pam,
                 OutputFormat::Tga,
                 OutputFormat::Qoi,
                 OutputFormat::Hdr,
@@ -3272,6 +3290,9 @@ mod tests {
             OutputFormat::Tiff,
             OutputFormat::Ico,
             OutputFormat::Ppm,
+            OutputFormat::Pbm,
+            OutputFormat::Pgm,
+            OutputFormat::Pam,
             OutputFormat::Tga,
             OutputFormat::Qoi,
             OutputFormat::Hdr,
@@ -3349,6 +3370,8 @@ mod tests {
         let expected = [
             OutputFormat::Wav,
             OutputFormat::Flac,
+            OutputFormat::Aiff,
+            OutputFormat::Au,
             OutputFormat::Zip,
             OutputFormat::Tar,
             OutputFormat::TarGz,
@@ -3359,6 +3382,8 @@ mod tests {
             InputFormat::Flac,
             InputFormat::Ogg,
             InputFormat::M4a,
+            InputFormat::Aiff,
+            InputFormat::Video,
         ] {
             assert_eq!(available_targets(Some(input)), expected);
         }
@@ -3398,6 +3423,8 @@ mod tests {
             [
                 OutputFormat::Wav,
                 OutputFormat::Flac,
+                OutputFormat::Aiff,
+                OutputFormat::Au,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
@@ -3420,6 +3447,8 @@ mod tests {
         assert_eq!(choices.first(), Some(&InputFormat::Any));
         assert!(choices.len() > 1);
         assert!(choices.contains(&InputFormat::Mp3));
+        assert!(choices.contains(&InputFormat::Aiff));
+        assert!(choices.contains(&InputFormat::Video));
         assert!(!choices.contains(&InputFormat::Mixed));
     }
 

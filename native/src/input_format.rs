@@ -31,13 +31,15 @@ pub enum InputFormat {
     Ogg,
     M4a,
     Aac,
+    Aiff,
+    Video,
     Archive,
     Any,
     Mixed,
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 27] = [
+    pub const SELECTABLE: [Self; 29] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -64,6 +66,8 @@ impl InputFormat {
         Self::Ogg,
         Self::M4a,
         Self::Aac,
+        Self::Aiff,
+        Self::Video,
         Self::Archive,
     ];
 
@@ -92,8 +96,10 @@ impl InputFormat {
             Self::Mp3 => "MP3 audio",
             Self::Flac => "FLAC audio",
             Self::Ogg => "OGG audio",
-            Self::M4a => "M4A/MP4 audio",
+            Self::M4a => "M4A audio",
             Self::Aac => "AAC audio",
+            Self::Aiff => "AIFF audio",
+            Self::Video => "Video",
             Self::Archive => "Archive file",
             Self::Any => "Any file",
             Self::Mixed => "Mixed formats",
@@ -125,8 +131,10 @@ impl InputFormat {
             Self::Mp3 => "MPEG audio",
             Self::Flac => "Free Lossless Audio Codec",
             Self::Ogg => "Ogg audio",
-            Self::M4a => "M4A, MP4, or ALAC audio",
+            Self::M4a => "M4A or ALAC audio",
             Self::Aac => "Advanced Audio Coding",
+            Self::Aiff => "Audio Interchange File Format",
+            Self::Video => "MP4, MOV, MKV, or WebM with an audio track",
             Self::Archive => "ZIP, TAR, TAR.GZ, or GZIP; archive creation only",
             Self::Any | Self::Mixed => "Archive creation only",
         }
@@ -159,6 +167,8 @@ impl InputFormat {
             Self::Ogg => "OGG",
             Self::M4a => "M4A",
             Self::Aac => "AAC",
+            Self::Aiff => "AIFF",
+            Self::Video => "VIDEO",
             Self::Archive => "ARCHIVE",
             Self::Any => "ANY",
             Self::Mixed => "MIXED",
@@ -192,6 +202,8 @@ impl InputFormat {
             Self::Ogg => "ogg",
             Self::M4a => "m4a",
             Self::Aac => "aac",
+            Self::Aiff => "aiff",
+            Self::Video => "mp4",
             Self::Archive => "zip",
             Self::Any | Self::Mixed => return None,
         })
@@ -294,8 +306,10 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "mp3" => InputFormat::Mp3,
         "flac" => InputFormat::Flac,
         "ogg" | "oga" => InputFormat::Ogg,
-        "m4a" | "mp4" | "alac" => InputFormat::M4a,
+        "m4a" | "alac" => InputFormat::M4a,
         "aac" => InputFormat::Aac,
+        "aiff" | "aif" => InputFormat::Aiff,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" => InputFormat::Video,
         "zip" | "tar" | "gz" | "tgz" => InputFormat::Archive,
         _ => return None,
     })
@@ -356,7 +370,13 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
         return Some(InputFormat::Mp3);
     }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        return Some(InputFormat::M4a);
+        return Some(match &bytes[8..12] {
+            b"M4A " | b"M4B " | b"M4P " => InputFormat::M4a,
+            _ => InputFormat::Video,
+        });
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"FORM") && &bytes[8..12] == b"AIFF" {
+        return Some(InputFormat::Aiff);
     }
     if bytes.starts_with(&[0x1f, 0x8b]) {
         return Some(InputFormat::Archive);
@@ -437,7 +457,13 @@ mod tests {
             ("song.oga", InputFormat::Ogg),
             ("song.m4a", InputFormat::M4a),
             ("song.aac", InputFormat::Aac),
-            ("song.mp4", InputFormat::M4a),
+            ("song.aiff", InputFormat::Aiff),
+            ("song.aif", InputFormat::Aiff),
+            ("movie.mp4", InputFormat::Video),
+            ("movie.m4v", InputFormat::Video),
+            ("movie.mov", InputFormat::Video),
+            ("movie.mkv", InputFormat::Video),
+            ("movie.webm", InputFormat::Video),
             ("song.alac", InputFormat::M4a),
             ("archive.zip", InputFormat::Archive),
             ("archive.tar", InputFormat::Archive),
@@ -478,6 +504,12 @@ mod tests {
 
         let mp4 = b"\0\0\0\x18ftypM4A ";
         assert_eq!(detect_from_bytes("mystery.bin", mp4), InputFormat::M4a);
+
+        let video = b"\0\0\0\x18ftypisom";
+        assert_eq!(detect_from_bytes("mystery.bin", video), InputFormat::Video);
+
+        let aiff = b"FORM\0\0\0\0AIFFCOMM";
+        assert_eq!(detect_from_bytes("mystery.bin", aiff), InputFormat::Aiff);
     }
 
     #[test]

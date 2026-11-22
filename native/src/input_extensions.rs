@@ -9,9 +9,11 @@ pub const IMAGE_INPUT_EXTENSIONS: &[&str] = &[
 /// Text and data extensions accepted by the conversion engine.
 pub const DATA_INPUT_EXTENSIONS: &[&str] = &["txt", "csv", "json", "yaml", "yml", "toml"];
 
-/// Audio extensions accepted by the conversion engine.
+/// Audio extensions accepted by the conversion engine, including video
+/// containers whose audio track can be extracted.
 pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
-    "wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "mp4", "alac",
+    "wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "mp4", "m4v", "mov", "mkv", "webm", "alac",
+    "aiff", "aif",
 ];
 
 /// Every non-archive extension accepted by the conversion engine, for the

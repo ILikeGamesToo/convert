@@ -27,6 +27,9 @@ pub enum OutputFormat {
     Tiff,
     Ico,
     Ppm,
+    Pbm,
+    Pgm,
+    Pam,
     Tga,
     Qoi,
     Hdr,
@@ -45,6 +48,8 @@ pub enum OutputFormat {
     Toml,
     Wav,
     Flac,
+    Aiff,
+    Au,
     Zip,
     Tar,
     TarGz,
@@ -200,7 +205,7 @@ impl ConversionOptions {
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 35] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -209,6 +214,9 @@ impl OutputFormat {
         Self::Tiff,
         Self::Ico,
         Self::Ppm,
+        Self::Pbm,
+        Self::Pgm,
+        Self::Pam,
         Self::Tga,
         Self::Qoi,
         Self::Hdr,
@@ -227,6 +235,8 @@ impl OutputFormat {
         Self::Toml,
         Self::Wav,
         Self::Flac,
+        Self::Aiff,
+        Self::Au,
         Self::Zip,
         Self::Tar,
         Self::TarGz,
@@ -243,6 +253,9 @@ impl OutputFormat {
             Self::Tiff => "TIFF image",
             Self::Ico => "ICO icon",
             Self::Ppm => "PPM image",
+            Self::Pbm => "PBM image",
+            Self::Pgm => "PGM image",
+            Self::Pam => "PAM image",
             Self::Tga => "TGA image",
             Self::Qoi => "QOI image",
             Self::Hdr => "Radiance HDR image",
@@ -261,6 +274,8 @@ impl OutputFormat {
             Self::Toml => "TOML",
             Self::Wav => "WAV audio",
             Self::Flac => "FLAC audio",
+            Self::Aiff => "AIFF audio",
+            Self::Au => "AU audio",
             Self::Zip => "ZIP archive",
             Self::Tar => "TAR archive",
             Self::TarGz => "TAR.GZ archive",
@@ -277,7 +292,7 @@ impl OutputFormat {
             Self::Bmp => Some(image::ImageFormat::Bmp),
             Self::Tiff => Some(image::ImageFormat::Tiff),
             Self::Ico => Some(image::ImageFormat::Ico),
-            Self::Ppm => Some(image::ImageFormat::Pnm),
+            Self::Ppm | Self::Pbm | Self::Pgm | Self::Pam => Some(image::ImageFormat::Pnm),
             Self::Tga => Some(image::ImageFormat::Tga),
             Self::Qoi => Some(image::ImageFormat::Qoi),
             Self::Hdr => Some(image::ImageFormat::Hdr),
@@ -296,6 +311,9 @@ impl OutputFormat {
             Self::Tiff => "tiff",
             Self::Ico => "ico",
             Self::Ppm => "ppm",
+            Self::Pbm => "pbm",
+            Self::Pgm => "pgm",
+            Self::Pam => "pam",
             Self::Tga => "tga",
             Self::Qoi => "qoi",
             Self::Hdr => "hdr",
@@ -314,6 +332,8 @@ impl OutputFormat {
             Self::Toml => "toml",
             Self::Wav => "wav",
             Self::Flac => "flac",
+            Self::Aiff => "aiff",
+            Self::Au => "au",
             Self::Zip => "zip",
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
@@ -333,6 +353,9 @@ impl OutputFormat {
             | Self::Tiff
             | Self::Ico
             | Self::Ppm
+            | Self::Pbm
+            | Self::Pgm
+            | Self::Pam
             | Self::Tga
             | Self::Qoi
             | Self::Hdr
@@ -347,7 +370,7 @@ impl OutputFormat {
             | Self::TextUtf16Be
             | Self::TextUtf32Le
             | Self::TextUtf32Be => extension == "txt",
-            Self::Wav | Self::Flac => is_audio_extension(&extension),
+            Self::Wav | Self::Flac | Self::Aiff | Self::Au => is_audio_extension(&extension),
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
         }
     }
@@ -462,7 +485,7 @@ pub fn convert_bytes_with_options(
         }]);
     }
 
-    if let Some(format) = target.image_format() {
+    if target.image_format().is_some() {
         if !is_image_input_extension(&extension) {
             return Err(unsupported(&extension, target));
         }
@@ -471,14 +494,17 @@ pub fn convert_bytes_with_options(
         } else {
             image::load_from_memory(input)?
         };
-        let bytes = encode_image(image, format, options)?;
+        let bytes = encode_image(image, target, options)?;
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
             bytes,
         }]);
     }
 
-    if matches!(target, OutputFormat::Wav | OutputFormat::Flac) {
+    if matches!(
+        target,
+        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au
+    ) {
         if !is_audio_extension(&extension) {
             return Err(unsupported(&extension, target));
         }
@@ -486,6 +512,8 @@ pub fn convert_bytes_with_options(
         let bytes = match target {
             OutputFormat::Wav => encode_wav(&audio)?,
             OutputFormat::Flac => encode_flac(&audio)?,
+            OutputFormat::Aiff => encode_aiff(&audio)?,
+            OutputFormat::Au => encode_au(&audio)?,
             _ => unreachable!("only audio targets reach this branch"),
         };
         return Ok(vec![ConvertedFile {
@@ -881,22 +909,18 @@ fn is_audio_extension(extension: &str) -> bool {
 
 fn encode_image(
     image: image::DynamicImage,
-    format: image::ImageFormat,
+    target: OutputFormat,
     options: ConversionOptions,
 ) -> Result<Vec<u8>, ConvertError> {
-    if format == image::ImageFormat::Pnm {
-        let image = image.to_rgb8();
-        let mut output = Cursor::new(Vec::new());
-        let encoder = image::codecs::pnm::PnmEncoder::new(&mut output).with_subtype(
-            image::codecs::pnm::PnmSubtype::Pixmap(image::codecs::pnm::SampleEncoding::Binary),
-        );
-        encoder.write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgb8,
-        )?;
-        return Ok(output.into_inner());
+    let format = target
+        .image_format()
+        .expect("encode_image is only called for image targets");
+
+    if matches!(
+        target,
+        OutputFormat::Ppm | OutputFormat::Pbm | OutputFormat::Pgm | OutputFormat::Pam
+    ) {
+        return encode_pnm_image(image, target);
     }
 
     let image = match format {
@@ -942,6 +966,67 @@ fn encode_image(
         image.write_with_encoder(encoder)?;
     } else {
         image.write_to(&mut output, format)?;
+    }
+    Ok(output.into_inner())
+}
+
+fn encode_pnm_image(
+    image: image::DynamicImage,
+    target: OutputFormat,
+) -> Result<Vec<u8>, ConvertError> {
+    use image::codecs::pnm::{PnmEncoder, PnmSubtype, SampleEncoding};
+
+    let mut output = Cursor::new(Vec::new());
+    match target {
+        OutputFormat::Ppm => {
+            let image = image.to_rgb8();
+            PnmEncoder::new(&mut output)
+                .with_subtype(PnmSubtype::Pixmap(SampleEncoding::Binary))
+                .write_image(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::Rgb8,
+                )?;
+        }
+        OutputFormat::Pbm => {
+            let image = image.to_luma8();
+            let bits: Vec<u8> = image
+                .pixels()
+                .map(|pixel| u8::from(pixel[0] >= 128))
+                .collect();
+            PnmEncoder::new(&mut output)
+                .with_subtype(PnmSubtype::Bitmap(SampleEncoding::Binary))
+                .write_image(
+                    &bits,
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::L8,
+                )?;
+        }
+        OutputFormat::Pgm => {
+            let image = image.to_luma8();
+            PnmEncoder::new(&mut output)
+                .with_subtype(PnmSubtype::Graymap(SampleEncoding::Binary))
+                .write_image(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::L8,
+                )?;
+        }
+        OutputFormat::Pam => {
+            let image = image.to_rgba8();
+            PnmEncoder::new(&mut output)
+                .with_subtype(PnmSubtype::ArbitraryMap)
+                .write_image(
+                    image.as_raw(),
+                    image.width(),
+                    image.height(),
+                    image::ExtendedColorType::Rgba8,
+                )?;
+        }
+        _ => unreachable!("only PNM-family targets reach this helper"),
     }
     Ok(output.into_inner())
 }
@@ -1360,10 +1445,74 @@ fn encode_wav(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     output.extend_from_slice(b"data");
     output.extend_from_slice(&data_size.to_le_bytes());
     for sample in &audio.samples {
-        let value = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-        output.extend_from_slice(&value.to_le_bytes());
+        output.extend_from_slice(&sample_to_i16(*sample).to_le_bytes());
     }
     Ok(output)
+}
+
+fn encode_aiff(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+    let channels = u16::try_from(audio.channels).map_err(|_| ConvertError::AudioTooLarge)?;
+    let usable_samples = audio.samples.len() - audio.samples.len() % audio.channels;
+    let frames =
+        u32::try_from(usable_samples / audio.channels).map_err(|_| ConvertError::AudioTooLarge)?;
+    let data_size = u32::try_from(usable_samples * 2).map_err(|_| ConvertError::AudioTooLarge)?;
+    let form_size = 46_u32
+        .checked_add(data_size)
+        .ok_or(ConvertError::AudioTooLarge)?;
+
+    let mut output = Vec::with_capacity(54 + data_size as usize);
+    output.extend_from_slice(b"FORM");
+    output.extend_from_slice(&form_size.to_be_bytes());
+    output.extend_from_slice(b"AIFF");
+    output.extend_from_slice(b"COMM");
+    output.extend_from_slice(&18_u32.to_be_bytes());
+    output.extend_from_slice(&channels.to_be_bytes());
+    output.extend_from_slice(&frames.to_be_bytes());
+    output.extend_from_slice(&16_u16.to_be_bytes());
+    output.extend_from_slice(&extended_sample_rate(audio.sample_rate));
+    output.extend_from_slice(b"SSND");
+    output.extend_from_slice(&(8 + data_size).to_be_bytes());
+    output.extend_from_slice(&0_u32.to_be_bytes());
+    output.extend_from_slice(&0_u32.to_be_bytes());
+    for sample in &audio.samples[..usable_samples] {
+        output.extend_from_slice(&sample_to_i16(*sample).to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn extended_sample_rate(sample_rate: u32) -> [u8; 10] {
+    if sample_rate == 0 {
+        return [0; 10];
+    }
+    let exponent = 31 - sample_rate.leading_zeros();
+    let mantissa = u64::from(sample_rate) << (63 - exponent);
+    let biased_exponent = (exponent + 16_383) as u16;
+    let mut bytes = [0; 10];
+    bytes[..2].copy_from_slice(&biased_exponent.to_be_bytes());
+    bytes[2..].copy_from_slice(&mantissa.to_be_bytes());
+    bytes
+}
+
+fn encode_au(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+    let channels = u32::try_from(audio.channels).map_err(|_| ConvertError::AudioTooLarge)?;
+    let usable_samples = audio.samples.len() - audio.samples.len() % audio.channels;
+    let data_size = u32::try_from(usable_samples * 2).map_err(|_| ConvertError::AudioTooLarge)?;
+
+    let mut output = Vec::with_capacity(24 + data_size as usize);
+    output.extend_from_slice(b".snd");
+    output.extend_from_slice(&24_u32.to_be_bytes());
+    output.extend_from_slice(&data_size.to_be_bytes());
+    output.extend_from_slice(&3_u32.to_be_bytes());
+    output.extend_from_slice(&audio.sample_rate.to_be_bytes());
+    output.extend_from_slice(&channels.to_be_bytes());
+    for sample in &audio.samples[..usable_samples] {
+        output.extend_from_slice(&sample_to_i16(*sample).to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn sample_to_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
 }
 
 fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
@@ -1373,7 +1522,7 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     let usable_samples = audio.samples.len() - audio.samples.len() % audio.channels;
     let integer_samples: Vec<i32> = audio.samples[..usable_samples]
         .iter()
-        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i32)
+        .map(|sample| i32::from(sample_to_i16(*sample)))
         .collect();
 
     let config = flacenc::config::Encoder::default()
@@ -2097,6 +2246,33 @@ mod tests {
     }
 
     #[test]
+    fn converts_png_to_pnm_variants() {
+        for (target, extension, magic) in [
+            (OutputFormat::Pbm, "pbm", &b"P4"[..]),
+            (OutputFormat::Pgm, "pgm", &b"P5"[..]),
+            (OutputFormat::Pam, "pam", &b"P7"[..]),
+        ] {
+            let converted = convert_bytes("sample.png", &png_fixture(), target).unwrap();
+            assert_eq!(
+                converted[0].name,
+                PathBuf::from(format!("sample.{extension}"))
+            );
+            assert!(
+                converted[0].bytes.starts_with(magic),
+                "{extension} output is missing its magic number"
+            );
+            let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2, 2));
+            if target == OutputFormat::Pbm {
+                assert!(
+                    decoded.to_luma8().pixels().all(|pixel| pixel[0] == 0),
+                    "dark pixels should stay black in a PBM"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rasterizes_svg_images_to_raster_formats() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#ff0000"/></svg>"##;
         let result = convert_bytes("icon.svg", svg, OutputFormat::Png).unwrap();
@@ -2354,6 +2530,61 @@ mod tests {
     }
 
     #[test]
+    fn converts_wav_audio_to_aiff_and_au() {
+        let wav = wav_fixture();
+        let original = parse_wav(&wav);
+
+        let aiff = convert_bytes("tone.wav", &wav, OutputFormat::Aiff).unwrap();
+        assert_eq!(aiff[0].name, PathBuf::from("tone.aiff"));
+        assert_eq!(&aiff[0].bytes[0..4], b"FORM");
+        assert_eq!(&aiff[0].bytes[8..12], b"AIFF");
+        let back = convert_bytes("tone.aiff", &aiff[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.sample_rate, original.sample_rate);
+        assert_eq!(decoded.channels, original.channels);
+        assert_eq!(decoded.samples, original.samples);
+        assert_audible(&decoded.samples);
+
+        let au = convert_bytes("tone.wav", &wav, OutputFormat::Au).unwrap();
+        assert_eq!(au[0].name, PathBuf::from("tone.au"));
+        assert_eq!(&au[0].bytes[0..4], b".snd");
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[4..8].try_into().unwrap()),
+            24
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[8..12].try_into().unwrap()) as usize,
+            au[0].bytes.len() - 24
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[12..16].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[16..20].try_into().unwrap()),
+            original.sample_rate
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[20..24].try_into().unwrap()),
+            u32::from(original.channels)
+        );
+        let au_samples: Vec<i16> = au[0].bytes[24..]
+            .chunks_exact(2)
+            .map(|bytes| i16::from_be_bytes([bytes[0], bytes[1]]))
+            .collect();
+        assert_eq!(au_samples, original.samples);
+    }
+
+    #[test]
+    fn writes_the_aiff_extended_sample_rate() {
+        assert_eq!(
+            super::extended_sample_rate(44_100),
+            [0x40, 0x0e, 0xac, 0x44, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(super::extended_sample_rate(0), [0; 10]);
+    }
+
+    #[test]
     fn applies_audio_sample_rate_and_channel_options() {
         let wav = wav_fixture();
 
@@ -2513,6 +2744,24 @@ mod tests {
     }
 
     #[test]
+    fn extracts_audio_from_a_video_container() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-video.mp4");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("sample-video.mp4", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.channels, 1);
+        assert!(
+            parsed.samples.len() >= 100_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
     fn decodes_flac_with_an_id3_tag() {
         let wav = wav_fixture();
         let flac = convert_bytes("tone.wav", &wav, OutputFormat::Flac).unwrap();
@@ -2530,6 +2779,9 @@ mod tests {
         assert!(OutputFormat::Hdr.supports_input("photo.dds"));
         assert!(OutputFormat::Wav.supports_input("song.mp3"));
         assert!(OutputFormat::Flac.supports_input("song.m4a"));
+        assert!(OutputFormat::Aiff.supports_input("song.aiff"));
+        assert!(OutputFormat::Wav.supports_input("movie.mkv"));
+        assert!(OutputFormat::Pbm.supports_input("photo.png"));
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
     }
 
