@@ -24,13 +24,14 @@ For a semi-technical overview of this tool, check out the video: https://youtu.b
 
 ## Native Rust desktop app (in progress)
 
-The repository is being migrated toward a cross-platform native Rust desktop app. Everything runs on-device and offline: no file ever leaves the computer, and no conversion needs a network connection. The native build currently offers 33 output formats:
+The repository is being migrated toward a cross-platform native Rust desktop app. Everything runs on-device and offline: no file ever leaves the computer, and no conversion needs a network connection. The native build currently offers 30 output formats:
 
 - **Images:** PNG, JPEG, WebP, GIF, BMP, single-page TIFF, ICO, PPM/PNM, TGA, QOI, Radiance HDR, and Farbfeld. Inputs also include DDS and SVG (SVG is rasterized with the system fonts available on the machine).
+- **Documents:** PDF, from images (one page per image) and plain text. Text is laid out on A4 pages with the built-in Courier font, mirroring the website's `textToPdf` handler.
 - **Text:** plain text plus UTF-8/16/32 encodings, following the behavior of the repository's `textEncoding` handler.
 - **Data:** CSV, JSON, YAML, and TOML, with conversion between them.
 - **Audio:** WAV and FLAC output from WAV, MP3, FLAC, OGG, M4A, and AAC input.
-- **Archives:** ZIP, TAR, TAR.GZ, and GZIP creation and extraction.
+- **Archives:** ZIP, TAR, TAR.GZ, and GZIP creation only. Archive files are not extracted; they can be selected through "All files" when creating a new archive.
 
 The existing browser/Electron app remains the full-coverage reference until its remaining format handlers have been ported. Its interface embeds the Inter Variable font; see [`native/assets/OFL.txt`](native/assets/OFL.txt) for its license.
 
