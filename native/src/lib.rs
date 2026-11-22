@@ -1120,7 +1120,12 @@ fn load_image(
 }
 
 /// Reads the EXIF orientation tag from JPEG, TIFF, or PNG (`eXIf`) input.
+///
+/// A duplicated orientation tag is ambiguous, so it is ignored rather than
+/// picking one and potentially rotating the image the wrong way. The same is
+/// true of a missing or malformed tag; callers then leave the pixels alone.
 fn exif_orientation(input: &[u8]) -> Option<u16> {
+    let mut orientations = Vec::new();
     if input.starts_with(&[0xFF, 0xD8]) {
         let mut position = 2;
         while position + 4 <= input.len() {
@@ -1141,43 +1146,64 @@ fn exif_orientation(input: &[u8]) -> Option<u16> {
                 break;
             }
             if marker == 0xE1 {
-                let segment = input.get(position + 4..position + 2 + length)?;
-                if let Some(tiff) = segment.strip_prefix(b"Exif\0\0") {
-                    if let Some(orientation) = tiff_orientation(tiff) {
-                        return Some(orientation);
+                if let Some(segment) = input.get(position + 4..position + 2 + length) {
+                    if let Some(tiff) = segment.strip_prefix(b"Exif\0\0") {
+                        orientations.extend(tiff_orientations(tiff));
                     }
                 }
             }
-            position += 2 + length;
+            position = match position.checked_add(2 + length) {
+                Some(next) => next,
+                None => break,
+            };
         }
-        return None;
-    }
-    if input.starts_with(b"II*\0") || input.starts_with(b"MM\0*") {
-        return tiff_orientation(input);
-    }
-    if input.starts_with(b"\x89PNG\r\n\x1a\n") {
+    } else if input.starts_with(b"II*\0") || input.starts_with(b"MM\0*") {
+        orientations.extend(tiff_orientations(input));
+    } else if input.starts_with(b"\x89PNG\r\n\x1a\n") {
         let mut position = 8;
         while position + 8 <= input.len() {
-            let length =
-                u32::from_be_bytes(input[position..position + 4].try_into().ok()?) as usize;
-            let kind = &input[position + 4..position + 8];
-            let body = input.get(position + 8..position + 8 + length)?;
+            let length = match input.get(position..position + 4) {
+                Some(bytes) => u32::from_be_bytes(bytes.try_into().ok()?) as usize,
+                None => break,
+            };
+            let kind = match input.get(position + 4..position + 8) {
+                Some(kind) => kind,
+                None => break,
+            };
+            let body_start = position + 8;
+            let body_end = match body_start.checked_add(length) {
+                Some(end) => end,
+                None => break,
+            };
+            let body = match input.get(body_start..body_end) {
+                Some(body) => body,
+                None => break,
+            };
             if kind == b"eXIf" {
-                return tiff_orientation(body);
+                orientations.extend(tiff_orientations(body));
             }
             if kind == b"IEND" {
                 break;
             }
-            position = position.checked_add(12 + length)?;
+            position = match position.checked_add(12 + length) {
+                Some(next) => next,
+                None => break,
+            };
         }
     }
-    None
+    match orientations.as_slice() {
+        [orientation] => Some(*orientation),
+        _ => None,
+    }
 }
 
-fn tiff_orientation(tiff: &[u8]) -> Option<u16> {
+/// Collects every orientation tag from the TIFF IFD chain. Returning all of
+/// them lets the caller distinguish one unambiguous tag from duplicates.
+fn tiff_orientations(tiff: &[u8]) -> Vec<u16> {
     let little = tiff.starts_with(b"II");
+    let mut orientations = Vec::new();
     if !little && !tiff.starts_with(b"MM") {
-        return None;
+        return orientations;
     }
     let read16 = |position: usize| -> Option<u16> {
         let bytes = tiff.get(position..position + 2)?.try_into().ok()?;
@@ -1195,15 +1221,45 @@ fn tiff_orientation(tiff: &[u8]) -> Option<u16> {
             u32::from_be_bytes(bytes)
         })
     };
-    let ifd = read32(4)? as usize;
-    let entries = read16(ifd)? as usize;
-    for index in 0..entries {
-        let entry = ifd + 2 + index * 12;
-        if read16(entry)? == 0x0112 {
-            return read16(entry + 8);
+    let mut ifd = match read32(4) {
+        Some(ifd) => ifd as usize,
+        None => return orientations,
+    };
+    // The IFD chain is normally short. A cap also makes a malicious cycle
+    // terminate instead of allocating forever.
+    for _ in 0..16 {
+        if ifd == 0 {
+            break;
         }
+        let entries = match read16(ifd) {
+            Some(entries) => usize::from(entries),
+            None => break,
+        };
+        let entries_end = match ifd.checked_add(2).and_then(|start| {
+            entries
+                .checked_mul(12)
+                .and_then(|size| start.checked_add(size))
+        }) {
+            Some(end) => end,
+            None => break,
+        };
+        for index in 0..entries {
+            let entry = ifd + 2 + index * 12;
+            if read16(entry) == Some(0x0112)
+                && read16(entry + 2) == Some(3)
+                && read32(entry + 4) == Some(1)
+            {
+                if let Some(value) = read16(entry + 8) {
+                    orientations.push(value);
+                }
+            }
+        }
+        ifd = match read32(entries_end) {
+            Some(next) => next as usize,
+            None => break,
+        };
     }
-    None
+    orientations
 }
 
 fn apply_orientation(image: image::DynamicImage, orientation: u16) -> image::DynamicImage {
@@ -7815,6 +7871,132 @@ mod tests {
         }
     }
 
+    fn tiff_with_orientations(orientations: &[u16]) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&(orientations.len() as u16).to_le_bytes());
+        for orientation in orientations {
+            tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+            tiff.extend_from_slice(&3_u16.to_le_bytes());
+            tiff.extend_from_slice(&1_u32.to_le_bytes());
+            tiff.extend_from_slice(&orientation.to_le_bytes());
+            tiff.extend_from_slice(&[0, 0]);
+        }
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+        tiff
+    }
+
+    fn jpeg_with_exif_orientations(image: &image::DynamicImage, orientations: &[u16]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut cursor,
+                100,
+            ))
+            .unwrap();
+        let jpeg = cursor.into_inner();
+        let mut result = jpeg[..2].to_vec();
+        let tiff = tiff_with_orientations(orientations);
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(&tiff);
+        result.extend_from_slice(&[0xFF, 0xE1]);
+        result.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        result.extend_from_slice(&segment);
+        result.extend_from_slice(&jpeg[2..]);
+        result
+    }
+
+    fn assert_rgb_near(actual: [u8; 3], expected: [u8; 3], tolerance: u8, label: &str) {
+        for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                actual.abs_diff(expected) <= tolerance,
+                "{label}: channel {channel} got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn exif_orientation_rotates_corners_and_ignores_duplicate_or_invalid_tags() {
+        let mut source = image::RgbImage::new(16, 16);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = match (x < 8, y < 8) {
+                (true, true) => image::Rgb([255, 0, 0]),
+                (false, true) => image::Rgb([0, 255, 0]),
+                (true, false) => image::Rgb([0, 0, 255]),
+                (false, false) => image::Rgb([255, 255, 0]),
+            };
+        }
+        let source = image::DynamicImage::ImageRgb8(source);
+
+        let oriented = jpeg_with_exif_orientations(&source, &[6]);
+        assert_eq!(super::exif_orientation(&oriented), Some(6));
+        let converted = convert_bytes("photo.jpg", &oriented, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (16, 16));
+        let pixels = decoded.to_rgb8();
+        assert_rgb_near(pixels.get_pixel(4, 4).0, [0, 0, 255], 35, "top-left");
+        assert_rgb_near(pixels.get_pixel(12, 4).0, [255, 0, 0], 35, "top-right");
+        assert_rgb_near(pixels.get_pixel(4, 12).0, [255, 255, 0], 35, "bottom-left");
+        assert_rgb_near(pixels.get_pixel(12, 12).0, [0, 255, 0], 35, "bottom-right");
+
+        let plain = jpeg_with_exif_orientations(&source, &[]);
+        assert_eq!(super::exif_orientation(&plain), None);
+        let plain = image::load_from_memory(
+            &convert_bytes("plain.jpg", &plain, OutputFormat::Png).unwrap()[0].bytes,
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_rgb_near(plain.get_pixel(4, 4).0, [255, 0, 0], 35, "plain top-left");
+
+        let invalid = jpeg_with_exif_orientations(&source, &[9]);
+        assert_eq!(super::exif_orientation(&invalid), Some(9));
+        let invalid = image::load_from_memory(
+            &convert_bytes("invalid.jpg", &invalid, OutputFormat::Png).unwrap()[0].bytes,
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_rgb_near(
+            invalid.get_pixel(4, 4).0,
+            [255, 0, 0],
+            35,
+            "invalid top-left",
+        );
+
+        let duplicate = jpeg_with_exif_orientations(&source, &[6, 6]);
+        assert_eq!(super::exif_orientation(&duplicate), None);
+        let duplicate = image::load_from_memory(
+            &convert_bytes("duplicate.jpg", &duplicate, OutputFormat::Png).unwrap()[0].bytes,
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_rgb_near(
+            duplicate.get_pixel(4, 4).0,
+            [255, 0, 0],
+            35,
+            "duplicate top-left",
+        );
+
+        let disabled = convert_bytes_with_options(
+            "photo.jpg",
+            &oriented,
+            OutputFormat::Png,
+            ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let disabled = image::load_from_memory(&disabled[0].bytes).unwrap();
+        assert_eq!((disabled.width(), disabled.height()), (16, 16));
+        assert_rgb_near(
+            disabled.to_rgb8().get_pixel(4, 4).0,
+            [255, 0, 0],
+            35,
+            "disabled top-left",
+        );
+    }
+
     #[test]
     fn applies_exif_orientation_when_loading_images() {
         let mut image = image::RgbImage::new(2, 1);
@@ -7899,6 +8081,90 @@ mod tests {
             .unwrap()
             .to_rgb8();
         assert_eq!(decoded.get_pixel(0, 0).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn composites_transparency_into_jpeg_and_bmp_with_two_backgrounds() {
+        let mut rgba = image::RgbaImage::new(16, 8);
+        for (x, _, pixel) in rgba.enumerate_pixels_mut() {
+            *pixel = if x < 8 {
+                image::Rgba([255, 0, 0, 0])
+            } else {
+                image::Rgba([10, 200, 30, 255])
+            };
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        for background in [[0, 0, 255], [12, 34, 56]] {
+            for (target, format, tolerance) in [
+                (OutputFormat::Jpeg, image::ImageFormat::Jpeg, 25),
+                (OutputFormat::Bmp, image::ImageFormat::Bmp, 0),
+            ] {
+                let converted = convert_bytes_with_options(
+                    "clear.png",
+                    &png,
+                    target,
+                    ConversionOptions {
+                        image_background: background,
+                        jpeg_quality: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let decoded = image::load_from_memory_with_format(&converted[0].bytes, format)
+                    .unwrap()
+                    .to_rgb8();
+                assert_eq!((decoded.width(), decoded.height()), (16, 8));
+                assert_rgb_near(
+                    decoded.get_pixel(2, 4).0,
+                    background,
+                    tolerance,
+                    "transparent area",
+                );
+                assert_rgb_near(
+                    decoded.get_pixel(13, 4).0,
+                    [10, 200, 30],
+                    tolerance,
+                    "opaque area",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn animated_gif_converts_to_a_single_frame() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+
+        let mut gif = Vec::new();
+        let mut encoder = GifEncoder::new(&mut gif);
+        encoder.set_repeat(Repeat::Infinite).unwrap();
+        encoder
+            .encode_frames([
+                image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    2,
+                    image::Rgba([255, 0, 0, 255]),
+                )),
+                image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    2,
+                    image::Rgba([0, 0, 255, 255]),
+                )),
+            ])
+            .unwrap();
+        drop(encoder);
+
+        let converted = convert_bytes("animated.gif", &gif, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        let pixel = decoded.to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            pixel[0] > 200 && pixel[2] < 60,
+            "the first GIF frame was not retained: {pixel:?}"
+        );
     }
 
     #[test]
