@@ -5626,6 +5626,59 @@ mod tests {
     }
 
     #[test]
+    fn default_track_matches_explicit_first_in_buffered_and_streaming_paths() {
+        let name = "sample-two-opus-tracks.webm";
+        let input = fixture(name);
+        let path = fixture_path(name);
+
+        let default = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+        let first = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(default[0].bytes, first[0].bytes);
+        assert_ne!(default[0].bytes, second[0].bytes);
+        assert_eq!(parse_wav(&default[0].bytes).samples.len(), 48_000);
+        assert_eq!(parse_wav(&second[0].bytes).samples.len(), 48_480);
+
+        let default_stream = stream_wav(&path, ConversionOptions::default());
+        let first_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        );
+        let second_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(default_stream, first_stream);
+        assert_ne!(default_stream, second_stream);
+        assert_eq!(parse_wav(&default_stream).samples.len(), 48_000);
+        assert_eq!(parse_wav(&second_stream).samples.len(), 48_480);
+    }
+
+    #[test]
     fn decodes_ac3_and_eac3_audio() {
         for (name, codec) in [
             ("sample-ac3.ac3", "AC-3"),

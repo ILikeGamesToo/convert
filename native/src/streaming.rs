@@ -163,29 +163,60 @@ fn matroska_discard_padding_from_path(path: &Path, track_id: u32) -> Option<u64>
             if value <= 0 {
                 continue;
             }
-            // The padding belongs to the Block in the same BlockGroup. Find
-            // the nearest preceding Block and check its track number so a
-            // multi-track file does not trim the wrong language.
+            // The padding belongs to the Block in its enclosing BlockGroup.
+            // Looking for the nearest preceding Block is not enough: with
+            // interleaved tracks that can be a Block from another language.
             let search_start = position.saturating_sub(1024 * 1024);
-            for block in (search_start..position).rev() {
-                if tail[block] != 0xA1 {
+            for group_start in (search_start..position).rev() {
+                if tail[group_start] != 0xA0 {
                     continue;
                 }
-                let mut block_cursor = block + 1;
-                let Some((block_size, _)) = read_ebml_vint(&tail, &mut block_cursor, 8, false)
+                let mut group_cursor = group_start + 1;
+                let Some((group_size, _)) = read_ebml_vint(&tail, &mut group_cursor, 8, false)
                 else {
                     continue;
                 };
-                let payload_start = block_cursor;
-                let Some((block_track, _)) = read_ebml_vint(&tail, &mut block_cursor, 8, false)
-                else {
+                let group_end = group_cursor.saturating_add(group_size as usize);
+                if group_end <= position || group_end > tail.len() {
                     continue;
-                };
-                if block_size >= 4
-                    && payload_start + block_size as usize <= tail.len()
-                    && block_track == u64::from(track_id)
-                {
-                    return Some(value as u64);
+                }
+                let mut block_track = None;
+                let mut group_padding = None;
+                while group_cursor < group_end {
+                    let Some((child_id, child_size)) = read_ebml_element(&tail, &mut group_cursor)
+                    else {
+                        break;
+                    };
+                    let Some(child_size) = child_size else {
+                        break;
+                    };
+                    let child_start = group_cursor;
+                    let Some(child_end) = child_start.checked_add(child_size as usize) else {
+                        break;
+                    };
+                    if child_end > group_end {
+                        break;
+                    }
+                    if child_id == 0xA1 {
+                        let mut block_cursor = child_start;
+                        if let Some((block_track_value, _)) =
+                            read_ebml_vint(&tail, &mut block_cursor, 8, false)
+                        {
+                            block_track = Some(block_track_value);
+                        }
+                    } else if child_id == 0x75A2 {
+                        if let Some(value) = read_ebml_signed(&tail, child_start, child_size) {
+                            if value > 0 {
+                                group_padding = Some(value as u64);
+                            }
+                        }
+                    }
+                    group_cursor = child_end;
+                }
+                if block_track == Some(u64::from(track_id)) {
+                    if let Some(value) = group_padding {
+                        return Some(value);
+                    }
                 }
             }
         }
