@@ -13,8 +13,11 @@ use std::{
     time::Duration,
 };
 
+mod input_format;
+
 use convert_to_it_native::{convert_batch, supported_input_extensions, OutputFormat};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
+use input_format::{common_format, detect, InputFormat};
 use rfd::FileDialog;
 
 const BG: Color32 = Color32::from_rgb(25, 25, 25);
@@ -221,6 +224,11 @@ fn rounded_rect_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
 #[derive(Default)]
 struct ConvertApp {
     inputs: Vec<PathBuf>,
+    input_formats: Vec<InputFormat>,
+    input_format_override: Option<InputFormat>,
+    show_input_format_picker: bool,
+    input_format_search: String,
+    input_format_show_all: bool,
     page: AppPage,
     file_scroll_offset: f32,
     output_directory: Option<PathBuf>,
@@ -296,14 +304,9 @@ fn format_category(format: OutputFormat) -> FormatCategory {
             FormatCategory::Data
         }
         OutputFormat::Wav | OutputFormat::Flac => FormatCategory::Audio,
-        OutputFormat::Zip
-        | OutputFormat::ExtractZip
-        | OutputFormat::Tar
-        | OutputFormat::ExtractTar
-        | OutputFormat::TarGz
-        | OutputFormat::ExtractTarGz
-        | OutputFormat::Gzip
-        | OutputFormat::ExtractGzip => FormatCategory::Archive,
+        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip => {
+            FormatCategory::Archive
+        }
     }
 }
 
@@ -335,13 +338,9 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Wav => "WAV",
         OutputFormat::Flac => "FLAC",
         OutputFormat::Zip => "ZIP",
-        OutputFormat::ExtractZip => "UNZIP",
         OutputFormat::Tar => "TAR",
-        OutputFormat::ExtractTar => "UNTAR",
         OutputFormat::TarGz => "TAR.GZ",
-        OutputFormat::ExtractTarGz => "UNTGZ",
         OutputFormat::Gzip => "GZ",
-        OutputFormat::ExtractGzip => "UNGZ",
     }
 }
 
@@ -373,28 +372,31 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Wav => "WAV audio",
         OutputFormat::Flac => "FLAC audio",
         OutputFormat::Zip => "ZIP archive",
-        OutputFormat::ExtractZip => "Extract ZIP archive",
         OutputFormat::Tar => "TAR archive",
-        OutputFormat::ExtractTar => "Extract TAR archive",
         OutputFormat::TarGz => "Gzipped TAR archive",
-        OutputFormat::ExtractTarGz => "Extract TAR.GZ archive",
         OutputFormat::Gzip => "GZIP compressed file",
-        OutputFormat::ExtractGzip => "Extract GZIP file",
     }
 }
 
-fn available_targets(inputs: &[PathBuf]) -> Vec<OutputFormat> {
-    if inputs.is_empty() {
-        return OutputFormat::ALL.to_vec();
-    }
+const ARCHIVE_TARGETS: [OutputFormat; 4] = [
+    OutputFormat::Zip,
+    OutputFormat::Tar,
+    OutputFormat::TarGz,
+    OutputFormat::Gzip,
+];
 
+fn available_targets(input_format: Option<InputFormat>) -> Vec<OutputFormat> {
+    let Some(input_format) = input_format else {
+        return OutputFormat::ALL.to_vec();
+    };
+    let Some(extension) = input_format.canonical_extension() else {
+        return ARCHIVE_TARGETS.to_vec();
+    };
+
+    let sample = format!("sample.{extension}");
     OutputFormat::ALL
         .into_iter()
-        .filter(|target| {
-            inputs
-                .iter()
-                .all(|path| target.supports_input(file_name(path)))
-        })
+        .filter(|target| target.supports_input(&sample))
         .collect()
 }
 
@@ -680,8 +682,154 @@ impl ConvertApp {
                     }
                 });
         }
+        self.show_input_format_dialog(context);
         self.show_help_modal(context);
         self.show_conversion_notice(context);
+    }
+
+    fn effective_input_format(&self) -> Option<InputFormat> {
+        if self.inputs.is_empty() {
+            return None;
+        }
+        Some(
+            self.input_format_override
+                .unwrap_or_else(|| common_format(&self.input_formats)),
+        )
+    }
+
+    fn detected_input_format(&self) -> Option<InputFormat> {
+        if self.inputs.is_empty() {
+            return None;
+        }
+        let detected = common_format(&self.input_formats);
+        (!matches!(detected, InputFormat::Any | InputFormat::Mixed)).then_some(detected)
+    }
+
+    fn open_input_format_picker(&mut self) {
+        self.input_format_search.clear();
+        self.input_format_show_all = self.input_format_override.is_some();
+        self.show_input_format_picker = true;
+    }
+
+    fn input_format_choices(&self) -> Vec<InputFormat> {
+        let detected = self.detected_input_format();
+        if self.input_format_show_all || detected.is_none() {
+            InputFormat::SELECTABLE.to_vec()
+        } else {
+            detected.into_iter().collect()
+        }
+    }
+
+    fn detected_input_label(&self) -> &'static str {
+        match common_format(&self.input_formats) {
+            InputFormat::Any => "Unknown format",
+            InputFormat::Mixed => InputFormat::Mixed.label(),
+            format => format.label(),
+        }
+    }
+
+    fn choose_input_format(&mut self, format: InputFormat) {
+        self.input_format_override = if self.effective_input_format() == Some(format) {
+            None
+        } else {
+            Some(format)
+        };
+        self.target = None;
+        self.show_input_format_picker = false;
+    }
+
+    fn show_input_format_dialog(&mut self, context: &egui::Context) {
+        if !self.show_input_format_picker {
+            return;
+        }
+
+        let detected = self.detected_input_format();
+        let detected_label = self.detected_input_label();
+        let effective = self.effective_input_format();
+        let current_override = self.input_format_override;
+        let using = current_override.or_else(|| match effective {
+            Some(InputFormat::Any | InputFormat::Mixed) => effective,
+            _ => None,
+        });
+        let mut open = true;
+        let mut selected = None;
+
+        egui::Window::new("Input format")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.label(format!("Detected: {detected_label}"));
+                if let Some(format) = using {
+                    ui.label(format!("Using: {}", format.label()));
+                }
+                ui.horizontal(|ui| {
+                    if current_override.is_none() && detected.is_some() {
+                        if self.input_format_show_all {
+                            if ui.button("Show matching only").clicked() {
+                                self.input_format_show_all = false;
+                            }
+                        } else if ui.button("Show all input formats").clicked() {
+                            self.input_format_show_all = true;
+                        }
+                    }
+                    if current_override.is_some() && ui.button("Auto-detect").clicked() {
+                        self.input_format_override = None;
+                        self.target = None;
+                    }
+                });
+
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.input_format_search)
+                        .hint_text("Search input formats..."),
+                );
+                ui.add_space(6.0);
+
+                let term = self.input_format_search.trim().to_ascii_lowercase();
+                let formats: Vec<_> = self
+                    .input_format_choices()
+                    .into_iter()
+                    .filter(|format| format.matches_search(&term))
+                    .collect();
+
+                if formats.is_empty() {
+                    ui.label(RichText::new("No matching input formats.").color(MUTED));
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("input-format-grid")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    for format in formats {
+                                        let selected_format = self.input_format_override
+                                            == Some(format)
+                                            || (self.input_format_override.is_none()
+                                                && effective == Some(format));
+                                        if ui
+                                            .selectable_label(selected_format, format.label())
+                                            .clicked()
+                                        {
+                                            selected = Some(format);
+                                        }
+                                        ui.label(
+                                            RichText::new(format.description())
+                                                .size(11.0)
+                                                .color(FOOTER_TEXT),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            });
+
+        self.show_input_format_picker = open;
+        if let Some(format) = selected {
+            self.choose_input_format(format);
+        }
     }
 
     fn show_help_modal(&mut self, context: &egui::Context) {
@@ -879,29 +1027,17 @@ impl ConvertApp {
             |ui| {
                 ui.set_width(width);
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                let targets = available_targets(&self.inputs);
+                let input_format = self.effective_input_format();
+                let targets = available_targets(input_format);
                 ui.add_space(20.0);
 
-                let source_label = self
-                    .inputs
-                    .first()
-                    .and_then(|path| path.extension())
-                    .map(|extension| {
-                        format!(".{}", extension.to_string_lossy().to_ascii_uppercase())
-                    })
-                    .unwrap_or_else(|| "ANY FILE".to_owned());
-                let source_is_image = self
-                    .inputs
-                    .first()
-                    .and_then(|path| path.extension())
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| {
-                        matches!(
-                            extension.to_ascii_lowercase().as_str(),
-                            "png" | "jpg" | "jpeg" | "webp"
-                        )
-                    })
-                    .unwrap_or(false);
+                let source_format = input_format.unwrap_or(InputFormat::Any);
+                let source_label = if self.inputs.is_empty() {
+                    "ANY FILE".to_owned()
+                } else {
+                    source_format.extension_label().to_owned()
+                };
+                let source_is_image = source_format.is_image();
                 let row_height = 51.0;
                 let source_width = 148.0;
                 let output_width = 190.0;
@@ -936,6 +1072,35 @@ impl ConvertApp {
                     bold_font(14.0),
                     TEXT,
                 );
+                if !self.inputs.is_empty() && self.conversion_result.is_none() {
+                    let chevron = egui::pos2(source.right() - 14.0, source.center().y);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(chevron.x - 3.5, chevron.y - 2.0),
+                            egui::pos2(chevron.x + 3.5, chevron.y - 2.0),
+                            egui::pos2(chevron.x, chevron.y + 2.0),
+                        ],
+                        MUTED,
+                        Stroke::NONE,
+                    ));
+                    let source_response = ui.interact(
+                        source,
+                        ui.make_persistent_id("input-format-source"),
+                        egui::Sense::click(),
+                    );
+                    if source_response.hovered() {
+                        painter.rect_stroke(
+                            source,
+                            egui::CornerRadius::same(8),
+                            Stroke::new(1.0_f32, PRIMARY),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if source_response.clicked() {
+                        self.open_input_format_picker();
+                    }
+                    let _ = source_response.on_hover_text("Change input format");
+                }
                 paint_arrow_right(
                     painter,
                     egui::pos2(source.right() + gap + arrow_width * 0.5, row.center().y),
@@ -1397,10 +1562,14 @@ impl ConvertApp {
 
         if let Some(index) = remove_index {
             self.inputs.remove(index);
+            self.input_formats.remove(index);
+            self.input_format_override = None;
+            self.input_format_search.clear();
+            self.input_format_show_all = false;
+            self.show_input_format_picker = false;
+            self.target = None;
             if self.inputs.is_empty() {
                 self.return_to_upload();
-            } else {
-                self.target = None;
             }
         }
     }
@@ -1408,6 +1577,11 @@ impl ConvertApp {
     fn return_to_upload(&mut self) {
         self.page = AppPage::Upload;
         self.inputs.clear();
+        self.input_formats.clear();
+        self.input_format_override = None;
+        self.input_format_search.clear();
+        self.input_format_show_all = false;
+        self.show_input_format_picker = false;
         self.file_scroll_offset = 0.0;
         self.target = None;
         self.status = None;
@@ -1487,6 +1661,7 @@ impl ConvertApp {
         let extensions = supported_input_extensions();
         if let Some(files) = FileDialog::new()
             .add_filter("Supported files", extensions.as_slice())
+            .add_filter("All files", &["*"])
             .pick_files()
         {
             self.add_files(files);
@@ -1497,6 +1672,7 @@ impl ConvertApp {
         let mut added = false;
         for file in files {
             if file.is_file() && !self.inputs.contains(&file) {
+                self.input_formats.push(detect(&file));
                 self.inputs.push(file);
                 added = true;
             }
@@ -1504,6 +1680,10 @@ impl ConvertApp {
         if added {
             self.page = AppPage::Conversion;
             self.target = None;
+            self.input_format_override = None;
+            self.input_format_search.clear();
+            self.input_format_show_all = false;
+            self.show_input_format_picker = false;
             self.search_filter.clear();
             self.selected_category = None;
             self.status = None;
@@ -2189,7 +2369,7 @@ mod tests {
     #[test]
     fn image_files_only_offer_supported_image_and_archive_outputs() {
         assert_eq!(
-            available_targets(&[PathBuf::from("sample.webp")]),
+            available_targets(Some(InputFormat::Webp)),
             [
                 OutputFormat::Png,
                 OutputFormat::Jpeg,
@@ -2214,7 +2394,7 @@ mod tests {
     #[test]
     fn text_files_offer_the_encodings_supported_by_the_web_handler() {
         assert_eq!(
-            available_targets(&[PathBuf::from("sample.txt")]),
+            available_targets(Some(InputFormat::Text)),
             [
                 OutputFormat::Text,
                 OutputFormat::TextUtf8NoBom,
@@ -2255,20 +2435,33 @@ mod tests {
             OutputFormat::TarGz,
             OutputFormat::Gzip,
         ];
-        for input in ["photo.bmp", "photo.tif", "photo.tiff"] {
-            assert_eq!(available_targets(&[PathBuf::from(input)]), expected);
+        for input in [InputFormat::Bmp, InputFormat::Tiff] {
+            assert_eq!(available_targets(Some(input)), expected);
         }
     }
 
     #[test]
     fn conversion_page_lists_all_formats_when_no_file_is_selected() {
-        assert_eq!(available_targets(&[]), OutputFormat::ALL);
+        assert_eq!(available_targets(None), OutputFormat::ALL);
+    }
+
+    #[test]
+    fn unknown_files_only_offer_archive_outputs() {
+        assert_eq!(
+            available_targets(Some(InputFormat::Any)),
+            [
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip
+            ]
+        );
     }
 
     #[test]
     fn mixed_inputs_only_offer_archive_outputs() {
         assert_eq!(
-            available_targets(&[PathBuf::from("photo.png"), PathBuf::from("notes.txt")]),
+            available_targets(Some(InputFormat::Mixed)),
             [
                 OutputFormat::Zip,
                 OutputFormat::Tar,
@@ -2279,12 +2472,11 @@ mod tests {
     }
 
     #[test]
-    fn zip_files_offer_extraction_and_repacking() {
+    fn zip_files_only_offer_archive_outputs() {
         assert_eq!(
-            available_targets(&[PathBuf::from("archive.zip")]),
+            available_targets(Some(InputFormat::Archive)),
             [
                 OutputFormat::Zip,
-                OutputFormat::ExtractZip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
                 OutputFormat::Gzip
@@ -2293,14 +2485,13 @@ mod tests {
     }
 
     #[test]
-    fn tar_gz_files_offer_both_tar_extraction_and_plain_decompression() {
+    fn tar_gz_files_only_offer_archive_outputs() {
         assert_eq!(
-            available_targets(&[PathBuf::from("backup.tar.gz")]),
+            available_targets(Some(InputFormat::Archive)),
             [
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
-                OutputFormat::ExtractTarGz,
                 OutputFormat::Gzip
             ]
         );
@@ -2316,8 +2507,13 @@ mod tests {
             OutputFormat::TarGz,
             OutputFormat::Gzip,
         ];
-        for input in ["song.mp3", "song.flac", "song.ogg", "song.m4a"] {
-            assert_eq!(available_targets(&[PathBuf::from(input)]), expected);
+        for input in [
+            InputFormat::Mp3,
+            InputFormat::Flac,
+            InputFormat::Ogg,
+            InputFormat::M4a,
+        ] {
+            assert_eq!(available_targets(Some(input)), expected);
         }
     }
 
@@ -2334,9 +2530,84 @@ mod tests {
             OutputFormat::TarGz,
             OutputFormat::Gzip,
         ];
-        for input in ["config.yaml", "config.yml", "config.toml"] {
-            assert_eq!(available_targets(&[PathBuf::from(input)]), expected);
+        for input in [InputFormat::Yaml, InputFormat::Toml] {
+            assert_eq!(available_targets(Some(input)), expected);
         }
+    }
+
+    #[test]
+    fn manual_input_override_takes_precedence_over_detection() {
+        let mut app = ConvertApp {
+            inputs: vec![PathBuf::from("photo.png")],
+            input_formats: vec![InputFormat::Png],
+            ..Default::default()
+        };
+        assert_eq!(app.effective_input_format(), Some(InputFormat::Png));
+
+        app.input_format_override = Some(InputFormat::Mp3);
+        assert_eq!(app.effective_input_format(), Some(InputFormat::Mp3));
+        assert_eq!(
+            available_targets(app.effective_input_format()),
+            [
+                OutputFormat::Wav,
+                OutputFormat::Flac,
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip
+            ]
+        );
+    }
+
+    #[test]
+    fn input_picker_starts_with_detected_formats_and_can_show_all() {
+        let mut app = ConvertApp {
+            inputs: vec![PathBuf::from("photo.png")],
+            input_formats: vec![InputFormat::Png],
+            ..Default::default()
+        };
+        assert_eq!(app.input_format_choices(), vec![InputFormat::Png]);
+
+        app.input_format_show_all = true;
+        let choices = app.input_format_choices();
+        assert_eq!(choices.first(), Some(&InputFormat::Any));
+        assert!(choices.len() > 1);
+        assert!(choices.contains(&InputFormat::Mp3));
+        assert!(!choices.contains(&InputFormat::Mixed));
+    }
+
+    #[test]
+    fn choosing_the_effective_format_clears_the_override() {
+        let mut app = ConvertApp {
+            inputs: vec![PathBuf::from("photo.png")],
+            input_formats: vec![InputFormat::Png],
+            ..Default::default()
+        };
+
+        app.show_input_format_picker = true;
+        app.choose_input_format(InputFormat::Png);
+        assert_eq!(app.input_format_override, None);
+        assert!(!app.show_input_format_picker);
+
+        app.choose_input_format(InputFormat::Mp3);
+        assert_eq!(app.input_format_override, Some(InputFormat::Mp3));
+        assert!(!app.show_input_format_picker);
+    }
+
+    #[test]
+    fn input_format_labels_describe_unknown_and_mixed_selections() {
+        let mut app = ConvertApp {
+            inputs: vec![PathBuf::from("mystery.bin")],
+            input_formats: vec![InputFormat::Any],
+            ..Default::default()
+        };
+        assert_eq!(app.detected_input_label(), "Unknown format");
+
+        app.input_formats = vec![InputFormat::Png, InputFormat::Text];
+        assert_eq!(app.detected_input_label(), "Mixed formats");
+
+        app.input_formats = vec![InputFormat::Png];
+        assert_eq!(app.detected_input_label(), "PNG image");
     }
 
     #[test]

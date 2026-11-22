@@ -2,8 +2,8 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    io::{Cursor, Read, Write},
-    path::{Component, Path, PathBuf},
+    io::{Cursor, Write},
+    path::{Path, PathBuf},
 };
 
 use image::ImageEncoder;
@@ -12,9 +12,6 @@ use thiserror::Error;
 mod input_extensions;
 pub use input_extensions::supported_input_extensions;
 
-const MAX_ARCHIVE_ENTRY_SIZE: u64 = 512 * 1024 * 1024;
-const MAX_ARCHIVE_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES: usize = 65_536;
 const MAX_AUDIO_SAMPLES: usize = 120_000_000;
 const MAX_SVG_DIMENSION: u32 = 8_192;
 const MAX_SVG_PIXELS: u64 = 32_000_000;
@@ -47,17 +44,13 @@ pub enum OutputFormat {
     Wav,
     Flac,
     Zip,
-    ExtractZip,
     Tar,
-    ExtractTar,
     TarGz,
-    ExtractTarGz,
     Gzip,
-    ExtractGzip,
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 29] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -84,13 +77,9 @@ impl OutputFormat {
         Self::Wav,
         Self::Flac,
         Self::Zip,
-        Self::ExtractZip,
         Self::Tar,
-        Self::ExtractTar,
         Self::TarGz,
-        Self::ExtractTarGz,
         Self::Gzip,
-        Self::ExtractGzip,
     ];
 
     pub fn label(self) -> &'static str {
@@ -121,13 +110,9 @@ impl OutputFormat {
             Self::Wav => "WAV audio",
             Self::Flac => "FLAC audio",
             Self::Zip => "ZIP archive",
-            Self::ExtractZip => "Extract ZIP",
             Self::Tar => "TAR archive",
-            Self::ExtractTar => "Extract TAR",
             Self::TarGz => "TAR.GZ archive",
-            Self::ExtractTarGz => "Extract TAR.GZ",
             Self::Gzip => "GZIP compressed file",
-            Self::ExtractGzip => "Extract GZIP",
         }
     }
 
@@ -149,48 +134,43 @@ impl OutputFormat {
         }
     }
 
-    fn extension(self) -> Option<&'static str> {
+    fn extension(self) -> &'static str {
         match self {
-            Self::Png => Some("png"),
-            Self::Jpeg => Some("jpg"),
-            Self::Webp => Some("webp"),
-            Self::Gif => Some("gif"),
-            Self::Bmp => Some("bmp"),
-            Self::Tiff => Some("tiff"),
-            Self::Ico => Some("ico"),
-            Self::Ppm => Some("ppm"),
-            Self::Tga => Some("tga"),
-            Self::Qoi => Some("qoi"),
-            Self::Hdr => Some("hdr"),
-            Self::Farbfeld => Some("ff"),
-            Self::Text => Some("txt"),
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Webp => "webp",
+            Self::Gif => "gif",
+            Self::Bmp => "bmp",
+            Self::Tiff => "tiff",
+            Self::Ico => "ico",
+            Self::Ppm => "ppm",
+            Self::Tga => "tga",
+            Self::Qoi => "qoi",
+            Self::Hdr => "hdr",
+            Self::Farbfeld => "ff",
+            Self::Text => "txt",
             Self::TextUtf8NoBom
             | Self::TextUtf8Bom
             | Self::TextUtf16Le
             | Self::TextUtf16Be
             | Self::TextUtf32Le
-            | Self::TextUtf32Be => Some("txt"),
-            Self::Csv => Some("csv"),
-            Self::Json => Some("json"),
-            Self::Yaml => Some("yaml"),
-            Self::Toml => Some("toml"),
-            Self::Wav => Some("wav"),
-            Self::Flac => Some("flac"),
-            Self::Zip => Some("zip"),
-            Self::ExtractZip => None,
-            Self::Tar => Some("tar"),
-            Self::ExtractTar => None,
-            Self::TarGz => Some("tar.gz"),
-            Self::ExtractTarGz => None,
-            Self::Gzip => Some("gz"),
-            Self::ExtractGzip => None,
+            | Self::TextUtf32Be => "txt",
+            Self::Csv => "csv",
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            Self::Toml => "toml",
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+            Self::Zip => "zip",
+            Self::Tar => "tar",
+            Self::TarGz => "tar.gz",
+            Self::Gzip => "gz",
         }
     }
 
     /// Whether files with this name can be used as input for the format.
     pub fn supports_input(self, file_name: &str) -> bool {
         let extension = file_extension(file_name);
-        let lower_name = file_name.to_ascii_lowercase();
         match self {
             Self::Png
             | Self::Jpeg
@@ -215,10 +195,6 @@ impl OutputFormat {
             | Self::TextUtf32Be => extension == "txt",
             Self::Wav | Self::Flac => is_audio_extension(&extension),
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
-            Self::ExtractZip => extension == "zip",
-            Self::ExtractTar => extension == "tar",
-            Self::ExtractTarGz => lower_name.ends_with(".tar.gz") || extension == "tgz",
-            Self::ExtractGzip => extension == "gz" && !lower_name.ends_with(".tar.gz"),
         }
     }
 }
@@ -244,18 +220,10 @@ pub enum ConvertError {
     JsonNotTabular,
     #[error("CSV contains duplicate column names")]
     DuplicateCsvHeader,
-    #[error("archive entry has an unsafe or unsupported path: {0}")]
-    UnsafeZipPath(String),
-    #[error("archive entry exceeds the supported extraction size")]
-    ArchiveEntryTooLarge,
-    #[error("archive exceeds the supported total extraction size")]
-    ArchiveTooLarge,
-    #[error("archive contains too many entries to extract")]
-    ArchiveTooManyEntries,
+    #[error("multiple input files are named {0:?}")]
+    DuplicateArchiveEntryName(String),
     #[error("no input files were provided")]
     NoInputFiles,
-    #[error("the archive contains no files")]
-    EmptyArchive,
     #[error("could not render the SVG: {0}")]
     Svg(String),
     #[error("the SVG is too large to render")]
@@ -291,32 +259,6 @@ pub fn convert_bytes(
     input: &[u8],
     target: OutputFormat,
 ) -> Result<Vec<ConvertedFile>, ConvertError> {
-    if target == OutputFormat::ExtractZip {
-        return extract_zip(input);
-    }
-    if target == OutputFormat::ExtractTar {
-        let extension = file_extension(input_name);
-        if extension != "tar" {
-            return Err(unsupported(&extension, target));
-        }
-        return extract_tar(input, false);
-    }
-    if target == OutputFormat::ExtractTarGz {
-        let extension = file_extension(input_name);
-        let lower_name = input_name.to_ascii_lowercase();
-        if !lower_name.ends_with(".tar.gz") && extension != "tgz" {
-            return Err(unsupported(&extension, target));
-        }
-        return extract_tar(input, true);
-    }
-    if target == OutputFormat::ExtractGzip {
-        let extension = file_extension(input_name);
-        if extension != "gz" {
-            return Err(unsupported(&extension, target));
-        }
-        return extract_gzip(input_name, input);
-    }
-
     let extension = file_extension(input_name);
     if target == OutputFormat::Zip {
         let name = safe_file_name(input_name);
@@ -355,7 +297,7 @@ pub fn convert_bytes(
         };
         let bytes = encode_image(image, format)?;
         return Ok(vec![ConvertedFile {
-            name: output_name(input_name, target.extension().expect("image extension")),
+            name: output_name(input_name, target.extension()),
             bytes,
         }]);
     }
@@ -371,7 +313,7 @@ pub fn convert_bytes(
             _ => unreachable!("only audio targets reach this branch"),
         };
         return Ok(vec![ConvertedFile {
-            name: output_name(input_name, target.extension().expect("audio extension")),
+            name: output_name(input_name, target.extension()),
             bytes,
         }]);
     }
@@ -397,9 +339,7 @@ pub fn convert_batch(
         for (path, bytes) in inputs {
             let name = safe_file_name(path.to_string_lossy().as_ref());
             if !seen_names.insert(name.clone()) {
-                return Err(ConvertError::UnsafeZipPath(format!(
-                    "multiple input files are named {name:?}"
-                )));
+                return Err(ConvertError::DuplicateArchiveEntryName(name));
             }
             entries.push((PathBuf::from(name), bytes.clone()));
         }
@@ -468,10 +408,7 @@ fn convert_text(
         }
         let text = decode_text(input)?;
         return Ok(vec![ConvertedFile {
-            name: output_name(
-                input_name,
-                target.extension().expect("text format extension"),
-            ),
+            name: output_name(input_name, target.extension()),
             bytes: encode_text(&text, target)?,
         }]);
     }
@@ -516,7 +453,7 @@ fn convert_text(
         _ => return Err(unsupported(&extension, target)),
     };
 
-    let output_extension = target.extension().expect("text format extension");
+    let output_extension = target.extension();
     Ok(vec![ConvertedFile {
         name: output_name(input_name, output_extension),
         bytes: output,
@@ -700,71 +637,6 @@ fn create_zip(entries: &[(PathBuf, Vec<u8>)]) -> Result<Vec<u8>, ConvertError> {
     }
 
     Ok(archive.finish()?.into_inner())
-}
-
-fn extract_zip(input: &[u8]) -> Result<Vec<ConvertedFile>, ConvertError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
-    let mut files = Vec::new();
-    let mut total_size = 0_u64;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        if entry.is_dir() {
-            continue;
-        }
-
-        let raw_name = entry.name().to_owned();
-        if entry.is_symlink() {
-            return Err(ConvertError::UnsafeZipPath(raw_name));
-        }
-        let name = safe_archive_path(&raw_name)
-            .ok_or_else(|| ConvertError::UnsafeZipPath(raw_name.clone()))?;
-        if files.len() == MAX_ARCHIVE_ENTRIES {
-            return Err(ConvertError::ArchiveTooManyEntries);
-        }
-        if entry.size() > MAX_ARCHIVE_ENTRY_SIZE {
-            return Err(ConvertError::ArchiveEntryTooLarge);
-        }
-        if entry.size() > MAX_ARCHIVE_TOTAL_SIZE.saturating_sub(total_size) {
-            return Err(ConvertError::ArchiveTooLarge);
-        }
-
-        // The declared size comes from the archive and may be forged, so only
-        // reserve a small buffer; the take() cap bounds the actual read.
-        let mut bytes = Vec::with_capacity(entry.size().min(64 * 1024) as usize);
-        entry
-            .by_ref()
-            .take(MAX_ARCHIVE_ENTRY_SIZE + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_ARCHIVE_ENTRY_SIZE {
-            return Err(ConvertError::ArchiveEntryTooLarge);
-        }
-        total_size = total_size.saturating_add(bytes.len() as u64);
-        if total_size > MAX_ARCHIVE_TOTAL_SIZE {
-            return Err(ConvertError::ArchiveTooLarge);
-        }
-        files.push(ConvertedFile { name, bytes });
-    }
-    if files.is_empty() {
-        return Err(ConvertError::EmptyArchive);
-    }
-    Ok(files)
-}
-
-fn safe_archive_path(name: &str) -> Option<PathBuf> {
-    if name.is_empty() || name.contains('\\') || name.contains(':') || name.starts_with('/') {
-        return None;
-    }
-
-    let path = Path::new(name);
-    let mut safe = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => safe.push(part),
-            Component::CurDir => {}
-            _ => return None,
-        }
-    }
-    (!safe.as_os_str().is_empty()).then_some(safe)
 }
 
 fn safe_file_name(path: &str) -> String {
@@ -1237,101 +1109,10 @@ fn gzip_bytes(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
     Ok(encoder.finish()?)
 }
 
-fn extract_tar(input: &[u8], gzip: bool) -> Result<Vec<ConvertedFile>, ConvertError> {
-    let reader: Box<dyn Read> = if gzip {
-        Box::new(flate2::read::GzDecoder::new(Cursor::new(input)))
-    } else {
-        Box::new(Cursor::new(input))
-    };
-    let mut archive = tar::Archive::new(reader);
-    let mut files = Vec::new();
-    let mut total_size = 0_u64;
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_type = entry.header().entry_type();
-        if entry_type.is_dir() {
-            continue;
-        }
-        if !entry_type.is_file() {
-            continue;
-        }
-
-        let raw_name = entry.path()?.to_string_lossy().into_owned();
-        let name = safe_archive_path(&raw_name)
-            .ok_or_else(|| ConvertError::UnsafeZipPath(raw_name.clone()))?;
-        if files.len() == MAX_ARCHIVE_ENTRIES {
-            return Err(ConvertError::ArchiveTooManyEntries);
-        }
-        let size = entry.size();
-        if size > MAX_ARCHIVE_ENTRY_SIZE {
-            return Err(ConvertError::ArchiveEntryTooLarge);
-        }
-        if size > MAX_ARCHIVE_TOTAL_SIZE.saturating_sub(total_size) {
-            return Err(ConvertError::ArchiveTooLarge);
-        }
-
-        // Do not reserve the header's claimed size up front; a tiny archive
-        // can declare a huge entry, and only take() should bound the read.
-        let mut bytes = Vec::with_capacity(size.min(64 * 1024) as usize);
-        entry
-            .by_ref()
-            .take(MAX_ARCHIVE_ENTRY_SIZE + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_ARCHIVE_ENTRY_SIZE {
-            return Err(ConvertError::ArchiveEntryTooLarge);
-        }
-        total_size = total_size.saturating_add(bytes.len() as u64);
-        if total_size > MAX_ARCHIVE_TOTAL_SIZE {
-            return Err(ConvertError::ArchiveTooLarge);
-        }
-        files.push(ConvertedFile { name, bytes });
-    }
-
-    if files.is_empty() {
-        return Err(ConvertError::EmptyArchive);
-    }
-    Ok(files)
-}
-
-fn extract_gzip(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFile>, ConvertError> {
-    extract_gzip_with_limit(input_name, input, MAX_ARCHIVE_ENTRY_SIZE)
-}
-
-fn extract_gzip_with_limit(
-    input_name: &str,
-    input: &[u8],
-    limit: u64,
-) -> Result<Vec<ConvertedFile>, ConvertError> {
-    let mut decoder = flate2::read::GzDecoder::new(Cursor::new(input));
-    let mut bytes = Vec::new();
-    decoder
-        .by_ref()
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(ConvertError::ArchiveEntryTooLarge);
-    }
-
-    let name = strip_suffix_case_insensitive(input_name, ".gz")
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "converted".to_owned());
-    Ok(vec![ConvertedFile {
-        name: PathBuf::from(safe_file_name(&name)),
-        bytes,
-    }])
-}
-
-fn strip_suffix_case_insensitive(value: &str, suffix: &str) -> Option<String> {
-    let start = value.len().checked_sub(suffix.len())?;
-    value[start..]
-        .eq_ignore_ascii_case(suffix)
-        .then(|| value[..start].to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn png_fixture() -> Vec<u8> {
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
@@ -1451,49 +1232,47 @@ mod tests {
     }
 
     #[test]
-    fn archives_multiple_files_and_extracts_them() {
+    fn archives_multiple_files() {
         let inputs = vec![
             (PathBuf::from("one.txt"), b"one".to_vec()),
             (PathBuf::from("two.txt"), b"two".to_vec()),
         ];
         let archive = convert_batch(&inputs, OutputFormat::Zip).unwrap();
-        let extracted =
-            convert_bytes("files.zip", &archive[0].bytes, OutputFormat::ExtractZip).unwrap();
-        assert_eq!(extracted.len(), 2);
-        assert_eq!(extracted[0].bytes, b"one");
-        assert_eq!(extracted[1].bytes, b"two");
+        assert_eq!(archive[0].name, PathBuf::from("converted.zip"));
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(&archive[0].bytes)).unwrap();
+        assert_eq!(zip.len(), 2);
+        let mut one = String::new();
+        zip.by_name("one.txt")
+            .unwrap()
+            .read_to_string(&mut one)
+            .unwrap();
+        assert_eq!(one, "one");
+        let mut two = String::new();
+        zip.by_name("two.txt")
+            .unwrap()
+            .read_to_string(&mut two)
+            .unwrap();
+        assert_eq!(two, "two");
     }
 
     #[test]
-    fn rejects_zip_paths_that_escape_the_output_folder() {
-        let cursor = Cursor::new(Vec::new());
-        let mut archive = zip::ZipWriter::new(cursor);
-        archive
-            .start_file("../outside.txt", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        archive.write_all(b"unsafe").unwrap();
-        let archive = archive.finish().unwrap().into_inner();
-
+    fn rejects_duplicate_archive_entry_names() {
+        let inputs = vec![
+            (PathBuf::from("first/one.txt"), b"one".to_vec()),
+            (PathBuf::from("second/one.txt"), b"two".to_vec()),
+        ];
         assert!(matches!(
-            convert_bytes("unsafe.zip", &archive, OutputFormat::ExtractZip),
-            Err(ConvertError::UnsafeZipPath(_))
+            convert_batch(&inputs, OutputFormat::Zip),
+            Err(ConvertError::DuplicateArchiveEntryName(name)) if name == "one.txt"
         ));
     }
 
     #[test]
-    fn rejects_empty_batches_and_archives() {
+    fn rejects_empty_batches() {
         assert!(matches!(
             convert_batch(&[], OutputFormat::Json),
             Err(ConvertError::NoInputFiles)
-        ));
-
-        let archive = zip::ZipWriter::new(Cursor::new(Vec::new()))
-            .finish()
-            .unwrap()
-            .into_inner();
-        assert!(matches!(
-            convert_bytes("empty.zip", &archive, OutputFormat::ExtractZip),
-            Err(ConvertError::EmptyArchive)
         ));
     }
 
@@ -1553,64 +1332,39 @@ mod tests {
     }
 
     #[test]
-    fn packs_and_extracts_tar_archives() {
+    fn packs_tar_archives() {
         let inputs = vec![
             (PathBuf::from("one.txt"), b"one".to_vec()),
             (PathBuf::from("two.txt"), b"two".to_vec()),
         ];
 
-        for (target, extract, name) in [
-            (OutputFormat::Tar, OutputFormat::ExtractTar, "converted.tar"),
-            (
-                OutputFormat::TarGz,
-                OutputFormat::ExtractTarGz,
-                "converted.tar.gz",
-            ),
+        for (target, name) in [
+            (OutputFormat::Tar, "converted.tar"),
+            (OutputFormat::TarGz, "converted.tar.gz"),
         ] {
             let archive = convert_batch(&inputs, target).unwrap();
             assert_eq!(archive[0].name, PathBuf::from(name));
-            let extracted = convert_bytes(name, &archive[0].bytes, extract).unwrap();
-            assert_eq!(extracted.len(), 2);
-            assert_eq!(extracted[0].bytes, b"one");
-            assert_eq!(extracted[1].bytes, b"two");
+
+            let reader: Box<dyn Read> = if target == OutputFormat::TarGz {
+                Box::new(flate2::read::GzDecoder::new(Cursor::new(&archive[0].bytes)))
+            } else {
+                Box::new(Cursor::new(&archive[0].bytes))
+            };
+            let mut tar = tar::Archive::new(reader);
+            let mut entries = Vec::new();
+            for entry in tar.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                entries.push((path, bytes));
+            }
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, "one.txt");
+            assert_eq!(entries[0].1, b"one");
+            assert_eq!(entries[1].0, "two.txt");
+            assert_eq!(entries[1].1, b"two");
         }
-    }
-
-    #[test]
-    fn caps_tar_extraction_at_the_entry_count_limit() {
-        let mut builder = tar::Builder::new(Vec::new());
-        for index in 0..=MAX_ARCHIVE_ENTRIES {
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Regular);
-            header.set_size(0);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, format!("empty-{index}.txt"), std::io::empty())
-                .unwrap();
-        }
-        let archive = builder.into_inner().unwrap();
-
-        assert!(matches!(
-            convert_bytes("many.tar", &archive, OutputFormat::ExtractTar),
-            Err(ConvertError::ArchiveTooManyEntries)
-        ));
-    }
-
-    #[test]
-    fn caps_gzip_extraction_at_the_archive_entry_limit() {
-        let payload = vec![0_u8; 4096];
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&payload).unwrap();
-        let gzip = encoder.finish().unwrap();
-
-        assert!(matches!(
-            extract_gzip_with_limit("bomb.gz", &gzip, 1024),
-            Err(ConvertError::ArchiveEntryTooLarge)
-        ));
-
-        let extracted = extract_gzip_with_limit("ok.gz", &gzip, 4096).unwrap();
-        assert_eq!(extracted[0].bytes.len(), 4096);
     }
 
     #[test]
@@ -1629,13 +1383,15 @@ mod tests {
     }
 
     #[test]
-    fn compresses_and_extracts_gzip_files() {
+    fn compresses_gzip_files() {
         let gzip = convert_bytes("note.txt", b"hello", OutputFormat::Gzip).unwrap();
         assert_eq!(gzip[0].name, PathBuf::from("note.txt.gz"));
+        assert_eq!(&gzip[0].bytes[0..2], &[0x1f, 0x8b]);
 
-        let back = convert_bytes("note.txt.gz", &gzip[0].bytes, OutputFormat::ExtractGzip).unwrap();
-        assert_eq!(back[0].name, PathBuf::from("note.txt"));
-        assert_eq!(back[0].bytes, b"hello");
+        let mut decoder = flate2::read::GzDecoder::new(Cursor::new(&gzip[0].bytes));
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"hello");
     }
 
     fn wav_fixture() -> Vec<u8> {
@@ -1873,24 +1629,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_tar_entries_with_dot_prefixes() {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(3);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "./one.txt", b"one".as_slice())
-            .unwrap();
-        let archive = builder.into_inner().unwrap();
-
-        let extracted = convert_bytes("archive.tar", &archive, OutputFormat::ExtractTar).unwrap();
-        assert_eq!(extracted[0].name, PathBuf::from("one.txt"));
-        assert_eq!(extracted[0].bytes, b"one");
-    }
-
-    #[test]
     fn decodes_flac_with_an_id3_tag() {
         let wav = wav_fixture();
         let flac = convert_bytes("tone.wav", &wav, OutputFormat::Flac).unwrap();
@@ -1909,8 +1647,6 @@ mod tests {
         assert!(OutputFormat::Wav.supports_input("song.mp3"));
         assert!(OutputFormat::Flac.supports_input("song.m4a"));
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
-        assert!(OutputFormat::ExtractTarGz.supports_input("backup.tar.gz"));
-        assert!(!OutputFormat::ExtractGzip.supports_input("backup.tar.gz"));
     }
 
     #[test]
@@ -1953,7 +1689,14 @@ mod tests {
             );
         }
 
-        for extension in ["ogg", "m4a", "svg", "gz", "tar", "tar.gz", "tgz"] {
+        for extension in ["zip", "tar", "tar.gz", "tgz", "gz"] {
+            assert!(
+                !extensions.contains(&extension),
+                "archives must not be in the default Supported files filter"
+            );
+        }
+
+        for extension in ["ogg", "m4a", "svg"] {
             assert!(
                 extensions.contains(&extension),
                 "the file picker is missing .{extension}"

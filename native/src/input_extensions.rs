@@ -14,16 +14,14 @@ pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
     "wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "mp4", "alac",
 ];
 
-/// Archive extensions accepted for extraction.
-pub const ARCHIVE_INPUT_EXTENSIONS: &[&str] = &["zip", "tar", "tar.gz", "tgz", "gz"];
-
-/// Every file extension the conversion engine can read, for the file picker.
+/// Every non-archive extension accepted by the conversion engine, for the
+/// default "Supported files" filter. Archive files can be selected through
+/// "All files" when creating a new archive.
 pub fn supported_input_extensions() -> Vec<&'static str> {
     IMAGE_INPUT_EXTENSIONS
         .iter()
         .chain(DATA_INPUT_EXTENSIONS)
         .chain(AUDIO_INPUT_EXTENSIONS)
-        .chain(ARCHIVE_INPUT_EXTENSIONS)
         .copied()
         .collect()
 }
