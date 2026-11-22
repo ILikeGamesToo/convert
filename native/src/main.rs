@@ -18,7 +18,7 @@ mod input_format;
 
 use convert_to_it_native::{
     convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
-    AudioChannels, ConversionOptions, OutputFormat, PdfPageSize,
+    AudioChannels, ConversionOptions, OutputFormat, PdfImageFit, PdfOrientation, PdfPageSize,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
@@ -498,6 +498,8 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
         }
         OutputFormat::Pdf => {
             options.pdf_page_size != ConversionOptions::DEFAULT_PDF_PAGE_SIZE
+                || options.pdf_orientation != ConversionOptions::DEFAULT_PDF_ORIENTATION
+                || options.pdf_image_fit != ConversionOptions::DEFAULT_PDF_IMAGE_FIT
                 || options.pdf_font_size != ConversionOptions::DEFAULT_PDF_FONT_SIZE
                 || options.pdf_margin != ConversionOptions::DEFAULT_PDF_MARGIN
         }
@@ -630,20 +632,27 @@ fn optional_channels(ui: &mut egui::Ui, channels: &mut Option<AudioChannels>) {
     });
 }
 
-fn pdf_page_size_setting(ui: &mut egui::Ui, page_size: &mut PdfPageSize) {
+fn pdf_choice_setting<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: &str,
+    selected: &mut T,
+    options: &[T],
+    option_label: impl Fn(T) -> &'static str,
+) {
     ui.vertical(|ui| {
-        ui.label(RichText::new("Page size").size(12.8).strong().color(TEXT));
+        ui.label(RichText::new(label).size(12.8).strong().color(TEXT));
         settings_input_frame(ui, |ui| {
-            egui::ComboBox::from_id_salt("pdf-page-size")
-                .selected_text(page_size.label())
+            egui::ComboBox::from_id_salt(id)
+                .selected_text(option_label(*selected))
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
-                    for option in PdfPageSize::ALL {
+                    for option in options {
                         if ui
-                            .selectable_label(*page_size == option, option.label())
+                            .selectable_label(*selected == *option, option_label(*option))
                             .clicked()
                         {
-                            *page_size = option;
+                            *selected = *option;
                         }
                     }
                 });
@@ -1155,20 +1164,39 @@ impl ConvertApp {
                 optional_channels(ui, &mut self.conversion_options.audio_channels);
             }
             OutputFormat::Pdf => {
-                if matches!(self.effective_input_format(), Some(format) if format != InputFormat::Text)
+                settings_section_heading(ui, "Page", None);
+                ui.add_space(10.0);
+                pdf_choice_setting(
+                    ui,
+                    "Page size",
+                    "pdf-page-size",
+                    &mut self.conversion_options.pdf_page_size,
+                    &PdfPageSize::ALL,
+                    PdfPageSize::label,
+                );
+                if self
+                    .effective_input_format()
+                    .is_some_and(InputFormat::is_image)
                 {
-                    ui.add_space(24.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("Page settings apply to text files.")
-                                .size(12.8)
-                                .color(MUTED),
-                        );
-                    });
+                    ui.add_space(14.0);
+                    pdf_choice_setting(
+                        ui,
+                        "Orientation",
+                        "pdf-orientation",
+                        &mut self.conversion_options.pdf_orientation,
+                        &PdfOrientation::ALL,
+                        PdfOrientation::label,
+                    );
+                    ui.add_space(14.0);
+                    pdf_choice_setting(
+                        ui,
+                        "Image fit",
+                        "pdf-image-fit",
+                        &mut self.conversion_options.pdf_image_fit,
+                        &PdfImageFit::ALL,
+                        PdfImageFit::label,
+                    );
                 } else {
-                    settings_section_heading(ui, "Page", None);
-                    ui.add_space(10.0);
-                    pdf_page_size_setting(ui, &mut self.conversion_options.pdf_page_size);
                     ui.add_space(14.0);
                     number_setting(
                         ui,
@@ -3513,6 +3541,26 @@ mod tests {
         let job = app.conversion_job.as_ref().unwrap();
         assert!(job.cancel.load(Ordering::Relaxed));
         assert_eq!(job.message, "Cancelling after the current step...");
+    }
+
+    #[test]
+    fn pdf_image_layout_options_trigger_reset_state() {
+        assert!(!target_has_applied_setting(
+            OutputFormat::Pdf,
+            &ConversionOptions::default()
+        ));
+
+        let landscape = ConversionOptions {
+            pdf_orientation: PdfOrientation::Landscape,
+            ..Default::default()
+        };
+        assert!(target_has_applied_setting(OutputFormat::Pdf, &landscape));
+
+        let cover = ConversionOptions {
+            pdf_image_fit: PdfImageFit::Cover,
+            ..Default::default()
+        };
+        assert!(target_has_applied_setting(OutputFormat::Pdf, &cover));
     }
 
     #[test]

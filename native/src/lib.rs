@@ -105,6 +105,48 @@ impl PdfPageSize {
             Self::Legal => (612.0, 1008.0),
         }
     }
+
+    fn dimensions_for(self, orientation: PdfOrientation) -> (f32, f32) {
+        let (width, height) = self.dimensions();
+        match orientation {
+            PdfOrientation::Portrait => (width, height),
+            PdfOrientation::Landscape => (height, width),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdfOrientation {
+    Portrait,
+    Landscape,
+}
+
+impl PdfOrientation {
+    pub const ALL: [Self; 2] = [Self::Portrait, Self::Landscape];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Portrait => "Portrait",
+            Self::Landscape => "Landscape",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdfImageFit {
+    Contain,
+    Cover,
+}
+
+impl PdfImageFit {
+    pub const ALL: [Self; 2] = [Self::Contain, Self::Cover];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Contain => "Contain",
+            Self::Cover => "Cover",
+        }
+    }
 }
 
 /// User-selected encoding options. `None` keeps the encoder's default.
@@ -116,6 +158,8 @@ pub struct ConversionOptions {
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<AudioChannels>,
     pub pdf_page_size: PdfPageSize,
+    pub pdf_orientation: PdfOrientation,
+    pub pdf_image_fit: PdfImageFit,
     pub pdf_font_size: u32,
     pub pdf_margin: u32,
 }
@@ -129,6 +173,8 @@ impl Default for ConversionOptions {
             audio_sample_rate: None,
             audio_channels: None,
             pdf_page_size: Self::DEFAULT_PDF_PAGE_SIZE,
+            pdf_orientation: Self::DEFAULT_PDF_ORIENTATION,
+            pdf_image_fit: Self::DEFAULT_PDF_IMAGE_FIT,
             pdf_font_size: Self::DEFAULT_PDF_FONT_SIZE,
             pdf_margin: Self::DEFAULT_PDF_MARGIN,
         }
@@ -143,6 +189,8 @@ impl ConversionOptions {
     /// FLAC's encoder accepts at most 96 kHz, so the shared audio control stays within that range.
     pub const MAX_AUDIO_SAMPLE_RATE: u32 = 96_000;
     pub const DEFAULT_PDF_PAGE_SIZE: PdfPageSize = PdfPageSize::A4;
+    pub const DEFAULT_PDF_ORIENTATION: PdfOrientation = PdfOrientation::Portrait;
+    pub const DEFAULT_PDF_IMAGE_FIT: PdfImageFit = PdfImageFit::Contain;
     pub const DEFAULT_PDF_FONT_SIZE: u32 = 11;
     pub const MIN_PDF_FONT_SIZE: u32 = 1;
     pub const MAX_PDF_FONT_SIZE: u32 = 200;
@@ -404,7 +452,7 @@ pub fn convert_bytes_with_options(
         let bytes = if extension == "txt" {
             text_to_pdf(input, options)?
         } else if is_image_input_extension(&extension) {
-            image_to_pdf(input, &extension)?
+            image_to_pdf(input, &extension, options)?
         } else {
             return Err(unsupported(&extension, target));
         };
@@ -1350,7 +1398,11 @@ const PDF_TEXT_LINE_HEIGHT: f32 = 1.2;
 /// Courier advances 0.6 em per character.
 const PDF_TEXT_CHAR_WIDTH: f32 = 0.6;
 
-fn image_to_pdf(input: &[u8], extension: &str) -> Result<Vec<u8>, ConvertError> {
+fn image_to_pdf(
+    input: &[u8],
+    extension: &str,
+    options: ConversionOptions,
+) -> Result<Vec<u8>, ConvertError> {
     if let Some(components @ (1 | 3)) = jpeg_component_count(input) {
         let (width, height) = image::ImageReader::new(Cursor::new(input))
             .with_guessed_format()?
@@ -1361,6 +1413,7 @@ fn image_to_pdf(input: &[u8], extension: &str) -> Result<Vec<u8>, ConvertError> 
             height,
             Filter::DctDecode,
             components == 1,
+            options,
         ));
     }
 
@@ -1378,7 +1431,39 @@ fn image_to_pdf(input: &[u8], extension: &str) -> Result<Vec<u8>, ConvertError> 
         height,
         Filter::FlateDecode,
         false,
+        options,
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImagePlacement {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+fn image_placement(
+    image_width: f32,
+    image_height: f32,
+    page_width: f32,
+    page_height: f32,
+    fit: PdfImageFit,
+) -> ImagePlacement {
+    let scale_x = page_width / image_width;
+    let scale_y = page_height / image_height;
+    let scale = match fit {
+        PdfImageFit::Contain => scale_x.min(scale_y),
+        PdfImageFit::Cover => scale_x.max(scale_y),
+    };
+    let width = image_width * scale;
+    let height = image_height * scale;
+    ImagePlacement {
+        x: (page_width - width) / 2.0,
+        y: (page_height - height) / 2.0,
+        width,
+        height,
+    }
 }
 
 fn build_image_pdf(
@@ -1387,7 +1472,19 @@ fn build_image_pdf(
     height: u32,
     filter: Filter,
     grayscale: bool,
+    options: ConversionOptions,
 ) -> Vec<u8> {
+    let (page_width, page_height) = options
+        .pdf_page_size
+        .dimensions_for(options.pdf_orientation);
+    let placement = image_placement(
+        width as f32,
+        height as f32,
+        page_width,
+        page_height,
+        options.pdf_image_fit,
+    );
+
     let catalog_id = Ref::new(1);
     let pages_id = Ref::new(2);
     let page_id = Ref::new(3);
@@ -1396,7 +1493,14 @@ fn build_image_pdf(
 
     let mut content = Content::new();
     content.save_state();
-    content.transform([width as f32, 0.0, 0.0, height as f32, 0.0, 0.0]);
+    content.transform([
+        placement.width,
+        0.0,
+        0.0,
+        placement.height,
+        placement.x,
+        placement.y,
+    ]);
     content.x_object(Name(b"Im1"));
     content.restore_state();
     let content = content.finish();
@@ -1407,7 +1511,7 @@ fn build_image_pdf(
     {
         let mut page = pdf.page(page_id);
         page.parent(pages_id)
-            .media_box(Rect::new(0.0, 0.0, width as f32, height as f32))
+            .media_box(Rect::new(0.0, 0.0, page_width, page_height))
             .contents(content_id);
         page.resources().x_objects().pair(Name(b"Im1"), image_id);
     }
@@ -2505,7 +2609,7 @@ mod tests {
         assert!(pdf.starts_with("%PDF-"));
         assert!(pdf.contains("/Subtype /Image"));
         assert!(pdf.contains("/Filter /FlateDecode"));
-        assert!(pdf.contains("/MediaBox"));
+        assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"));
     }
 
     #[test]
@@ -2518,6 +2622,41 @@ mod tests {
             .any(|window| window == jpeg));
         let pdf = String::from_utf8_lossy(&converted[0].bytes);
         assert!(pdf.contains("/Filter /DCTDecode"));
+        assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"));
+    }
+
+    #[test]
+    fn image_fit_math_centers_and_crops() {
+        let contain = super::image_placement(64.0, 48.0, 595.28, 841.89, PdfImageFit::Contain);
+        assert!((contain.width - 595.28).abs() < 0.01);
+        assert!((contain.height - 446.46).abs() < 0.01);
+        assert!(contain.x.abs() < 0.01);
+        assert!((contain.y - 197.715).abs() < 0.01);
+
+        let cover = super::image_placement(64.0, 48.0, 792.0, 612.0, PdfImageFit::Cover);
+        assert!((cover.width - 816.0).abs() < 0.01);
+        assert!((cover.height - 612.0).abs() < 0.01);
+        assert!((cover.x + 12.0).abs() < 0.01);
+        assert!(cover.y.abs() < 0.01);
+    }
+
+    #[test]
+    fn applies_pdf_page_orientation_and_image_fit() {
+        let converted = convert_bytes_with_options(
+            "sample.png",
+            &png_fixture(),
+            OutputFormat::Pdf,
+            ConversionOptions {
+                pdf_page_size: PdfPageSize::Letter,
+                pdf_orientation: PdfOrientation::Landscape,
+                pdf_image_fit: PdfImageFit::Cover,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/MediaBox [0 0 792 612]"));
+        assert!(pdf.contains("792 0 0 792 0 -90 cm"));
     }
 
     #[test]
