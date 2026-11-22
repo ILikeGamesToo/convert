@@ -73,14 +73,66 @@ impl AudioChannels {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PdfPageSize {
+    A3,
+    A4,
+    A5,
+    Letter,
+    Legal,
+}
+
+impl PdfPageSize {
+    pub const ALL: [Self; 5] = [Self::A3, Self::A4, Self::A5, Self::Letter, Self::Legal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::A3 => "A3",
+            Self::A4 => "A4",
+            Self::A5 => "A5",
+            Self::Letter => "LETTER",
+            Self::Legal => "LEGAL",
+        }
+    }
+
+    /// Page dimensions in points, matching PDFKit's page sizes.
+    fn dimensions(self) -> (f32, f32) {
+        match self {
+            Self::A3 => (841.89, 1190.55),
+            Self::A4 => (595.28, 841.89),
+            Self::A5 => (419.53, 595.28),
+            Self::Letter => (612.0, 792.0),
+            Self::Legal => (612.0, 1008.0),
+        }
+    }
+}
+
 /// User-selected encoding options. `None` keeps the encoder's default.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConversionOptions {
     pub jpeg_quality: Option<u8>,
     pub png_compression: Option<u8>,
     pub archive_compression: Option<u8>,
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<AudioChannels>,
+    pub pdf_page_size: PdfPageSize,
+    pub pdf_font_size: u32,
+    pub pdf_margin: u32,
+}
+
+impl Default for ConversionOptions {
+    fn default() -> Self {
+        Self {
+            jpeg_quality: None,
+            png_compression: None,
+            archive_compression: None,
+            audio_sample_rate: None,
+            audio_channels: None,
+            pdf_page_size: Self::DEFAULT_PDF_PAGE_SIZE,
+            pdf_font_size: Self::DEFAULT_PDF_FONT_SIZE,
+            pdf_margin: Self::DEFAULT_PDF_MARGIN,
+        }
+    }
 }
 
 impl ConversionOptions {
@@ -90,6 +142,13 @@ impl ConversionOptions {
     pub const MIN_AUDIO_SAMPLE_RATE: u32 = 1_000;
     /// FLAC's encoder accepts at most 96 kHz, so the shared audio control stays within that range.
     pub const MAX_AUDIO_SAMPLE_RATE: u32 = 96_000;
+    pub const DEFAULT_PDF_PAGE_SIZE: PdfPageSize = PdfPageSize::A4;
+    pub const DEFAULT_PDF_FONT_SIZE: u32 = 11;
+    pub const MIN_PDF_FONT_SIZE: u32 = 1;
+    pub const MAX_PDF_FONT_SIZE: u32 = 200;
+    pub const DEFAULT_PDF_MARGIN: u32 = 72;
+    pub const MIN_PDF_MARGIN: u32 = 0;
+    pub const MAX_PDF_MARGIN: u32 = 144;
 }
 
 impl OutputFormat {
@@ -343,7 +402,7 @@ pub fn convert_bytes_with_options(
     }
     if target == OutputFormat::Pdf {
         let bytes = if extension == "txt" {
-            text_to_pdf(input)?
+            text_to_pdf(input, options)?
         } else if is_image_input_extension(&extension) {
             image_to_pdf(input, &extension)?
         } else {
@@ -1287,16 +1346,9 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     Ok(sink.as_slice().to_vec())
 }
 
-const PDF_TEXT_PAGE_WIDTH: f32 = 595.28;
-const PDF_TEXT_PAGE_HEIGHT: f32 = 841.89;
-const PDF_TEXT_MARGIN: f32 = 72.0;
-const PDF_TEXT_FONT_SIZE: f32 = 11.0;
-const PDF_TEXT_LEADING: f32 = 13.2;
+const PDF_TEXT_LINE_HEIGHT: f32 = 1.2;
 /// Courier advances 0.6 em per character.
-const PDF_TEXT_MAX_CHARS: usize =
-    ((PDF_TEXT_PAGE_WIDTH - 2.0 * PDF_TEXT_MARGIN) / (PDF_TEXT_FONT_SIZE * 0.6)) as usize;
-const PDF_TEXT_LINES_PER_PAGE: usize =
-    ((PDF_TEXT_PAGE_HEIGHT - 2.0 * PDF_TEXT_MARGIN) / PDF_TEXT_LEADING) as usize;
+const PDF_TEXT_CHAR_WIDTH: f32 = 0.6;
 
 fn image_to_pdf(input: &[u8], extension: &str) -> Result<Vec<u8>, ConvertError> {
     if let Some(components @ (1 | 3)) = jpeg_component_count(input) {
@@ -1431,10 +1483,23 @@ fn deflate_bytes(data: &[u8]) -> Result<Vec<u8>, ConvertError> {
     Ok(encoder.finish()?)
 }
 
-fn text_to_pdf(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
+fn text_to_pdf(input: &[u8], options: ConversionOptions) -> Result<Vec<u8>, ConvertError> {
     let text = decode_text(input)?;
-    let lines = wrap_text_lines(&text);
-    let page_count = lines.len().div_ceil(PDF_TEXT_LINES_PER_PAGE);
+    let (page_width, page_height) = options.pdf_page_size.dimensions();
+    let font_size = options.pdf_font_size.clamp(
+        ConversionOptions::MIN_PDF_FONT_SIZE,
+        ConversionOptions::MAX_PDF_FONT_SIZE,
+    ) as f32;
+    let margin = options.pdf_margin.clamp(
+        ConversionOptions::MIN_PDF_MARGIN,
+        ConversionOptions::MAX_PDF_MARGIN,
+    ) as f32;
+    let leading = font_size * PDF_TEXT_LINE_HEIGHT;
+    let max_chars =
+        (((page_width - 2.0 * margin) / (font_size * PDF_TEXT_CHAR_WIDTH)).floor() as usize).max(1);
+    let lines_per_page = (((page_height - 2.0 * margin) / leading).floor() as usize).max(1);
+    let lines = wrap_text_lines(&text, max_chars);
+    let page_count = lines.len().div_ceil(lines_per_page);
 
     let catalog_id = Ref::new(1);
     let pages_id = Ref::new(2);
@@ -1452,23 +1517,16 @@ fn text_to_pdf(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
     for page_index in 0..page_count {
         let page_id = Ref::new(4 + (page_index as i32) * 2);
         let content_id = Ref::new(5 + (page_index as i32) * 2);
-        let start = page_index * PDF_TEXT_LINES_PER_PAGE;
-        let end = (start + PDF_TEXT_LINES_PER_PAGE).min(lines.len());
+        let start = page_index * lines_per_page;
+        let end = (start + lines_per_page).min(lines.len());
 
         let mut content = Content::new();
         content.begin_text();
-        content.set_font(Name(b"F1"), PDF_TEXT_FONT_SIZE);
-        content.set_text_matrix([
-            1.0,
-            0.0,
-            0.0,
-            1.0,
-            PDF_TEXT_MARGIN,
-            PDF_TEXT_PAGE_HEIGHT - PDF_TEXT_MARGIN - PDF_TEXT_FONT_SIZE,
-        ]);
+        content.set_font(Name(b"F1"), font_size);
+        content.set_text_matrix([1.0, 0.0, 0.0, 1.0, margin, page_height - margin - font_size]);
         for (line_index, line) in lines[start..end].iter().enumerate() {
             if line_index > 0 {
-                content.next_line(0.0, -PDF_TEXT_LEADING);
+                content.next_line(0.0, -leading);
             }
             content.show(Str(&win_ansi_bytes(line)));
         }
@@ -1478,12 +1536,7 @@ fn text_to_pdf(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
         {
             let mut page = pdf.page(page_id);
             page.parent(pages_id)
-                .media_box(Rect::new(
-                    0.0,
-                    0.0,
-                    PDF_TEXT_PAGE_WIDTH,
-                    PDF_TEXT_PAGE_HEIGHT,
-                ))
+                .media_box(Rect::new(0.0, 0.0, page_width, page_height))
                 .contents(content_id);
             page.resources().fonts().pair(Name(b"F1"), font_id);
         }
@@ -1492,7 +1545,7 @@ fn text_to_pdf(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
     Ok(pdf.finish())
 }
 
-fn wrap_text_lines(text: &str) -> Vec<String> {
+fn wrap_text_lines(text: &str, max_chars: usize) -> Vec<String> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = Vec::new();
     for raw_line in normalized.split('\n') {
@@ -1502,16 +1555,15 @@ fn wrap_text_lines(text: &str) -> Vec<String> {
         }
         let mut current = String::new();
         for word in raw_line.split(' ') {
-            if !current.is_empty()
-                && current.chars().count() + 1 + word.chars().count() > PDF_TEXT_MAX_CHARS
+            if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > max_chars
             {
                 lines.push(std::mem::take(&mut current));
             }
             if current.is_empty() {
-                if word.chars().count() <= PDF_TEXT_MAX_CHARS {
+                if word.chars().count() <= max_chars {
                     current.push_str(word);
                 } else {
-                    hard_wrap_word(word, &mut lines, &mut current);
+                    hard_wrap_word(word, &mut lines, &mut current, max_chars);
                 }
             } else {
                 current.push(' ');
@@ -1523,16 +1575,12 @@ fn wrap_text_lines(text: &str) -> Vec<String> {
     lines
 }
 
-fn hard_wrap_word(word: &str, lines: &mut Vec<String>, current: &mut String) {
+fn hard_wrap_word(word: &str, lines: &mut Vec<String>, current: &mut String, max_chars: usize) {
     let characters: Vec<char> = word.chars().collect();
     let mut start = 0;
-    while start + PDF_TEXT_MAX_CHARS < characters.len() {
-        lines.push(
-            characters[start..start + PDF_TEXT_MAX_CHARS]
-                .iter()
-                .collect(),
-        );
-        start += PDF_TEXT_MAX_CHARS;
+    while start + max_chars < characters.len() {
+        lines.push(characters[start..start + max_chars].iter().collect());
+        start += max_chars;
     }
     current.extend(characters[start..].iter());
 }
@@ -2478,8 +2526,50 @@ mod tests {
         let converted = convert_bytes("notes.txt", text.as_bytes(), OutputFormat::Pdf).unwrap();
         let pdf = String::from_utf8_lossy(&converted[0].bytes);
         assert!(pdf.contains("(Hello, PDF!) Tj"));
+        assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"));
+        assert!(pdf.contains("/F1 11 Tf"));
         let pages = pdf.matches("/Type /Page").count() - pdf.matches("/Type /Pages").count();
-        assert_eq!(pages, 120usize.div_ceil(super::PDF_TEXT_LINES_PER_PAGE));
+        assert_eq!(pages, 3);
+    }
+
+    #[test]
+    fn applies_pdf_page_font_and_margin_options() {
+        let text = "Hello, PDF!\n".repeat(120);
+        let converted = convert_bytes_with_options(
+            "notes.txt",
+            text.as_bytes(),
+            OutputFormat::Pdf,
+            ConversionOptions {
+                pdf_page_size: PdfPageSize::Letter,
+                pdf_font_size: 20,
+                pdf_margin: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/MediaBox [0 0 612 792]"));
+        assert!(pdf.contains("/F1 20 Tf"));
+        let pages = pdf.matches("/Type /Page").count() - pdf.matches("/Type /Pages").count();
+        assert_eq!(pages, 6);
+    }
+
+    #[test]
+    fn clamps_pdf_options_to_supported_ranges() {
+        let converted = convert_bytes_with_options(
+            "notes.txt",
+            b"Hello\n",
+            OutputFormat::Pdf,
+            ConversionOptions {
+                pdf_font_size: 0,
+                pdf_margin: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/F1 1 Tf"));
+        assert!(pdf.contains("1 0 0 1 144 "));
     }
 
     #[test]

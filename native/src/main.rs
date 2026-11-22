@@ -18,7 +18,7 @@ mod input_format;
 
 use convert_to_it_native::{
     convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
-    AudioChannels, ConversionOptions, OutputFormat,
+    AudioChannels, ConversionOptions, OutputFormat, PdfPageSize,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
@@ -496,6 +496,11 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
         OutputFormat::Wav | OutputFormat::Flac => {
             options.audio_sample_rate.is_some() || options.audio_channels.is_some()
         }
+        OutputFormat::Pdf => {
+            options.pdf_page_size != ConversionOptions::DEFAULT_PDF_PAGE_SIZE
+                || options.pdf_font_size != ConversionOptions::DEFAULT_PDF_FONT_SIZE
+                || options.pdf_margin != ConversionOptions::DEFAULT_PDF_MARGIN
+        }
         _ => false,
     }
 }
@@ -621,6 +626,47 @@ fn optional_channels(ui: &mut egui::Ui, channels: &mut Option<AudioChannels>) {
                         }
                     }
                 });
+        });
+    });
+}
+
+fn pdf_page_size_setting(ui: &mut egui::Ui, page_size: &mut PdfPageSize) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new("Page size").size(12.8).strong().color(TEXT));
+        settings_input_frame(ui, |ui| {
+            egui::ComboBox::from_id_salt("pdf-page-size")
+                .selected_text(page_size.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for option in PdfPageSize::ALL {
+                        if ui
+                            .selectable_label(*page_size == option, option.label())
+                            .clicked()
+                        {
+                            *page_size = option;
+                        }
+                    }
+                });
+        });
+    });
+}
+
+fn number_setting(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+    unit: &str,
+) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(label).size(12.8).strong().color(TEXT));
+        settings_input_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(value).range(range).speed(1.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(unit).size(11.0).color(MUTED));
+                });
+            });
         });
     });
 }
@@ -1107,6 +1153,39 @@ impl ConvertApp {
                 optional_sample_rate(ui, &mut self.conversion_options.audio_sample_rate);
                 ui.add_space(14.0);
                 optional_channels(ui, &mut self.conversion_options.audio_channels);
+            }
+            OutputFormat::Pdf => {
+                if matches!(self.effective_input_format(), Some(format) if format != InputFormat::Text)
+                {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("Page settings apply to text files.")
+                                .size(12.8)
+                                .color(MUTED),
+                        );
+                    });
+                } else {
+                    settings_section_heading(ui, "Page", None);
+                    ui.add_space(10.0);
+                    pdf_page_size_setting(ui, &mut self.conversion_options.pdf_page_size);
+                    ui.add_space(14.0);
+                    number_setting(
+                        ui,
+                        "Font size",
+                        &mut self.conversion_options.pdf_font_size,
+                        ConversionOptions::MIN_PDF_FONT_SIZE..=ConversionOptions::MAX_PDF_FONT_SIZE,
+                        "pt",
+                    );
+                    ui.add_space(14.0);
+                    number_setting(
+                        ui,
+                        "Margin",
+                        &mut self.conversion_options.pdf_margin,
+                        ConversionOptions::MIN_PDF_MARGIN..=ConversionOptions::MAX_PDF_MARGIN,
+                        "pt",
+                    );
+                }
             }
             _ => {
                 ui.add_space(24.0);
