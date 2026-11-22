@@ -1006,7 +1006,12 @@ fn create_encoder<'a>(
         OutputFormat::Aiff => Box::new(AiffStreamEncoder::new(writer, sample_rate, channels)?),
         OutputFormat::Au => Box::new(AuStreamEncoder::new(writer, sample_rate, channels)?),
         OutputFormat::Opus => Box::new(OpusStreamEncoder::new(writer, sample_rate, channels)?),
-        OutputFormat::Mp3 => Box::new(Mp3StreamEncoder::new(writer, sample_rate, channels)?),
+        OutputFormat::Mp3 => Box::new(Mp3StreamEncoder::new(
+            writer,
+            sample_rate,
+            channels,
+            options.mp3_bitrate,
+        )?),
         _ => return Err(unsupported("audio", target)),
     })
 }
@@ -1459,8 +1464,9 @@ impl<'a> Mp3StreamEncoder<'a> {
         writer: &'a mut dyn WriteSeek,
         sample_rate: u32,
         channels: usize,
+        bitrate: Mp3Bitrate,
     ) -> Result<Self, ConvertError> {
-        use mp3lame_encoder::{Bitrate, Builder, Quality};
+        use mp3lame_encoder::{Builder, Quality};
 
         if channels == 0 {
             return Err(ConvertError::NoAudioTrack);
@@ -1470,13 +1476,7 @@ impl<'a> Mp3StreamEncoder<'a> {
         builder
             .set_num_channels(channels as u8)
             .and_then(|_| builder.set_sample_rate(sample_rate))
-            .and_then(|_| {
-                builder.set_brate(if channels == 1 {
-                    Bitrate::Kbps96
-                } else {
-                    Bitrate::Kbps192
-                })
-            })
+            .and_then(|_| builder.set_brate(mp3_lame_bitrate(bitrate)))
             .and_then(|_| builder.set_quality(Quality::NearBest))
             .map_err(|error| {
                 ConvertError::Audio(format!("could not configure the MP3 encoder: {error}"))

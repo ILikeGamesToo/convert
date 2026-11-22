@@ -19,8 +19,8 @@ mod input_format;
 use convert_to_it_native::{
     audio_output_name, audio_tracks_from_path, convert_audio_file_to_writer_with_cancel,
     convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
-    AudioBitDepth, AudioChannels, AudioTrackInfo, ConversionOptions, ConvertError, OutputFormat,
-    PdfImageFit, PdfOrientation, PdfPageSize,
+    AudioBitDepth, AudioChannels, AudioTrackInfo, ConversionOptions, ConvertError, Mp3Bitrate,
+    OutputFormat, PdfImageFit, PdfOrientation, PdfPageSize,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
@@ -535,10 +535,16 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
                 || options.audio_track.is_some()
                 || options.audio_bit_depth != AudioBitDepth::Bit16
         }
-        OutputFormat::Aiff | OutputFormat::Au | OutputFormat::Opus | OutputFormat::Mp3 => {
+        OutputFormat::Aiff | OutputFormat::Au | OutputFormat::Opus => {
             options.audio_sample_rate.is_some()
                 || options.audio_channels.is_some()
                 || options.audio_track.is_some()
+        }
+        OutputFormat::Mp3 => {
+            options.audio_sample_rate.is_some()
+                || options.audio_channels.is_some()
+                || options.audio_track.is_some()
+                || options.mp3_bitrate != ConversionOptions::DEFAULT_MP3_BITRATE
         }
         OutputFormat::Pdf => {
             options.pdf_page_size != ConversionOptions::DEFAULT_PDF_PAGE_SIZE
@@ -671,6 +677,32 @@ fn optional_channels(ui: &mut egui::Ui, channels: &mut Option<AudioChannels>) {
                             .clicked()
                         {
                             *channels = Some(option);
+                        }
+                    }
+                });
+        });
+    });
+}
+
+fn mp3_bitrate_setting(ui: &mut egui::Ui, bitrate: &mut Mp3Bitrate) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new("Bitrate").size(12.8).strong().color(TEXT));
+        ui.label(
+            RichText::new("MP3 is lossy; bit depth does not apply.")
+                .size(11.5)
+                .color(MUTED),
+        );
+        settings_input_frame(ui, |ui| {
+            egui::ComboBox::from_id_salt("mp3-bitrate")
+                .selected_text(bitrate.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for option in Mp3Bitrate::ALL {
+                        if ui
+                            .selectable_label(*bitrate == option, option.label())
+                            .clicked()
+                        {
+                            *bitrate = option;
                         }
                     }
                 });
@@ -1291,6 +1323,10 @@ impl ConvertApp {
                 optional_sample_rate(ui, &mut self.conversion_options.audio_sample_rate);
                 ui.add_space(14.0);
                 optional_channels(ui, &mut self.conversion_options.audio_channels);
+                if target == OutputFormat::Mp3 {
+                    ui.add_space(14.0);
+                    mp3_bitrate_setting(ui, &mut self.conversion_options.mp3_bitrate);
+                }
                 if matches!(target, OutputFormat::Wav | OutputFormat::Flac) {
                     ui.add_space(14.0);
                     audio_bit_depth_setting(
@@ -3733,6 +3769,25 @@ mod tests {
         no_language.index = 0;
         no_language.id = 1;
         assert_eq!(no_language.label(), "#1 · AC-3 · 5.1 · 48.0 kHz");
+    }
+
+    #[test]
+    fn mp3_bitrate_is_a_non_default_setting() {
+        assert!(!target_has_applied_setting(
+            OutputFormat::Mp3,
+            &ConversionOptions::default()
+        ));
+        let high_bitrate = ConversionOptions {
+            mp3_bitrate: Mp3Bitrate::Kbps320,
+            ..Default::default()
+        };
+        assert!(target_has_applied_setting(OutputFormat::Mp3, &high_bitrate));
+        assert!(!target_has_applied_setting(
+            OutputFormat::Wav,
+            &high_bitrate
+        ));
+        assert_eq!(Mp3Bitrate::ALL.len(), 4);
+        assert_eq!(Mp3Bitrate::Kbps320.kbps(), 320);
     }
 
     #[test]

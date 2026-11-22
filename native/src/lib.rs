@@ -101,6 +101,38 @@ impl AudioBitDepth {
     }
 }
 
+/// Bitrate for MP3 output. MP3 is lossy, so sample bit depth does not apply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Mp3Bitrate {
+    Kbps128,
+    #[default]
+    Kbps192,
+    Kbps256,
+    Kbps320,
+}
+
+impl Mp3Bitrate {
+    pub const ALL: [Self; 4] = [Self::Kbps128, Self::Kbps192, Self::Kbps256, Self::Kbps320];
+
+    pub fn kbps(self) -> u16 {
+        match self {
+            Self::Kbps128 => 128,
+            Self::Kbps192 => 192,
+            Self::Kbps256 => 256,
+            Self::Kbps320 => 320,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Kbps128 => "128 kbps",
+            Self::Kbps192 => "192 kbps",
+            Self::Kbps256 => "256 kbps",
+            Self::Kbps320 => "320 kbps",
+        }
+    }
+}
+
 /// One audio track that can be decoded from an input file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioTrackInfo {
@@ -254,6 +286,8 @@ pub struct ConversionOptions {
     /// Zero-based index of the audio track to decode. `None` uses the first.
     pub audio_track: Option<usize>,
     pub audio_bit_depth: AudioBitDepth,
+    /// Bitrate for MP3 output. Other audio formats ignore this.
+    pub mp3_bitrate: Mp3Bitrate,
     /// Background used when an image with transparency is saved to a format
     /// without an alpha channel.
     pub image_background: [u8; 3],
@@ -276,6 +310,7 @@ impl Default for ConversionOptions {
             audio_channels: None,
             audio_track: None,
             audio_bit_depth: AudioBitDepth::Bit16,
+            mp3_bitrate: Self::DEFAULT_MP3_BITRATE,
             image_background: Self::DEFAULT_IMAGE_BACKGROUND,
             image_apply_exif_orientation: true,
             pdf_page_size: Self::DEFAULT_PDF_PAGE_SIZE,
@@ -291,6 +326,7 @@ impl ConversionOptions {
     pub const DEFAULT_JPEG_QUALITY: u8 = 75;
     pub const DEFAULT_COMPRESSION_LEVEL: u8 = 6;
     pub const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 44_100;
+    pub const DEFAULT_MP3_BITRATE: Mp3Bitrate = Mp3Bitrate::Kbps192;
     pub const MIN_AUDIO_SAMPLE_RATE: u32 = 1_000;
     pub const DEFAULT_IMAGE_BACKGROUND: [u8; 3] = [255, 255, 255];
     /// FLAC's encoder accepts at most 96 kHz, so the shared audio control stays within that range.
@@ -655,7 +691,7 @@ pub fn convert_bytes_with_options(
             OutputFormat::Aiff => encode_aiff(&audio)?,
             OutputFormat::Au => encode_au(&audio)?,
             OutputFormat::Opus => encode_opus(audio)?,
-            OutputFormat::Mp3 => encode_mp3(audio)?,
+            OutputFormat::Mp3 => encode_mp3(audio, options.mp3_bitrate)?,
             _ => unreachable!("only audio targets reach this branch"),
         };
         return Ok(vec![ConvertedFile {
@@ -3740,8 +3776,18 @@ fn mp3_sample_rate(sample_rate: u32) -> u32 {
     }
 }
 
-fn encode_mp3(audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
-    use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm, Quality};
+fn mp3_lame_bitrate(bitrate: Mp3Bitrate) -> mp3lame_encoder::Bitrate {
+    use mp3lame_encoder::Bitrate;
+    match bitrate {
+        Mp3Bitrate::Kbps128 => Bitrate::Kbps128,
+        Mp3Bitrate::Kbps192 => Bitrate::Kbps192,
+        Mp3Bitrate::Kbps256 => Bitrate::Kbps256,
+        Mp3Bitrate::Kbps320 => Bitrate::Kbps320,
+    }
+}
+
+fn encode_mp3(audio: DecodedAudio, bitrate: Mp3Bitrate) -> Result<Vec<u8>, ConvertError> {
+    use mp3lame_encoder::{Builder, FlushNoGap, InterleavedPcm, MonoPcm, Quality};
 
     if audio.channels == 0 || audio.sample_rate == 0 || audio.samples.is_empty() {
         return Err(ConvertError::NoAudioTrack);
@@ -3762,13 +3808,7 @@ fn encode_mp3(audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     builder
         .set_num_channels(channels as u8)
         .and_then(|_| builder.set_sample_rate(sample_rate))
-        .and_then(|_| {
-            builder.set_brate(if channels == 1 {
-                Bitrate::Kbps96
-            } else {
-                Bitrate::Kbps192
-            })
-        })
+        .and_then(|_| builder.set_brate(mp3_lame_bitrate(bitrate)))
         .and_then(|_| builder.set_quality(Quality::NearBest))
         .map_err(|error| {
             ConvertError::Audio(format!("could not configure the MP3 encoder: {error}"))
@@ -4697,14 +4737,25 @@ mod tests {
     }
 
     fn wav_fixture_at(sample_rate: u32, frames: u32) -> Vec<u8> {
-        let channels = 2_u16;
-        let mut samples = Vec::new();
+        wav_tone_at(sample_rate, frames, 2, 440.0, 0.5)
+    }
+
+    fn wav_tone_at(
+        sample_rate: u32,
+        frames: u32,
+        channels: u16,
+        frequency: f64,
+        amplitude: f64,
+    ) -> Vec<u8> {
+        let mut samples = Vec::with_capacity(frames as usize * usize::from(channels));
         for frame in 0..frames {
-            let value = ((frame as f32 / sample_rate as f32 * 440.0 * std::f32::consts::TAU).sin()
-                * 0.5
-                * i16::MAX as f32) as i16;
-            samples.push(value);
-            samples.push(value);
+            let value =
+                ((frame as f64 / f64::from(sample_rate) * frequency * std::f64::consts::TAU).sin()
+                    * amplitude
+                    * f64::from(i16::MAX)) as i16;
+            for _ in 0..channels {
+                samples.push(value);
+            }
         }
 
         let data_size = (samples.len() * 2) as u32;
@@ -4725,6 +4776,92 @@ mod tests {
             wav.extend_from_slice(&sample.to_le_bytes());
         }
         wav
+    }
+
+    fn mp3_first_frame_bitrate(bytes: &[u8]) -> Option<u16> {
+        let mut position = 0;
+        if bytes.starts_with(b"ID3") && bytes.len() >= 10 {
+            let size = (usize::from(bytes[6] & 0x7F) << 21)
+                | (usize::from(bytes[7] & 0x7F) << 14)
+                | (usize::from(bytes[8] & 0x7F) << 7)
+                | usize::from(bytes[9] & 0x7F);
+            position = 10 + size;
+        }
+        let mpeg1 = [
+            0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+        ];
+        let mpeg2 = [
+            0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+        ];
+        while position + 4 <= bytes.len() {
+            let header = &bytes[position..position + 4];
+            let version = (header[1] >> 3) & 0x03;
+            let layer = (header[1] >> 1) & 0x03;
+            let bitrate_index = usize::from((header[2] >> 4) & 0x0F);
+            if header[0] == 0xFF && (header[1] & 0xE0) == 0xE0 && layer == 1 {
+                let table: &[u16; 16] = if version == 3 { &mpeg1 } else { &mpeg2 };
+                if bitrate_index > 0 && bitrate_index < 15 {
+                    return Some(table[bitrate_index]);
+                }
+            }
+            position += 1;
+        }
+        None
+    }
+
+    fn assert_mp3_tone(
+        mp3: &[u8],
+        sample_rate: u32,
+        channels: u16,
+        expected_frames: usize,
+        expected_bitrate: Mp3Bitrate,
+    ) {
+        assert_eq!(
+            mp3_first_frame_bitrate(mp3),
+            Some(expected_bitrate.kbps()),
+            "the MP3 frame header does not declare {} kbps",
+            expected_bitrate.kbps()
+        );
+        let decoded = super::convert_bytes("tone.mp3", mp3, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&decoded[0].bytes);
+        assert_eq!(parsed.sample_rate, sample_rate);
+        assert_eq!(parsed.channels, channels);
+        let frames = parsed.samples.len() / usize::from(channels);
+        let delta = (frames as i64 - expected_frames as i64).abs();
+        assert!(
+            delta <= 1_152,
+            "decoded {frames} frames instead of {expected_frames} (delta {delta})"
+        );
+
+        let first_channel: Vec<i16> = parsed
+            .samples
+            .iter()
+            .step_by(usize::from(channels))
+            .copied()
+            .collect();
+        // MP3 encoders add a short delay and padding. Measure the middle half
+        // of the signal so those edges do not skew the tone metrics.
+        let window = &first_channel[frames / 4..frames * 3 / 4];
+        let crossings = window
+            .windows(2)
+            .filter(|pair| (pair[0] < 0) != (pair[1] < 0))
+            .count();
+        let measured = crossings as f64 * f64::from(sample_rate) / (2.0 * window.len() as f64);
+        assert!(
+            (measured - 1_000.0).abs() < 20.0,
+            "the decoded tone is at {measured:.1} Hz"
+        );
+        let rms = (window
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / window.len() as f64)
+            .sqrt();
+        assert!(
+            (rms - 11_585.0).abs() < 2_000.0,
+            "the decoded tone RMS is {rms:.1}"
+        );
+        assert_audible(&parsed.samples);
     }
 
     struct ParsedWav {
@@ -5363,6 +5500,8 @@ mod tests {
         assert!(OutputFormat::Flac.supports_input("song.m4a"));
         assert!(OutputFormat::Aiff.supports_input("song.aiff"));
         assert!(OutputFormat::Opus.supports_input("song.wav"));
+        assert!(OutputFormat::Mp3.supports_input("song.wav"));
+        assert!(OutputFormat::Mp3.supports_input("movie.mkv"));
         assert!(OutputFormat::Wav.supports_input("movie.mkv"));
         assert!(OutputFormat::Pbm.supports_input("photo.png"));
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
@@ -6787,10 +6926,139 @@ mod tests {
         assert_audible(&parsed.samples);
 
         // LAME has to clamp its bitrate for low sample rates instead of
-        // failing the conversion.
-        let low_rate = convert_bytes("tone.wav", &wav_fixture(), OutputFormat::Mp3)
-            .expect("8 kHz stereo MP3 output should work");
-        assert!(low_rate[0].bytes.len() > 100);
+        // failing the conversion, even when the UI offers a high bitrate.
+        for bitrate in Mp3Bitrate::ALL {
+            let low_rate = convert_bytes_with_options(
+                "tone.wav",
+                &wav_fixture(),
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: bitrate,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("8 kHz MP3 at {} failed: {error}", bitrate.label()));
+            assert!(low_rate[0].bytes.len() > 100);
+        }
+    }
+
+    #[test]
+    fn mp3_output_preserves_tone_channels_duration_and_bitrate() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let frames = sample_rate;
+            let wav = wav_tone_at(sample_rate, frames, channels, 1_000.0, 0.5);
+            let mp3 = convert_bytes_with_options(
+                "tone.wav",
+                &wav,
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: Mp3Bitrate::Kbps192,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes;
+            assert_mp3_tone(
+                &mp3,
+                sample_rate,
+                channels,
+                frames as usize,
+                Mp3Bitrate::Kbps192,
+            );
+        }
+
+        let wav = wav_tone_at(44_100, 44_100, 2, 1_000.0, 0.5);
+        let encode = |bitrate| {
+            convert_bytes_with_options(
+                "tone.wav",
+                &wav,
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: bitrate,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes
+        };
+        let low = encode(Mp3Bitrate::Kbps128);
+        let high = encode(Mp3Bitrate::Kbps320);
+        assert!(
+            high.len() > low.len() * 2,
+            "320 kbps produced {} bytes but 128 kbps produced {}",
+            high.len(),
+            low.len()
+        );
+        assert_mp3_tone(&low, 44_100, 2, 44_100, Mp3Bitrate::Kbps128);
+        assert_mp3_tone(&high, 44_100, 2, 44_100, Mp3Bitrate::Kbps320);
+    }
+
+    #[test]
+    fn streams_mp3_at_the_requested_bitrate() {
+        let directory = stream_temp_dir("mp3-bitrate");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_tone_at(48_000, 48_000, 1, 1_000.0, 0.5)).unwrap();
+        let encode = |bitrate| {
+            let mut output = Cursor::new(Vec::new());
+            super::convert_audio_file_to_writer(
+                &input,
+                "tone.wav",
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: bitrate,
+                    ..Default::default()
+                },
+                &mut output,
+            )
+            .unwrap();
+            output.into_inner()
+        };
+        let low = encode(Mp3Bitrate::Kbps128);
+        let high = encode(Mp3Bitrate::Kbps320);
+        assert!(
+            high.len() > low.len() * 2,
+            "streaming 320 kbps produced {} bytes but 128 kbps produced {}",
+            high.len(),
+            low.len()
+        );
+        assert_mp3_tone(&low, 48_000, 1, 48_000, Mp3Bitrate::Kbps128);
+        assert_mp3_tone(&high, 48_000, 1, 48_000, Mp3Bitrate::Kbps320);
+
+        std::fs::write(&input, wav_tone_at(44_100, 44_100, 2, 1_000.0, 0.5)).unwrap();
+        let stereo = encode(Mp3Bitrate::Kbps256);
+        assert_mp3_tone(&stereo, 44_100, 2, 44_100, Mp3Bitrate::Kbps256);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn converts_movie_audio_to_mp3() {
+        let input = fixture("sample-ac3.mkv");
+        let mp3 = convert_bytes_with_options(
+            "sample-ac3.mkv",
+            &input,
+            OutputFormat::Mp3,
+            ConversionOptions {
+                mp3_bitrate: Mp3Bitrate::Kbps256,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .remove(0)
+        .bytes;
+        assert_eq!(mp3_first_frame_bitrate(&mp3), Some(256));
+
+        let decoded = convert_bytes("sample-ac3.mp3", &mp3, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&decoded[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            parsed.samples.len() / 2 >= 90_000,
+            "the movie audio was truncated to {} frames",
+            parsed.samples.len() / 2
+        );
+        assert_audible(&parsed.samples);
     }
 
     #[test]
