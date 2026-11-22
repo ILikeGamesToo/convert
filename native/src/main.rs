@@ -6,6 +6,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc,
     },
@@ -16,8 +17,8 @@ use std::{
 mod input_format;
 
 use convert_to_it_native::{
-    convert_batch_with_options, supported_input_extensions, AudioChannels, ConversionOptions,
-    OutputFormat,
+    convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
+    AudioChannels, ConversionOptions, OutputFormat,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
@@ -240,11 +241,27 @@ struct ConvertApp {
     search_filter: String,
     selected_category: Option<FormatCategory>,
     status: Option<(String, bool)>,
-    conversion_result: Option<Receiver<Result<String, String>>>,
+    conversion_job: Option<ConversionJob>,
     conversion_notice: Option<(String, String, bool)>,
     show_settings: bool,
     show_conversion_settings: bool,
     show_help: bool,
+}
+
+enum ConversionEvent {
+    Progress { completed: usize, message: String },
+    Finished(Result<String, String>),
+    Cancelled,
+}
+
+struct ConversionJob {
+    receiver: Receiver<ConversionEvent>,
+    cancel: Arc<AtomicBool>,
+    completed: usize,
+    total: usize,
+    message: String,
+    source_label: String,
+    target_label: String,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -483,7 +500,7 @@ fn optional_audio_setting(
 impl eframe::App for ConvertApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_conversion();
-        if self.conversion_result.is_none() {
+        if !self.is_converting() {
             self.collect_dropped_files(context);
         }
 
@@ -495,9 +512,7 @@ impl eframe::App for ConvertApp {
             });
 
         self.show_home_dialogs(context);
-        if self.conversion_result.is_none()
-            && context.input(|input| !input.raw.hovered_files.is_empty())
-        {
+        if !self.is_converting() && context.input(|input| !input.raw.hovered_files.is_empty()) {
             self.show_drop_overlay(context);
         }
 
@@ -808,6 +823,7 @@ impl ConvertApp {
         self.show_input_format_dialog(context);
         self.show_help_modal(context);
         self.show_conversion_notice(context);
+        self.show_conversion_progress(context);
     }
 
     fn effective_input_format(&self) -> Option<InputFormat> {
@@ -1095,7 +1111,7 @@ impl ConvertApp {
             egui::Sense::click(),
         );
         logo_response.clone().on_hover_text("Back to upload");
-        if logo_response.clicked() && self.conversion_result.is_none() {
+        if logo_response.clicked() && !self.is_converting() {
             self.return_to_upload();
         }
 
@@ -1195,7 +1211,7 @@ impl ConvertApp {
                     bold_font(14.0),
                     TEXT,
                 );
-                if !self.inputs.is_empty() && self.conversion_result.is_none() {
+                if !self.inputs.is_empty() && !self.is_converting() {
                     let chevron = egui::pos2(source.right() - 14.0, source.center().y);
                     painter.add(egui::Shape::convex_polygon(
                         vec![
@@ -1499,7 +1515,7 @@ impl ConvertApp {
             Vec2::new(76.0, 40.0),
         );
         let mut remove_index = None;
-        let busy = self.conversion_result.is_some();
+        let busy = self.is_converting();
         let file_area_right = back_rect.left() - 12.0;
         let file_area = egui::Rect::from_min_max(
             egui::pos2(bar.left() + 20.0, bar.top()),
@@ -1820,6 +1836,61 @@ impl ConvertApp {
         }
     }
 
+    fn is_converting(&self) -> bool {
+        self.conversion_job.is_some()
+    }
+
+    fn cancel_conversion(&mut self) {
+        let Some(job) = self.conversion_job.as_mut() else {
+            return;
+        };
+        if !job.cancel.swap(true, Ordering::Relaxed) {
+            job.message = "Cancelling after the current step...".to_owned();
+        }
+    }
+
+    fn show_conversion_progress(&mut self, context: &egui::Context) {
+        let Some(job) = self.conversion_job.as_ref() else {
+            return;
+        };
+        let mut cancel_clicked = false;
+
+        let _ = egui::Modal::new(egui::Id::new("conversion-progress-modal"))
+            .frame(
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .inner_margin(egui::Margin::same(28)),
+            )
+            .show(context, |ui| {
+                ui.set_max_width(512.0);
+                ui.heading("Converting...");
+                ui.label(
+                    RichText::new(format!("{} → {}", job.source_label, job.target_label))
+                        .size(13.0)
+                        .color(MUTED),
+                );
+                ui.add_space(14.0);
+                let fraction = (job.completed as f32 / job.total.max(1) as f32).clamp(0.0, 1.0);
+                ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                ui.add_space(8.0);
+                ui.label(RichText::new(job.message.as_str()).size(12.0).color(TEXT));
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if job.cancel.load(Ordering::Relaxed) {
+                        ui.add_enabled(false, egui::Button::new("Cancelling..."));
+                    } else if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if cancel_clicked {
+            self.cancel_conversion();
+        }
+    }
+
     fn start_conversion(&mut self) {
         let Some(output_directory) = self.output_directory.clone() else {
             self.status = Some((
@@ -1837,42 +1908,97 @@ impl ConvertApp {
             return;
         };
         let options = self.conversion_options;
+        let source_label = self
+            .effective_input_format()
+            .unwrap_or(InputFormat::Any)
+            .extension_label()
+            .to_owned();
+        let target_label = format!(".{}", format_extension(target));
+        let total = conversion_step_total(inputs.len(), target);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
-        self.conversion_result = Some(receiver);
+        self.conversion_job = Some(ConversionJob {
+            receiver,
+            cancel,
+            completed: 0,
+            total,
+            message: "Preparing...".to_owned(),
+            source_label,
+            target_label,
+        });
+        self.show_input_format_picker = false;
         self.conversion_notice = None;
-        self.status = Some(("Converting your files...".to_owned(), false));
+        self.status = None;
 
+        let progress_sender = sender.clone();
         thread::spawn(move || {
-            let result = convert_to_directory(&inputs, target, options, &output_directory);
-            let _ = sender.send(result);
+            let result = convert_to_directory(
+                &inputs,
+                target,
+                options,
+                &output_directory,
+                worker_cancel.as_ref(),
+                |completed, message| {
+                    let _ = progress_sender.send(ConversionEvent::Progress { completed, message });
+                },
+            );
+            let event = match result {
+                Ok(message) => ConversionEvent::Finished(Ok(message)),
+                Err(ConversionFailure::Cancelled) => ConversionEvent::Cancelled,
+                Err(ConversionFailure::Message(message)) => ConversionEvent::Finished(Err(message)),
+            };
+            let _ = sender.send(event);
         });
     }
 
+    fn finish_conversion(&mut self, title: &str, message: String, error: bool) {
+        self.conversion_job = None;
+        self.status = None;
+        self.conversion_notice = Some((title.to_owned(), message, error));
+    }
+
     fn poll_conversion(&mut self) {
-        let Some(receiver) = self.conversion_result.as_ref() else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(Ok(message)) => {
-                self.status = None;
-                self.conversion_notice = Some(("Conversion complete!".to_owned(), message, false));
-                self.conversion_result = None;
+        loop {
+            let received = match self.conversion_job.as_ref() {
+                Some(job) => job.receiver.try_recv(),
+                None => return,
+            };
+            match received {
+                Ok(ConversionEvent::Progress { completed, message }) => {
+                    if let Some(job) = self.conversion_job.as_mut() {
+                        job.completed = completed;
+                        if !job.cancel.load(Ordering::Relaxed) {
+                            job.message = message;
+                        }
+                    }
+                }
+                Ok(ConversionEvent::Finished(Ok(message))) => {
+                    self.finish_conversion("Conversion complete!", message, false);
+                    return;
+                }
+                Ok(ConversionEvent::Finished(Err(message))) => {
+                    self.finish_conversion("Conversion failed", message, true);
+                    return;
+                }
+                Ok(ConversionEvent::Cancelled) => {
+                    self.finish_conversion(
+                        "Conversion cancelled",
+                        "No files were written.".to_owned(),
+                        false,
+                    );
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.finish_conversion(
+                        "Conversion error",
+                        "Conversion stopped unexpectedly.".to_owned(),
+                        true,
+                    );
+                    return;
+                }
             }
-            Ok(Err(message)) => {
-                self.status = None;
-                self.conversion_notice = Some(("Conversion failed".to_owned(), message, true));
-                self.conversion_result = None;
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.status = None;
-                self.conversion_notice = Some((
-                    "Conversion error".to_owned(),
-                    "Conversion stopped unexpectedly.".to_owned(),
-                    true,
-                ));
-                self.conversion_result = None;
-            }
-            Err(TryRecvError::Empty) => {}
         }
     }
 }
@@ -2367,40 +2493,144 @@ fn file_size(path: &Path) -> String {
     }
 }
 
+#[derive(Debug)]
+enum ConversionFailure {
+    Cancelled,
+    Message(String),
+}
+
+fn conversion_step_total(input_count: usize, target: OutputFormat) -> usize {
+    if matches!(
+        target,
+        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
+    ) {
+        input_count.saturating_add(2)
+    } else {
+        input_count.saturating_mul(3)
+    }
+}
+
 fn convert_to_directory(
     inputs: &[PathBuf],
     target: OutputFormat,
     options: ConversionOptions,
     output_directory: &Path,
-) -> Result<String, String> {
+    cancel: &AtomicBool,
+    mut report: impl FnMut(usize, String),
+) -> Result<String, ConversionFailure> {
+    let mut completed = 0;
     let mut files = Vec::with_capacity(inputs.len());
+
     for path in inputs {
-        let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ConversionFailure::Cancelled);
+        }
+        report(completed, format!("Reading {}...", file_name(path)));
+        let bytes = fs::read(path)
+            .map_err(|error| ConversionFailure::Message(format!("{}: {error}", path.display())))?;
         files.push((path.clone(), bytes));
+        completed += 1;
+        report(
+            completed,
+            format!("Read {} of {} files", completed, inputs.len()),
+        );
     }
-    let converted =
-        convert_batch_with_options(&files, target, options).map_err(|error| error.to_string())?;
-    let mut written = Vec::with_capacity(converted.len());
+
+    let mut written = Vec::new();
+    if matches!(
+        target,
+        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
+    ) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ConversionFailure::Cancelled);
+        }
+        report(completed, "Creating archive...".to_owned());
+        let converted = convert_batch_with_options(&files, target, options)
+            .map_err(|error| ConversionFailure::Message(error.to_string()))?;
+        completed += 1;
+        report(completed, "Archive created".to_owned());
+
+        for file in converted {
+            if cancel.load(Ordering::Relaxed) {
+                remove_written(&written);
+                return Err(ConversionFailure::Cancelled);
+            }
+            report(completed, format!("Saving {}...", file.name.display()));
+            let output =
+                write_unique(output_directory, &file.name, &file.bytes).map_err(|error| {
+                    ConversionFailure::Message(format!("{}: {error}", file.name.display()))
+                })?;
+            written.push(output);
+            completed += 1;
+            report(completed, format!("Saved {}", file.name.display()));
+        }
+        return Ok(conversion_summary(&written));
+    }
+
+    let mut converted = Vec::new();
+    for (index, (path, bytes)) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ConversionFailure::Cancelled);
+        }
+        report(
+            completed,
+            format!(
+                "Converting {} ({}/{})...",
+                file_name(path),
+                index + 1,
+                files.len()
+            ),
+        );
+        let mut outputs = convert_bytes_with_options(file_name(path), bytes, target, options)
+            .map_err(|error| ConversionFailure::Message(error.to_string()))?;
+        converted.append(&mut outputs);
+        completed += 1;
+        report(
+            completed,
+            format!("Converted {} of {} files", index + 1, files.len()),
+        );
+    }
+
     for file in converted {
-        let output = write_unique(output_directory, &file.name, &file.bytes)
-            .map_err(|error| format!("{}: {error}", file.name.display()))?;
+        if cancel.load(Ordering::Relaxed) {
+            remove_written(&written);
+            return Err(ConversionFailure::Cancelled);
+        }
+        report(completed, format!("Saving {}...", file.name.display()));
+        let output = write_unique(output_directory, &file.name, &file.bytes).map_err(|error| {
+            ConversionFailure::Message(format!("{}: {error}", file.name.display()))
+        })?;
         written.push(output);
+        completed += 1;
+        report(completed, format!("Saved {}", file.name.display()));
     }
+
+    Ok(conversion_summary(&written))
+}
+
+fn conversion_summary(written: &[PathBuf]) -> String {
     let remaining = written.len().saturating_sub(3);
     let suffix = if remaining == 0 {
         String::new()
     } else {
         format!(", and {remaining} more")
     };
-    Ok(format!(
+    format!(
         "Created {} file(s): {}{suffix}",
         written.len(),
-        written[0..written.len().min(3)]
+        written
             .iter()
+            .take(3)
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ")
-    ))
+    )
+}
+
+fn remove_written(written: &[PathBuf]) {
+    for path in written {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn write_unique(directory: &Path, relative_path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
@@ -2481,6 +2711,18 @@ fn validate_relative_path(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_conversion_job(receiver: Receiver<ConversionEvent>) -> ConversionJob {
+        ConversionJob {
+            receiver,
+            cancel: Arc::new(AtomicBool::new(false)),
+            completed: 0,
+            total: 3,
+            message: "Preparing...".to_owned(),
+            source_label: "TXT".to_owned(),
+            target_label: ".JSON".to_owned(),
+        }
+    }
 
     #[test]
     fn dashed_border_outline_follows_all_rounded_corners() {
@@ -2740,10 +2982,12 @@ mod tests {
     fn completed_conversions_open_a_notice_instead_of_inline_status() {
         let (sender, receiver) = mpsc::channel();
         sender
-            .send(Ok("Created 1 file(s): output.png".to_owned()))
+            .send(ConversionEvent::Finished(Ok(
+                "Created 1 file(s): output.png".to_owned(),
+            )))
             .unwrap();
         let mut app = ConvertApp {
-            conversion_result: Some(receiver),
+            conversion_job: Some(test_conversion_job(receiver)),
             status: Some(("Converting your files...".to_owned(), false)),
             ..Default::default()
         };
@@ -2759,5 +3003,79 @@ mod tests {
                 false
             ))
         );
+        assert!(app.conversion_job.is_none());
+    }
+
+    #[test]
+    fn progress_events_update_the_active_job() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(ConversionEvent::Progress {
+                completed: 2,
+                message: "Saving output.png...".to_owned(),
+            })
+            .unwrap();
+        let mut app = ConvertApp {
+            conversion_job: Some(test_conversion_job(receiver)),
+            ..Default::default()
+        };
+
+        app.poll_conversion();
+
+        let job = app.conversion_job.as_ref().unwrap();
+        assert_eq!(job.completed, 2);
+        assert_eq!(job.message, "Saving output.png...");
+    }
+
+    #[test]
+    fn cancellation_clears_the_job_and_shows_a_notice() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(ConversionEvent::Cancelled).unwrap();
+        let mut app = ConvertApp {
+            conversion_job: Some(test_conversion_job(receiver)),
+            ..Default::default()
+        };
+
+        app.poll_conversion();
+
+        assert!(app.conversion_job.is_none());
+        assert_eq!(
+            app.conversion_notice,
+            Some((
+                "Conversion cancelled".to_owned(),
+                "No files were written.".to_owned(),
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn requesting_cancel_sets_the_worker_flag() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut app = ConvertApp {
+            conversion_job: Some(test_conversion_job(receiver)),
+            ..Default::default()
+        };
+
+        app.cancel_conversion();
+
+        let job = app.conversion_job.as_ref().unwrap();
+        assert!(job.cancel.load(Ordering::Relaxed));
+        assert_eq!(job.message, "Cancelling after the current step...");
+    }
+
+    #[test]
+    fn cancellation_before_start_writes_nothing() {
+        let cancel = AtomicBool::new(true);
+        let result = convert_to_directory(
+            &[PathBuf::from("input.txt")],
+            OutputFormat::Text,
+            ConversionOptions::default(),
+            Path::new("unused"),
+            &cancel,
+            |_, _| {},
+        );
+
+        assert!(matches!(result, Err(ConversionFailure::Cancelled)));
     }
 }
