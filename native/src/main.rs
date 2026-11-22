@@ -15,7 +15,10 @@ use std::{
 
 mod input_format;
 
-use convert_to_it_native::{convert_batch, supported_input_extensions, OutputFormat};
+use convert_to_it_native::{
+    convert_batch_with_options, supported_input_extensions, AudioChannels, ConversionOptions,
+    OutputFormat,
+};
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
 use rfd::FileDialog;
@@ -233,6 +236,7 @@ struct ConvertApp {
     file_scroll_offset: f32,
     output_directory: Option<PathBuf>,
     target: Option<OutputFormat>,
+    conversion_options: ConversionOptions,
     search_filter: String,
     selected_category: Option<FormatCategory>,
     status: Option<(String, bool)>,
@@ -398,6 +402,82 @@ fn available_targets(input_format: Option<InputFormat>) -> Vec<OutputFormat> {
         .into_iter()
         .filter(|target| target.supports_input(&sample))
         .collect()
+}
+
+fn optional_setting(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<u8>,
+    range: std::ops::RangeInclusive<u8>,
+    default: u8,
+) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut automatic = value.is_none();
+        if ui.checkbox(&mut automatic, "Auto").changed() {
+            *value = if automatic { None } else { Some(default) };
+        }
+        if let Some(value) = value {
+            ui.add(egui::Slider::new(value, range).show_value(true));
+        } else {
+            ui.label(RichText::new("encoder default").color(MUTED));
+        }
+    });
+}
+
+fn optional_audio_setting(
+    ui: &mut egui::Ui,
+    sample_rate: &mut Option<u32>,
+    channels: &mut Option<AudioChannels>,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Sample rate");
+        let mut automatic = sample_rate.is_none();
+        if ui.checkbox(&mut automatic, "Auto").changed() {
+            *sample_rate = if automatic {
+                None
+            } else {
+                Some(ConversionOptions::DEFAULT_AUDIO_SAMPLE_RATE)
+            };
+        }
+        if let Some(rate) = sample_rate {
+            ui.add(
+                egui::DragValue::new(rate)
+                    .range(
+                        ConversionOptions::MIN_AUDIO_SAMPLE_RATE
+                            ..=ConversionOptions::MAX_AUDIO_SAMPLE_RATE,
+                    )
+                    .speed(100.0)
+                    .suffix(" Hz"),
+            );
+        } else {
+            ui.label(RichText::new("encoder default").color(MUTED));
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Channels");
+        let mut automatic = channels.is_none();
+        if ui.checkbox(&mut automatic, "Auto").changed() {
+            *channels = if automatic {
+                None
+            } else {
+                Some(AudioChannels::Stereo)
+            };
+        }
+        if let Some(channels) = channels {
+            for option in [AudioChannels::Mono, AudioChannels::Stereo] {
+                if ui
+                    .selectable_label(*channels == option, option.label())
+                    .clicked()
+                {
+                    *channels = option;
+                }
+            }
+        } else {
+            ui.label(RichText::new("encoder default").color(MUTED));
+        }
+    });
 }
 
 impl eframe::App for ConvertApp {
@@ -670,15 +750,58 @@ impl ConvertApp {
             egui::Window::new("Conversion settings")
                 .collapsible(false)
                 .resizable(false)
+                .default_width(360.0)
                 .open(&mut self.show_conversion_settings)
                 .show(context, |ui| {
-                    if let Some(target) = self.target {
-                        ui.label(format!(
-                            "{} doesn't have any settings.",
-                            target.label().to_uppercase()
-                        ));
-                    } else {
+                    let Some(target) = self.target else {
                         ui.label("Pick an output format to see its settings.");
+                        return;
+                    };
+
+                    ui.label(
+                        RichText::new(format!(".{}", format_extension(target)))
+                            .strong()
+                            .color(PRIMARY),
+                    );
+                    ui.add_space(4.0);
+                    match target {
+                        OutputFormat::Jpeg => optional_setting(
+                            ui,
+                            "Quality",
+                            &mut self.conversion_options.jpeg_quality,
+                            1..=100,
+                            ConversionOptions::DEFAULT_JPEG_QUALITY,
+                        ),
+                        OutputFormat::Png => optional_setting(
+                            ui,
+                            "Compression level",
+                            &mut self.conversion_options.png_compression,
+                            1..=9,
+                            ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
+                        ),
+                        OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
+                            optional_setting(
+                                ui,
+                                "Compression level",
+                                &mut self.conversion_options.archive_compression,
+                                1..=9,
+                                ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
+                            );
+                        }
+                        OutputFormat::Wav | OutputFormat::Flac => {
+                            optional_audio_setting(
+                                ui,
+                                &mut self.conversion_options.audio_sample_rate,
+                                &mut self.conversion_options.audio_channels,
+                            );
+                        }
+                        _ => {
+                            ui.label(format!("{} doesn't have any settings.", target.label()));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Reset to defaults").clicked() {
+                        self.conversion_options = ConversionOptions::default();
                     }
                 });
         }
@@ -1713,13 +1836,14 @@ impl ConvertApp {
         let Some(target) = self.target else {
             return;
         };
+        let options = self.conversion_options;
         let (sender, receiver) = mpsc::channel();
         self.conversion_result = Some(receiver);
         self.conversion_notice = None;
         self.status = Some(("Converting your files...".to_owned(), false));
 
         thread::spawn(move || {
-            let result = convert_to_directory(&inputs, target, &output_directory);
+            let result = convert_to_directory(&inputs, target, options, &output_directory);
             let _ = sender.send(result);
         });
     }
@@ -2246,6 +2370,7 @@ fn file_size(path: &Path) -> String {
 fn convert_to_directory(
     inputs: &[PathBuf],
     target: OutputFormat,
+    options: ConversionOptions,
     output_directory: &Path,
 ) -> Result<String, String> {
     let mut files = Vec::with_capacity(inputs.len());
@@ -2253,7 +2378,8 @@ fn convert_to_directory(
         let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
         files.push((path.clone(), bytes));
     }
-    let converted = convert_batch(&files, target).map_err(|error| error.to_string())?;
+    let converted =
+        convert_batch_with_options(&files, target, options).map_err(|error| error.to_string())?;
     let mut written = Vec::with_capacity(converted.len());
     for file in converted {
         let output = write_unique(output_directory, &file.name, &file.bytes)

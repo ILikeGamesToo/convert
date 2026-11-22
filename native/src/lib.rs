@@ -49,6 +49,47 @@ pub enum OutputFormat {
     Gzip,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioChannels {
+    Mono,
+    Stereo,
+}
+
+impl AudioChannels {
+    pub fn count(self) -> usize {
+        match self {
+            Self::Mono => 1,
+            Self::Stereo => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mono => "Mono",
+            Self::Stereo => "Stereo",
+        }
+    }
+}
+
+/// User-selected encoding options. `None` keeps the encoder's default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConversionOptions {
+    pub jpeg_quality: Option<u8>,
+    pub png_compression: Option<u8>,
+    pub archive_compression: Option<u8>,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_channels: Option<AudioChannels>,
+}
+
+impl ConversionOptions {
+    pub const DEFAULT_JPEG_QUALITY: u8 = 75;
+    pub const DEFAULT_COMPRESSION_LEVEL: u8 = 6;
+    pub const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 44_100;
+    pub const MIN_AUDIO_SAMPLE_RATE: u32 = 1_000;
+    /// FLAC's encoder accepts at most 96 kHz, so the shared audio control stays within that range.
+    pub const MAX_AUDIO_SAMPLE_RATE: u32 = 96_000;
+}
+
 impl OutputFormat {
     pub const ALL: [Self; 29] = [
         Self::Png,
@@ -259,13 +300,22 @@ pub fn convert_bytes(
     input: &[u8],
     target: OutputFormat,
 ) -> Result<Vec<ConvertedFile>, ConvertError> {
+    convert_bytes_with_options(input_name, input, target, ConversionOptions::default())
+}
+
+pub fn convert_bytes_with_options(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    options: ConversionOptions,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
     let extension = file_extension(input_name);
     if target == OutputFormat::Zip {
         let name = safe_file_name(input_name);
         let entries = [(PathBuf::from(name), input.to_vec())];
-        let bytes = create_zip(&entries)?;
+        let bytes = create_zip(&entries, options.archive_compression)?;
         return Ok(vec![ConvertedFile {
-            name: output_name(input_name, "zip"),
+            name: output_name(input_name, target.extension()),
             bytes,
         }]);
     }
@@ -273,16 +323,16 @@ pub fn convert_bytes(
         let name = safe_file_name(input_name);
         let entries = [(PathBuf::from(name), input.to_vec())];
         let gzip = target == OutputFormat::TarGz;
-        let bytes = create_tar(&entries, gzip)?;
+        let bytes = create_tar(&entries, gzip, options.archive_compression)?;
         return Ok(vec![ConvertedFile {
-            name: output_name(input_name, if gzip { "tar.gz" } else { "tar" }),
+            name: output_name(input_name, target.extension()),
             bytes,
         }]);
     }
     if target == OutputFormat::Gzip {
         return Ok(vec![ConvertedFile {
             name: PathBuf::from(format!("{}.gz", safe_file_name(input_name))),
-            bytes: gzip_bytes(input)?,
+            bytes: gzip_bytes(input, options.archive_compression)?,
         }]);
     }
 
@@ -295,7 +345,7 @@ pub fn convert_bytes(
         } else {
             image::load_from_memory(input)?
         };
-        let bytes = encode_image(image, format)?;
+        let bytes = encode_image(image, format, options)?;
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
             bytes,
@@ -306,7 +356,7 @@ pub fn convert_bytes(
         if !is_audio_extension(&extension) {
             return Err(unsupported(&extension, target));
         }
-        let audio = decode_audio(input, &extension)?;
+        let audio = apply_audio_options(decode_audio(input, &extension)?, options)?;
         let bytes = match target {
             OutputFormat::Wav => encode_wav(&audio)?,
             OutputFormat::Flac => encode_flac(&audio)?,
@@ -324,6 +374,14 @@ pub fn convert_bytes(
 pub fn convert_batch(
     inputs: &[(PathBuf, Vec<u8>)],
     target: OutputFormat,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    convert_batch_with_options(inputs, target, ConversionOptions::default())
+}
+
+pub fn convert_batch_with_options(
+    inputs: &[(PathBuf, Vec<u8>)],
+    target: OutputFormat,
+    options: ConversionOptions,
 ) -> Result<Vec<ConvertedFile>, ConvertError> {
     if inputs.is_empty() {
         return Err(ConvertError::NoInputFiles);
@@ -345,9 +403,18 @@ pub fn convert_batch(
         }
 
         let (name, bytes) = match target {
-            OutputFormat::Zip => ("converted.zip", create_zip(&entries)?),
-            OutputFormat::Tar => ("converted.tar", create_tar(&entries, false)?),
-            OutputFormat::TarGz => ("converted.tar.gz", create_tar(&entries, true)?),
+            OutputFormat::Zip => (
+                "converted.zip",
+                create_zip(&entries, options.archive_compression)?,
+            ),
+            OutputFormat::Tar => (
+                "converted.tar",
+                create_tar(&entries, false, options.archive_compression)?,
+            ),
+            OutputFormat::TarGz => (
+                "converted.tar.gz",
+                create_tar(&entries, true, options.archive_compression)?,
+            ),
             _ => unreachable!("only archive targets reach this branch"),
         };
         return Ok(vec![ConvertedFile {
@@ -364,7 +431,7 @@ pub fn convert_batch(
                     "{}.gz",
                     safe_file_name(path.to_string_lossy().as_ref())
                 )),
-                bytes: gzip_bytes(bytes)?,
+                bytes: gzip_bytes(bytes, options.archive_compression)?,
             });
         }
         return Ok(converted);
@@ -372,13 +439,14 @@ pub fn convert_batch(
 
     let mut converted = Vec::new();
     for (path, bytes) in inputs {
-        converted.extend(convert_bytes(
+        converted.extend(convert_bytes_with_options(
             path.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .as_ref(),
             bytes,
             target,
+            options,
         )?);
     }
     Ok(converted)
@@ -624,11 +692,15 @@ fn text_to_csv(text: &str) -> Result<Vec<u8>, ConvertError> {
     Ok(writer.into_inner().map_err(|error| error.into_error())?)
 }
 
-fn create_zip(entries: &[(PathBuf, Vec<u8>)]) -> Result<Vec<u8>, ConvertError> {
+fn create_zip(
+    entries: &[(PathBuf, Vec<u8>)],
+    compression: Option<u8>,
+) -> Result<Vec<u8>, ConvertError> {
     let cursor = Cursor::new(Vec::new());
     let mut archive = zip::ZipWriter::new(cursor);
     let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(compression.map(|level| i64::from(level.clamp(1, 9))));
 
     for (name, bytes) in entries {
         let name = name.to_string_lossy().replace('\\', "/");
@@ -684,6 +756,7 @@ fn is_audio_extension(extension: &str) -> bool {
 fn encode_image(
     image: image::DynamicImage,
     format: image::ImageFormat,
+    options: ConversionOptions,
 ) -> Result<Vec<u8>, ConvertError> {
     if format == image::ImageFormat::Pnm {
         let image = image.to_rgb8();
@@ -723,7 +796,27 @@ fn encode_image(
     };
 
     let mut output = Cursor::new(Vec::new());
-    image.write_to(&mut output, format)?;
+    if format == image::ImageFormat::Jpeg {
+        let quality = options
+            .jpeg_quality
+            .unwrap_or(ConversionOptions::DEFAULT_JPEG_QUALITY)
+            .clamp(1, 100);
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
+        image.write_with_encoder(encoder)?;
+    } else if format == image::ImageFormat::Png {
+        let compression = match options.png_compression {
+            Some(level) => image::codecs::png::CompressionType::Level(level.clamp(1, 9)),
+            None => image::codecs::png::CompressionType::Fast,
+        };
+        let encoder = image::codecs::png::PngEncoder::new_with_quality(
+            &mut output,
+            compression,
+            image::codecs::png::FilterType::Adaptive,
+        );
+        image.write_with_encoder(encoder)?;
+    } else {
+        image.write_to(&mut output, format)?;
+    }
     Ok(output.into_inner())
 }
 
@@ -998,6 +1091,98 @@ fn decode_flac(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
     })
 }
 
+fn apply_audio_options(
+    mut audio: DecodedAudio,
+    options: ConversionOptions,
+) -> Result<DecodedAudio, ConvertError> {
+    if let Some(channels) = options.audio_channels {
+        audio = remix_channels(audio, channels);
+    }
+    if let Some(sample_rate) = options.audio_sample_rate {
+        audio = resample_audio(audio, sample_rate)?;
+    }
+    if audio.samples.len() > MAX_AUDIO_SAMPLES {
+        return Err(ConvertError::AudioTooLarge);
+    }
+    Ok(audio)
+}
+
+fn remix_channels(audio: DecodedAudio, target: AudioChannels) -> DecodedAudio {
+    let target_channels = target.count();
+    if audio.channels == target_channels {
+        return audio;
+    }
+
+    let frames = audio.samples.len() / audio.channels;
+    let mut samples = Vec::with_capacity(frames * target_channels);
+    for frame in audio.samples.chunks_exact(audio.channels) {
+        match target {
+            AudioChannels::Mono => {
+                samples.push(frame.iter().sum::<f32>() / audio.channels as f32);
+            }
+            AudioChannels::Stereo => {
+                if audio.channels == 1 {
+                    samples.extend_from_slice(&[frame[0], frame[0]]);
+                } else {
+                    samples.extend_from_slice(&frame[..2]);
+                }
+            }
+        }
+    }
+
+    DecodedAudio {
+        samples,
+        channels: target_channels,
+        sample_rate: audio.sample_rate,
+    }
+}
+
+fn resample_audio(audio: DecodedAudio, target_rate: u32) -> Result<DecodedAudio, ConvertError> {
+    let target_rate = target_rate.clamp(
+        ConversionOptions::MIN_AUDIO_SAMPLE_RATE,
+        ConversionOptions::MAX_AUDIO_SAMPLE_RATE,
+    );
+    if target_rate == audio.sample_rate {
+        return Ok(audio);
+    }
+
+    let channels = audio.channels;
+    let source_frames = audio.samples.len() / channels;
+    if source_frames == 0 {
+        return Ok(audio);
+    }
+    let target_frames = ((source_frames as f64 * f64::from(target_rate))
+        / f64::from(audio.sample_rate))
+    .round()
+    .max(1.0) as usize;
+    let sample_count = target_frames
+        .checked_mul(channels)
+        .ok_or(ConvertError::AudioTooLarge)?;
+    if sample_count > MAX_AUDIO_SAMPLES {
+        return Err(ConvertError::AudioTooLarge);
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for frame in 0..target_frames {
+        let source_position = frame as f64 * f64::from(audio.sample_rate) / f64::from(target_rate);
+        let source_floor = source_position.floor();
+        let source_index = (source_floor as usize).min(source_frames - 1);
+        let next_index = (source_index + 1).min(source_frames - 1);
+        let fraction = (source_position - source_floor) as f32;
+        for channel in 0..channels {
+            let current = audio.samples[source_index * channels + channel];
+            let next = audio.samples[next_index * channels + channel];
+            samples.push(current + (next - current) * fraction);
+        }
+    }
+
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate: target_rate,
+    })
+}
+
 fn strip_id3v2(input: &[u8]) -> &[u8] {
     if input.len() < 10 || &input[..3] != b"ID3" {
         return input;
@@ -1083,7 +1268,11 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     Ok(sink.as_slice().to_vec())
 }
 
-fn create_tar(entries: &[(PathBuf, Vec<u8>)], gzip: bool) -> Result<Vec<u8>, ConvertError> {
+fn create_tar(
+    entries: &[(PathBuf, Vec<u8>)],
+    gzip: bool,
+    compression: Option<u8>,
+) -> Result<Vec<u8>, ConvertError> {
     let mut builder = tar::Builder::new(Vec::new());
     for (name, bytes) in entries {
         let name = name.to_string_lossy().replace('\\', "/");
@@ -1097,14 +1286,18 @@ fn create_tar(entries: &[(PathBuf, Vec<u8>)], gzip: bool) -> Result<Vec<u8>, Con
     }
     let bytes = builder.into_inner()?;
     if gzip {
-        gzip_bytes(&bytes)
+        gzip_bytes(&bytes, compression)
     } else {
         Ok(bytes)
     }
 }
 
-fn gzip_bytes(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+fn gzip_bytes(input: &[u8], compression: Option<u8>) -> Result<Vec<u8>, ConvertError> {
+    let level = compression
+        .unwrap_or(ConversionOptions::DEFAULT_COMPRESSION_LEVEL)
+        .clamp(1, 9);
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level.into()));
     encoder.write_all(input)?;
     Ok(encoder.finish()?)
 }
@@ -1125,6 +1318,22 @@ mod tests {
         bytes.into_inner()
     }
 
+    fn detailed_png_fixture() -> Vec<u8> {
+        let mut pixels = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 4) as u8,
+                (y * 4) as u8,
+                ((x * 17 + y * 29) % 256) as u8,
+            ]);
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
     #[test]
     fn converts_between_supported_image_formats() {
         let result = convert_bytes("sample.png", &png_fixture(), OutputFormat::Webp).unwrap();
@@ -1133,6 +1342,132 @@ mod tests {
             image::load_from_memory_with_format(&result[0].bytes, image::ImageFormat::WebP)
                 .unwrap();
         assert_eq!((decoded.width(), decoded.height()), (2, 2));
+    }
+
+    #[test]
+    fn applies_jpeg_quality_and_png_compression_options() {
+        let input = detailed_png_fixture();
+        let low_quality = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Jpeg,
+            ConversionOptions {
+                jpeg_quality: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let high_quality = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Jpeg,
+            ConversionOptions {
+                jpeg_quality: Some(95),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(low_quality[0].name, PathBuf::from("sample.jpg"));
+        assert_eq!(high_quality[0].name, PathBuf::from("sample.jpg"));
+        assert!(
+            high_quality[0].bytes.len() > low_quality[0].bytes.len(),
+            "higher JPEG quality should produce a larger file"
+        );
+        assert!(image::load_from_memory_with_format(
+            &high_quality[0].bytes,
+            image::ImageFormat::Jpeg
+        )
+        .is_ok());
+
+        let fast_png = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                png_compression: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let best_png = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                png_compression: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fast_png[0].name, PathBuf::from("sample.png"));
+        assert_eq!(best_png[0].name, PathBuf::from("sample.png"));
+        assert!(
+            best_png[0].bytes.len() <= fast_png[0].bytes.len(),
+            "higher PNG compression should not produce a larger file"
+        );
+        assert!(
+            image::load_from_memory_with_format(&best_png[0].bytes, image::ImageFormat::Png)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn applies_archive_compression_options() {
+        let inputs = vec![(
+            PathBuf::from("note.txt"),
+            b"the same line repeated many times\n".repeat(2_000),
+        )];
+
+        let fast_zip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Zip,
+            ConversionOptions {
+                archive_compression: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let best_zip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Zip,
+            ConversionOptions {
+                archive_compression: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            best_zip[0].bytes.len() <= fast_zip[0].bytes.len(),
+            "higher ZIP compression should not produce a larger archive"
+        );
+        assert!(zip::ZipArchive::new(Cursor::new(&best_zip[0].bytes)).is_ok());
+
+        let fast_gzip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Gzip,
+            ConversionOptions {
+                archive_compression: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let best_gzip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Gzip,
+            ConversionOptions {
+                archive_compression: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            best_gzip[0].bytes.len() <= fast_gzip[0].bytes.len(),
+            "higher GZIP compression should not produce a larger file"
+        );
+        let mut decoder = flate2::read::GzDecoder::new(Cursor::new(&best_gzip[0].bytes));
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, inputs[0].1);
     }
 
     #[test]
@@ -1554,6 +1889,93 @@ mod tests {
         assert_eq!(decoded.samples.len(), original.samples.len());
         assert_eq!(decoded.samples, original.samples);
         assert_audible(&decoded.samples);
+    }
+
+    #[test]
+    fn applies_audio_sample_rate_and_channel_options() {
+        let wav = wav_fixture();
+
+        let upsampled = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&upsampled[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.samples.len(), 32_000);
+        assert_audible(&parsed.samples);
+
+        let mono = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&mono[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+
+        let stereo = convert_bytes_with_options(
+            "tone.wav",
+            &mono[0].bytes,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&stereo[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.samples.len(), 32_000);
+        assert_audible(&parsed.samples);
+
+        let flac = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let flac_wav = convert_bytes("tone.flac", &flac[0].bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&flac_wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+
+        let clamped = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_sample_rate: Some(384_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let clamped_wav = convert_bytes("tone.flac", &clamped[0].bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&clamped_wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 96_000);
+        assert_audible(&parsed.samples);
     }
 
     #[test]
