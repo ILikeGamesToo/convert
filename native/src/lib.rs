@@ -6487,6 +6487,194 @@ mod tests {
         );
     }
 
+    fn linear_resample_reference(
+        samples: &[f32],
+        channels: usize,
+        source_rate: u32,
+        target_rate: u32,
+    ) -> Vec<f32> {
+        if channels == 0 {
+            return Vec::new();
+        }
+        let frames = samples.len() / channels;
+        if frames == 0 {
+            return Vec::new();
+        }
+        let ratio = f64::from(target_rate) / f64::from(source_rate);
+        let target_frames = ((frames as f64 * ratio).round() as usize).max(1);
+        let mut output = Vec::with_capacity(target_frames * channels);
+        for frame in 0..target_frames {
+            let position = frame as f64 / ratio;
+            let left = position.floor() as usize;
+            let right = (left + 1).min(frames - 1);
+            let fraction = (position - left as f64) as f32;
+            for channel in 0..channels {
+                let a = samples[left * channels + channel];
+                let b = samples[right * channels + channel];
+                output.push(a + (b - a) * fraction);
+            }
+        }
+        output
+    }
+
+    fn mono_tone(rate: u32, frequency: f64, seconds: f64) -> super::DecodedAudio {
+        let frames = (rate as f64 * seconds).round() as usize;
+        super::DecodedAudio {
+            samples: (0..frames)
+                .map(|frame| {
+                    (std::f64::consts::TAU * frequency * frame as f64 / f64::from(rate)).sin()
+                        as f32
+                        * 0.5
+                })
+                .collect(),
+            channels: 1,
+            sample_rate: rate,
+            source_bits: None,
+        }
+    }
+
+    fn rms(samples: &[f32]) -> f64 {
+        (samples
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / samples.len() as f64)
+            .sqrt()
+    }
+
+    fn zero_crossings(samples: &[f32]) -> usize {
+        samples
+            .windows(2)
+            .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
+            .count()
+    }
+
+    #[test]
+    fn resampler_rejects_high_frequency_images_at_44_1_and_48_khz() {
+        // Sweep test tones across the region above the new 22.05 kHz Nyquist.
+        // Linear interpolation folds each one back into the output, while the
+        // band-limited path rejects it. (Frequencies must stay below the 24 kHz
+        // source Nyquist; a 30 kHz test tone would already alias at 48 kHz.)
+        for (target_rate, frequency) in [
+            (44_100, 23_000.0),
+            (44_100, 23_300.0),
+            (44_100, 23_600.0),
+            (44_100, 23_900.0),
+            // A non-integer 48 -> 32 kHz ratio has a 16 kHz output Nyquist.
+            (32_000, 23_000.0),
+        ] {
+            let source = mono_tone(48_000, frequency, 0.5);
+            let old = linear_resample_reference(&source.samples, 1, 48_000, target_rate);
+            let new = super::resample_audio(source, target_rate).unwrap();
+            assert!(
+                rms(&old) > 0.2,
+                "{frequency} Hz -> {target_rate}: the linear reference did not alias: RMS {}",
+                rms(&old)
+            );
+            assert!(
+                rms(&new.samples) < 0.03,
+                "{frequency} Hz -> {target_rate} aliased through the band-limited path at RMS {}",
+                rms(&new.samples)
+            );
+            if target_rate == 32_000 {
+                // 23 kHz sampled at 48 kHz and resampled to 32 kHz folds to
+                // 9 kHz with linear interpolation: a clearly low image.
+                assert!(
+                    (zero_crossings(&old) as i64 - 9_000).abs() < 100,
+                    "the linear reference did not produce the 9 kHz image: {} crossings",
+                    zero_crossings(&old)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resampler_preserves_passband_amplitude_and_frequency() {
+        for (source_rate, target_rate) in [(44_100, 48_000), (48_000, 44_100), (48_000, 32_000)] {
+            let source = mono_tone(source_rate, 10_000.0, 0.5);
+            let output = super::resample_audio(source, target_rate).unwrap();
+            assert_eq!(output.sample_rate, target_rate);
+            assert_eq!(
+                output.samples.len(),
+                ((source_rate as f64 * 0.5 * target_rate as f64 / source_rate as f64).round()
+                    as usize)
+            );
+            assert!(
+                (rms(&output.samples) - 0.353_553).abs() < 0.03,
+                "{source_rate} -> {target_rate}: passband RMS {}",
+                rms(&output.samples)
+            );
+            let crossings = zero_crossings(&output.samples);
+            let expected = (10_000.0 * 0.5 * 2.0) as i64;
+            assert!(
+                (crossings as i64 - expected).abs() < 20,
+                "{source_rate} -> {target_rate}: expected about {expected} crossings, got {crossings}"
+            );
+        }
+    }
+
+    #[test]
+    fn resampler_preserves_exact_frame_counts_and_streaming_continuity() {
+        let directory = stream_temp_dir("resampler-counts");
+        for (source_rate, frames, target_rate, expected) in [
+            (44_100, 44_100, 48_000, 48_000),
+            (48_000, 48_000, 44_100, 44_100),
+            // 48 kHz -> 32 kHz is a non-integer ratio (2/3).
+            (48_000, 48_000, 32_000, 32_000),
+            (44_100, 44_100, 32_000, 32_000),
+        ] {
+            let source = mono_tone(source_rate, 440.0, frames as f64 / source_rate as f64);
+            let direct = super::resample_audio(source, target_rate).unwrap();
+            assert_eq!(
+                direct.samples.len(),
+                expected,
+                "direct {source_rate}->{target_rate}"
+            );
+
+            let input = directory.join(format!("tone-{source_rate}-{frames}.wav"));
+            std::fs::write(&input, wav_fixture_at(source_rate, frames)).unwrap();
+            let streamed = stream_wav(
+                &input,
+                ConversionOptions {
+                    audio_sample_rate: Some(target_rate),
+                    ..Default::default()
+                },
+            );
+            let parsed = parse_wav(&streamed);
+            assert_eq!(parsed.sample_rate, target_rate);
+            assert_eq!(
+                parsed.samples.len(),
+                expected * usize::from(parsed.channels),
+                "streaming {source_rate}->{target_rate}"
+            );
+
+            let buffered = convert_bytes_with_options(
+                "tone.wav",
+                &wav_fixture_at(source_rate, frames),
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_sample_rate: Some(target_rate),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let buffered = parse_wav(&buffered[0].bytes);
+            assert_eq!(buffered.samples.len(), parsed.samples.len());
+            let max_difference = buffered
+                .samples
+                .iter()
+                .zip(&parsed.samples)
+                .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+                .max()
+                .unwrap();
+            assert!(
+                max_difference <= 2,
+                "streaming chunking changed samples by {max_difference} for {source_rate}->{target_rate}"
+            );
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn writes_24_bit_and_float_wav() {
         let wav = wav_fixture();
