@@ -3316,11 +3316,19 @@ mod tests {
             let parsed = parse_wav(&wav[0].bytes);
             assert_eq!(parsed.sample_rate, 48_000, "{name}");
             assert_eq!(parsed.channels, 1, "{name}");
-            assert!(
-                (parsed.samples.len() as i64 - 96_000).abs() <= 1_000,
-                "{name} decoded {} samples",
-                parsed.samples.len()
-            );
+            if name == "sample-vp9-opus.webm" {
+                // The source WebM carries the Opus end trim, so its audio is
+                // exactly 2 s long.
+                assert_eq!(parsed.samples.len(), 96_000, "{name}");
+            } else {
+                // The MP4 and remuxed WebM do not carry the end trim, so their
+                // decoded audio keeps the final packet's padding.
+                assert!(
+                    (parsed.samples.len() as i64 - 96_000).abs() <= 1_000,
+                    "{name} decoded {} samples",
+                    parsed.samples.len()
+                );
+            }
             assert_audible(&parsed.samples);
         }
     }
@@ -3347,7 +3355,7 @@ mod tests {
     }
 
     #[test]
-    fn trims_only_the_selected_audio_tracks_discard_padding() {
+    fn trims_discard_padding_for_the_selected_audio_track() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/sample-two-opus-tracks.webm");
         let input = std::fs::read(path).unwrap();
