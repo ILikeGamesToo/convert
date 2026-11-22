@@ -50,6 +50,7 @@ pub enum OutputFormat {
     Flac,
     Aiff,
     Au,
+    Opus,
     Zip,
     Tar,
     TarGz,
@@ -205,7 +206,7 @@ impl ConversionOptions {
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -237,6 +238,7 @@ impl OutputFormat {
         Self::Flac,
         Self::Aiff,
         Self::Au,
+        Self::Opus,
         Self::Zip,
         Self::Tar,
         Self::TarGz,
@@ -276,6 +278,7 @@ impl OutputFormat {
             Self::Flac => "FLAC audio",
             Self::Aiff => "AIFF audio",
             Self::Au => "AU audio",
+            Self::Opus => "Opus audio",
             Self::Zip => "ZIP archive",
             Self::Tar => "TAR archive",
             Self::TarGz => "TAR.GZ archive",
@@ -334,6 +337,7 @@ impl OutputFormat {
             Self::Flac => "flac",
             Self::Aiff => "aiff",
             Self::Au => "au",
+            Self::Opus => "opus",
             Self::Zip => "zip",
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
@@ -370,7 +374,9 @@ impl OutputFormat {
             | Self::TextUtf16Be
             | Self::TextUtf32Le
             | Self::TextUtf32Be => extension == "txt",
-            Self::Wav | Self::Flac | Self::Aiff | Self::Au => is_audio_extension(&extension),
+            Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus => {
+                is_audio_extension(&extension)
+            }
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
         }
     }
@@ -503,7 +509,11 @@ pub fn convert_bytes_with_options(
 
     if matches!(
         target,
-        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au
+        OutputFormat::Wav
+            | OutputFormat::Flac
+            | OutputFormat::Aiff
+            | OutputFormat::Au
+            | OutputFormat::Opus
     ) {
         if !is_audio_extension(&extension) {
             return Err(unsupported(&extension, target));
@@ -514,6 +524,7 @@ pub fn convert_bytes_with_options(
             OutputFormat::Flac => encode_flac(&audio)?,
             OutputFormat::Aiff => encode_aiff(&audio)?,
             OutputFormat::Au => encode_au(&audio)?,
+            OutputFormat::Opus => encode_opus(audio)?,
             _ => unreachable!("only audio targets reach this branch"),
         };
         return Ok(vec![ConvertedFile {
@@ -1407,9 +1418,22 @@ fn opus_stream_info(
             ConvertError::Audio("the Opus track does not declare a channel count".to_owned())
         })?;
     let channels = opus_channels(channels)?;
-    let pre_skip = codec_params
-        .delay
-        .or_else(|| head.map(|data| u32::from(u16::from_le_bytes([data[10], data[11]]))))
+    // The OpusHead pre-skip is the decoder delay. Container delay metadata is
+    // not the same number: in MP4 it is expressed in the track timescale and
+    // can be much larger, so only fall back to it when there is no header.
+    // Symphonia builds MP4 extra data by prefixing "OpusHead" to the big-endian
+    // dOps payload, so version 0 fields are big-endian while an Ogg OpusHead
+    // (version 1) stores them little-endian.
+    let pre_skip = head
+        .map(|data| {
+            let bytes = [data[10], data[11]];
+            if data[8] == 1 {
+                u32::from(u16::from_le_bytes(bytes))
+            } else {
+                u32::from(u16::from_be_bytes(bytes))
+            }
+        })
+        .or(codec_params.delay)
         .unwrap_or(0);
     Ok((channels, pre_skip))
 }
@@ -1654,6 +1678,87 @@ fn encode_au(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
         output.extend_from_slice(&sample_to_i16(*sample).to_be_bytes());
     }
     Ok(output)
+}
+
+fn opus_sample_rate(sample_rate: u32) -> u32 {
+    match sample_rate {
+        0..=8_000 => 8_000,
+        8_001..=12_000 => 12_000,
+        12_001..=16_000 => 16_000,
+        16_001..=24_000 => 24_000,
+        _ => 48_000,
+    }
+}
+
+fn encode_opus(audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+    use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
+
+    if audio.channels == 0 || audio.sample_rate == 0 || audio.samples.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    let mut audio = if audio.channels > 2 {
+        remix_channels(audio, AudioChannels::Stereo)
+    } else {
+        audio
+    };
+    let sample_rate = opus_sample_rate(audio.sample_rate);
+    if audio.sample_rate != sample_rate {
+        audio = resample_audio(audio, sample_rate)?;
+    }
+
+    let channels = audio.channels;
+    let mut encoder =
+        OpusEncoder::new(sample_rate as i32, channels, Application::Audio).map_err(|error| {
+            ConvertError::Audio(format!("could not start the Opus encoder: {error}"))
+        })?;
+    encoder.bitrate_bps = if channels == 1 { 64_000 } else { 96_000 };
+    let head = OpusHead::for_encoder(&encoder, sample_rate);
+    let pre_skip = u64::from(head.pre_skip);
+    let mut writer = OggOpusWriter::new(Vec::new(), head).map_err(|error| {
+        ConvertError::Audio(format!("could not start the Opus stream: {error}"))
+    })?;
+
+    let total = audio.samples.len() / channels;
+    let frame_size = (sample_rate / 50) as usize;
+    let ticks = 48_000 / sample_rate;
+    // The encoder runs `pre_skip` samples behind its input, so flush that much
+    // silence and round up to whole frames.
+    let flush = (pre_skip + u64::from(ticks) - 1) / u64::from(ticks);
+    let frames = (total + flush as usize + frame_size - 1) / frame_size;
+    let final_granule = pre_skip + total as u64 * 48_000 / u64::from(sample_rate);
+    let mut packet = vec![0_u8; MAX_PACKET_BYTES];
+    let mut block = vec![0.0f32; frame_size * channels];
+
+    for i in 0..frames {
+        let offset = i * frame_size;
+        let end = (offset + frame_size).min(total);
+        block.fill(0.0);
+        if offset < total {
+            block[..(end - offset) * channels]
+                .copy_from_slice(&audio.samples[offset * channels..end * channels]);
+        }
+        let len = encoder
+            .encode(&block, frame_size, &mut packet)
+            .map_err(|error| {
+                ConvertError::Audio(format!("could not encode Opus audio: {error}"))
+            })?;
+        if i + 1 == frames {
+            let duration = final_granule.saturating_sub(writer.granule() as u64) as u32;
+            writer
+                .write_packet_with_duration(&packet[..len], duration)
+                .map_err(|error| {
+                    ConvertError::Audio(format!("could not write the Opus stream: {error}"))
+                })?;
+        } else {
+            writer.write_packet(&packet[..len]).map_err(|error| {
+                ConvertError::Audio(format!("could not write the Opus stream: {error}"))
+            })?;
+        }
+    }
+
+    writer
+        .finish()
+        .map_err(|error| ConvertError::Audio(format!("could not finish the Opus stream: {error}")))
 }
 
 fn sample_to_i16(sample: f32) -> i16 {
@@ -2721,6 +2826,66 @@ mod tests {
     }
 
     #[test]
+    fn converts_wav_audio_to_opus_and_back() {
+        let wav = wav_fixture();
+
+        let opus = convert_bytes("tone.wav", &wav, OutputFormat::Opus).unwrap();
+        assert_eq!(opus[0].name, PathBuf::from("tone.opus"));
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+        let back = convert_bytes("tone.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert!(
+            (decoded.samples.len() as i64 - 96_000).abs() <= 1_000,
+            "decoded {} samples",
+            decoded.samples.len()
+        );
+        assert_audible(&decoded.samples);
+
+        let mono = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mono_back = convert_bytes("tone.opus", &mono[0].bytes, OutputFormat::Wav).unwrap();
+        let mono_decoded = parse_wav(&mono_back[0].bytes);
+        assert_eq!(mono_decoded.channels, 1);
+        assert!(
+            (mono_decoded.samples.len() as i64 - 48_000).abs() <= 1_000,
+            "decoded {} samples",
+            mono_decoded.samples.len()
+        );
+        assert_audible(&mono_decoded.samples);
+
+        let resampled = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let resampled_back =
+            convert_bytes("tone.opus", &resampled[0].bytes, OutputFormat::Wav).unwrap();
+        let resampled_decoded = parse_wav(&resampled_back[0].bytes);
+        assert_eq!(resampled_decoded.sample_rate, 48_000);
+        assert!(
+            (resampled_decoded.samples.len() as i64 - 96_000).abs() <= 1_000,
+            "decoded {} samples",
+            resampled_decoded.samples.len()
+        );
+        assert_audible(&resampled_decoded.samples);
+    }
+
+    #[test]
     fn writes_the_aiff_extended_sample_rate() {
         assert_eq!(
             super::extended_sample_rate(44_100),
@@ -2943,6 +3108,31 @@ mod tests {
     }
 
     #[test]
+    fn extracts_audio_from_vp9_opus_webm_mp4_webm_round_trip() {
+        for name in [
+            "sample-vp9-opus.webm",
+            "sample-vp9-opus.mp4",
+            "sample-vp9-opus-roundtrip.webm",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join(name);
+            let input = std::fs::read(path).unwrap();
+
+            let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&wav[0].bytes);
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.channels, 1, "{name}");
+            assert!(
+                (parsed.samples.len() as i64 - 96_000).abs() <= 1_000,
+                "{name} decoded {} samples",
+                parsed.samples.len()
+            );
+            assert_audible(&parsed.samples);
+        }
+    }
+
+    #[test]
     fn decodes_ogg_opus_audio() {
         use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
 
@@ -2995,6 +3185,7 @@ mod tests {
         assert!(OutputFormat::Wav.supports_input("song.mp3"));
         assert!(OutputFormat::Flac.supports_input("song.m4a"));
         assert!(OutputFormat::Aiff.supports_input("song.aiff"));
+        assert!(OutputFormat::Opus.supports_input("song.wav"));
         assert!(OutputFormat::Wav.supports_input("movie.mkv"));
         assert!(OutputFormat::Pbm.supports_input("photo.png"));
         assert!(OutputFormat::Yaml.supports_input("config.toml"));

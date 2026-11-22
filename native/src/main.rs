@@ -331,9 +331,11 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         OutputFormat::Csv | OutputFormat::Json | OutputFormat::Yaml | OutputFormat::Toml => {
             FormatCategory::Data
         }
-        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au => {
-            FormatCategory::Audio
-        }
+        OutputFormat::Wav
+        | OutputFormat::Flac
+        | OutputFormat::Aiff
+        | OutputFormat::Au
+        | OutputFormat::Opus => FormatCategory::Audio,
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip => {
             FormatCategory::Archive
         }
@@ -373,6 +375,7 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Flac => "FLAC",
         OutputFormat::Aiff => "AIFF",
         OutputFormat::Au => "AU",
+        OutputFormat::Opus => "OPUS",
         OutputFormat::Zip => "ZIP",
         OutputFormat::Tar => "TAR",
         OutputFormat::TarGz => "TAR.GZ",
@@ -413,6 +416,7 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Flac => "FLAC audio",
         OutputFormat::Aiff => "AIFF audio",
         OutputFormat::Au => "AU audio",
+        OutputFormat::Opus => "Opus audio",
         OutputFormat::Zip => "ZIP archive",
         OutputFormat::Tar => "TAR archive",
         OutputFormat::TarGz => "Gzipped TAR archive",
@@ -508,7 +512,11 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
         OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
             options.archive_compression.is_some()
         }
-        OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au => {
+        OutputFormat::Wav
+        | OutputFormat::Flac
+        | OutputFormat::Aiff
+        | OutputFormat::Au
+        | OutputFormat::Opus => {
             options.audio_sample_rate.is_some() || options.audio_channels.is_some()
         }
         OutputFormat::Pdf => {
@@ -1171,7 +1179,11 @@ impl ConvertApp {
                     ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
                 );
             }
-            OutputFormat::Wav | OutputFormat::Flac | OutputFormat::Aiff | OutputFormat::Au => {
+            OutputFormat::Wav
+            | OutputFormat::Flac
+            | OutputFormat::Aiff
+            | OutputFormat::Au
+            | OutputFormat::Opus => {
                 settings_section_heading(ui, "Audio", None);
                 ui.add_space(10.0);
                 optional_sample_rate(ui, &mut self.conversion_options.audio_sample_rate);
@@ -3372,6 +3384,7 @@ mod tests {
             OutputFormat::Flac,
             OutputFormat::Aiff,
             OutputFormat::Au,
+            OutputFormat::Opus,
             OutputFormat::Zip,
             OutputFormat::Tar,
             OutputFormat::TarGz,
@@ -3426,6 +3439,7 @@ mod tests {
                 OutputFormat::Flac,
                 OutputFormat::Aiff,
                 OutputFormat::Au,
+                OutputFormat::Opus,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
