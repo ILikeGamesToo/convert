@@ -4945,6 +4945,34 @@ mod tests {
         }
     }
 
+    fn decoded_tone_frequency(parsed: &ParsedWav) -> f64 {
+        let channels = usize::from(parsed.channels);
+        let frames = parsed.samples.len() / channels;
+        assert!(frames > 4, "not enough samples to measure a tone");
+        let start = frames / 4 * channels;
+        let end = frames * 3 / 4 * channels;
+        let first_channel: Vec<i16> = parsed.samples[start..end]
+            .iter()
+            .step_by(channels)
+            .copied()
+            .collect();
+        let crossings = first_channel
+            .windows(2)
+            .filter(|pair| (pair[0] < 0) != (pair[1] < 0))
+            .count();
+        crossings as f64 * f64::from(parsed.sample_rate) / (2.0 * first_channel.len() as f64)
+    }
+
+    fn decoded_rms(parsed: &ParsedWav) -> f64 {
+        (parsed
+            .samples
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / parsed.samples.len() as f64)
+            .sqrt()
+    }
+
     fn assert_audible(samples: &[i16]) {
         assert!(!samples.is_empty(), "the WAV contains no samples");
         let peak = samples
@@ -6248,6 +6276,192 @@ mod tests {
         assert_ne!(default_stream, second_stream);
         assert_eq!(parse_wav(&default_stream).samples.len(), 48_000);
         assert_eq!(parse_wav(&second_stream).samples.len(), 48_480);
+    }
+
+    #[test]
+    fn selected_audio_track_changes_the_decoded_tone() {
+        let name = "sample-two-opus-tracks.webm";
+        let input = fixture(name);
+        let path = fixture_path(name);
+
+        let default = parse_wav(&convert_bytes(name, &input, OutputFormat::Wav).unwrap()[0].bytes);
+        let first = parse_wav(
+            &convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_track: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap()[0]
+                .bytes,
+        );
+        let second = parse_wav(
+            &convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_track: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap()[0]
+                .bytes,
+        );
+
+        assert_eq!(default.samples.len(), 48_000);
+        assert_eq!(first.samples.len(), 48_000);
+        assert_eq!(second.samples.len(), 48_480);
+        assert!((decoded_tone_frequency(&default) - 440.0).abs() < 5.0);
+        assert!((decoded_tone_frequency(&first) - 440.0).abs() < 5.0);
+        assert!((decoded_tone_frequency(&second) - 880.0).abs() < 5.0);
+        for parsed in [&default, &first, &second] {
+            let rms = decoded_rms(parsed);
+            assert!(
+                (1_000.0..5_000.0).contains(&rms),
+                "decoded tone RMS is {rms:.1}"
+            );
+            assert_audible(&parsed.samples);
+        }
+
+        let default_stream = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+        let second_stream = parse_wav(&stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        ));
+        assert!((decoded_tone_frequency(&default_stream) - 440.0).abs() < 5.0);
+        assert!((decoded_tone_frequency(&second_stream) - 880.0).abs() < 5.0);
+        assert_eq!(second_stream.samples.len(), 48_480);
+
+        let mut output = Cursor::new(Vec::new());
+        let error = super::convert_audio_file_to_writer(
+            &path,
+            name,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn selects_the_audio_track_in_an_mp4_video() {
+        let name = "sample-video.mp4";
+        let input = fixture(name);
+        let tracks = super::audio_tracks(&input, "mp4").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AAC");
+        assert_eq!(tracks[0].channels, 1);
+        assert_eq!(tracks[0].sample_rate, 44_100);
+
+        let selected = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&selected[0].bytes);
+        assert_eq!(parsed.channels, 1);
+        assert_audible(&parsed.samples);
+
+        let error = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 2,
+                available: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn selected_audio_track_reaches_every_audio_encoder() {
+        let name = "sample-two-opus-tracks.webm";
+        let input = fixture(name);
+        for target in [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Aiff,
+            OutputFormat::Au,
+            OutputFormat::Opus,
+            OutputFormat::Mp3,
+        ] {
+            let encoded = convert_bytes_with_options(
+                name,
+                &input,
+                target,
+                ConversionOptions {
+                    audio_track: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let parsed = if target == OutputFormat::Au {
+                // AU is an output-only format here, so inspect its PCM payload
+                // directly instead of asking the decoder to read it back.
+                assert_eq!(&encoded[0].bytes[0..4], b".snd", "{target:?}");
+                let channels =
+                    u32::from_be_bytes(encoded[0].bytes[20..24].try_into().unwrap()) as u16;
+                let sample_rate = u32::from_be_bytes(encoded[0].bytes[16..20].try_into().unwrap());
+                let samples = encoded[0].bytes[24..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| i16::from_be_bytes(*bytes))
+                    .collect();
+                ParsedWav {
+                    channels,
+                    sample_rate,
+                    bits_per_sample: 16,
+                    samples,
+                }
+            } else {
+                let decoded = convert_bytes(
+                    encoded[0].name.to_string_lossy().as_ref(),
+                    &encoded[0].bytes,
+                    OutputFormat::Wav,
+                )
+                .unwrap();
+                parse_wav(&decoded[0].bytes)
+            };
+            assert_eq!(parsed.channels, 1, "{target:?}");
+            assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+            assert!(
+                (decoded_tone_frequency(&parsed) - 880.0).abs() < 20.0,
+                "{target:?} did not encode the second track: {} Hz",
+                decoded_tone_frequency(&parsed)
+            );
+            assert_audible(&parsed.samples);
+        }
     }
 
     #[test]
