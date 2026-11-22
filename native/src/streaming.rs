@@ -30,15 +30,6 @@ trait AudioChunkReader {
     fn next_chunk(&mut self) -> Result<Option<AudioChunk>, ConvertError>;
 }
 
-/// Frames to drop from the start, an optional exact length, and frames to
-/// discard from the end. All values are in source frames.
-#[derive(Clone, Copy, Default)]
-struct AudioTrim {
-    skip_frames: usize,
-    limit_frames: Option<usize>,
-    tail_padding: usize,
-}
-
 trait WriteSeek: Write + Seek {}
 impl<T: Write + Seek> WriteSeek for T {}
 
@@ -104,124 +95,20 @@ pub fn convert_audio_file_to_writer_with_cancel<W: Write + Seek>(
 }
 
 fn audio_trim(input_path: &Path, extension: &str, entry: &AudioTrackEntry) -> AudioTrim {
-    let mut trim = AudioTrim::default();
-
     if is_mp4_extension(extension) {
-        if let Some(moov) = read_mp4_moov(input_path) {
-            if entry.kind != AudioCodecKind::Opus {
-                if let Some((skip, total)) = mp4_gapless_info(&moov, entry.track_index) {
-                    trim.skip_frames = skip;
-                    trim.limit_frames = total;
-                }
-            }
-        }
-        return trim;
+        return read_mp4_moov(input_path)
+            .and_then(|moov| mp4_gapless_info(&moov, entry.track_index))
+            .map(|info| mp4_trim_for_kind(info, entry.kind, entry.pre_skip))
+            .unwrap_or_default();
     }
 
     // Ogg's Trim already handles the pre-skip and the final granule. Matroska
-    // stores the end padding separately, and it is only safe to associate the
-    // tail element with the track when there is a single audio track.
+    // stores the end trim on the selected track's final block; scan only the
+    // bounded tail so a long movie is still streamed, not buffered.
     if matches!(extension, "mkv" | "webm") && entry.kind == AudioCodecKind::Opus {
-        if let Some(padding_ns) = matroska_discard_padding_from_path(input_path, entry.info.id) {
-            trim.tail_padding = (((u128::from(padding_ns) * 48_000 + 500_000_000) / 1_000_000_000)
-                as usize)
-                .min(48_000);
-        }
+        return matroska_audio_timing_from_path(input_path, entry.info.id).to_trim();
     }
-    trim
-}
-
-/// Finds the last DiscardPadding element in the tail of a Matroska file. The
-/// element lives in the final BlockGroup, so scanning a bounded tail avoids
-/// reading a multi-gigabyte movie just to find a few bytes of metadata.
-fn matroska_discard_padding_from_path(path: &Path, track_id: u32) -> Option<u64> {
-    const TAIL_BYTES: u64 = 8 * 1024 * 1024;
-    let mut file = File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).ok()?;
-    if magic != [0x1A, 0x45, 0xDF, 0xA3] {
-        return None;
-    }
-    let tail_length = length.min(TAIL_BYTES);
-    file.seek(SeekFrom::Start(length - tail_length)).ok()?;
-    let mut tail = vec![0_u8; tail_length as usize];
-    file.read_exact(&mut tail).ok()?;
-
-    for position in (0..tail.len().saturating_sub(1)).rev() {
-        if tail[position] != 0x75 || tail[position + 1] != 0xA2 {
-            continue;
-        }
-        let mut cursor = position + 2;
-        let Some((size, _)) = read_ebml_vint(&tail, &mut cursor, 8, false) else {
-            continue;
-        };
-        if size > 8 {
-            continue;
-        }
-        if let Some(value) = read_ebml_signed(&tail, cursor, size) {
-            if value <= 0 {
-                continue;
-            }
-            // The padding belongs to the Block in its enclosing BlockGroup.
-            // Looking for the nearest preceding Block is not enough: with
-            // interleaved tracks that can be a Block from another language.
-            let search_start = position.saturating_sub(1024 * 1024);
-            for group_start in (search_start..position).rev() {
-                if tail[group_start] != 0xA0 {
-                    continue;
-                }
-                let mut group_cursor = group_start + 1;
-                let Some((group_size, _)) = read_ebml_vint(&tail, &mut group_cursor, 8, false)
-                else {
-                    continue;
-                };
-                let group_end = group_cursor.saturating_add(group_size as usize);
-                if group_end <= position || group_end > tail.len() {
-                    continue;
-                }
-                let mut block_track = None;
-                let mut group_padding = None;
-                while group_cursor < group_end {
-                    let Some((child_id, child_size)) = read_ebml_element(&tail, &mut group_cursor)
-                    else {
-                        break;
-                    };
-                    let Some(child_size) = child_size else {
-                        break;
-                    };
-                    let child_start = group_cursor;
-                    let Some(child_end) = child_start.checked_add(child_size as usize) else {
-                        break;
-                    };
-                    if child_end > group_end {
-                        break;
-                    }
-                    if child_id == 0xA1 {
-                        let mut block_cursor = child_start;
-                        if let Some((block_track_value, _)) =
-                            read_ebml_vint(&tail, &mut block_cursor, 8, false)
-                        {
-                            block_track = Some(block_track_value);
-                        }
-                    } else if child_id == 0x75A2 {
-                        if let Some(value) = read_ebml_signed(&tail, child_start, child_size) {
-                            if value > 0 {
-                                group_padding = Some(value as u64);
-                            }
-                        }
-                    }
-                    group_cursor = child_end;
-                }
-                if block_track == Some(u64::from(track_id)) {
-                    if let Some(value) = group_padding {
-                        return Some(value);
-                    }
-                }
-            }
-        }
-    }
-    None
+    AudioTrim::default()
 }
 
 fn open_reader(

@@ -1472,6 +1472,16 @@ impl DecodedAudio {
     }
 }
 
+/// Frames to drop from the start, an optional exact length, and frames to
+/// discard from the end. All values are in source frames after any decoder
+/// delay has already been removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AudioTrim {
+    skip_frames: usize,
+    limit_frames: Option<usize>,
+    tail_padding: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AudioCodecKind {
     Symphonia,
@@ -1485,6 +1495,10 @@ struct AudioTrackEntry {
     /// Position of the track in the container's track list. MP4 metadata
     /// boxes are indexed by this value, not by the audio-only ordinal.
     track_index: usize,
+    /// Opus decoder delay declared by the codec header. MP4 edit lists are
+    /// expressed on the undecoded timeline, so this must be removed from their
+    /// skip value when the decoder already dropped it.
+    pre_skip: u32,
 }
 
 /// Lists the audio tracks in a file so callers can choose one before
@@ -1532,6 +1546,7 @@ fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, Co
             },
             kind: AudioCodecKind::Symphonia,
             track_index: 0,
+            pre_skip: 0,
         }]);
     }
     if is_ogg_opus(head) {
@@ -1553,6 +1568,7 @@ fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, Co
             },
             kind: AudioCodecKind::Opus,
             track_index: 0,
+            pre_skip: 0,
         }]);
     }
     if is_raw_ac3(head, &extension) {
@@ -1572,6 +1588,7 @@ fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, Co
             },
             kind: AudioCodecKind::Ac3,
             track_index: 0,
+            pre_skip: 0,
         }]);
     }
 
@@ -1628,6 +1645,7 @@ fn audio_track_entries(
             },
             kind: AudioCodecKind::Symphonia,
             track_index: 0,
+            pre_skip: 0,
         }]);
     }
     if is_ogg_opus(input) {
@@ -1649,6 +1667,7 @@ fn audio_track_entries(
             },
             kind: AudioCodecKind::Opus,
             track_index: 0,
+            pre_skip: 0,
         }]);
     }
     if is_raw_ac3(input, extension) {
@@ -1668,6 +1687,7 @@ fn audio_track_entries(
             },
             kind: AudioCodecKind::Ac3,
             track_index: 0,
+            pre_skip: 0,
         }]);
     }
     symphonia_audio_track_entries(input, extension)
@@ -1738,14 +1758,15 @@ fn audio_track_entries_from_format(
             .filter(|data| data.starts_with(&[0x0B, 0x77]))
             .and_then(|data| filmcraft_ac3::parse_header(data).ok());
 
-        let (kind, codec, channels, sample_rate) =
+        let (kind, codec, channels, sample_rate, pre_skip) =
             if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
-                let (channels, _) = opus_stream_info(&codec_params).unwrap_or((0, 0));
+                let (channels, pre_skip) = opus_stream_info(&codec_params).unwrap_or((0, 0));
                 (
                     AudioCodecKind::Opus,
                     "Opus".to_owned(),
                     channels,
                     codec_params.sample_rate.unwrap_or(48_000),
+                    pre_skip,
                 )
             } else if let Some(header) = ac3_header {
                 (
@@ -1753,6 +1774,7 @@ fn audio_track_entries_from_format(
                     ac3_codec_label(&header).to_owned(),
                     header.channels(),
                     header.sample_rate,
+                    0,
                 )
             } else if known_audio {
                 let mut channels = codec_params
@@ -1777,6 +1799,7 @@ fn audio_track_entries_from_format(
                     symphonia_codec_label(codec_params.codec).to_owned(),
                     channels,
                     sample_rate,
+                    0,
                 )
             } else if codec_params.codec == CODEC_TYPE_NULL
                 && (codec_params.sample_rate.is_some() || codec_params.channels.is_some())
@@ -1792,6 +1815,7 @@ fn audio_track_entries_from_format(
                         .map(|channels| channels.count())
                         .unwrap_or(0),
                     codec_params.sample_rate.unwrap_or(0),
+                    0,
                 )
             } else {
                 continue;
@@ -1810,6 +1834,7 @@ fn audio_track_entries_from_format(
             },
             kind,
             track_index,
+            pre_skip,
         });
     }
 
@@ -1969,10 +1994,6 @@ fn decode_audio(
         return decode_ac3_elementary(input);
     }
 
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::errors::Error as SymphoniaError;
-
     let mut format = probe_symphonia(input, extension)?;
     let codec_params = format
         .tracks()
@@ -1980,21 +2001,52 @@ fn decode_audio(
         .find(|candidate| candidate.id == track_id)
         .map(|candidate| candidate.codec_params.clone())
         .ok_or(ConvertError::NoAudioTrack)?;
+    let pre_skip = if kind == AudioCodecKind::Opus {
+        opus_stream_info(&codec_params)
+            .map(|(_, pre_skip)| pre_skip)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mp4_gapless = if is_mp4_extension(extension) {
+        mp4_find(input, b"moov").and_then(|moov| mp4_gapless_info(moov, track_index))
+    } else {
+        None
+    };
 
-    if kind == AudioCodecKind::Opus {
-        return decode_opus_track(
-            format.as_mut(),
-            track_id,
-            &codec_params,
-            matroska_discard_padding(input, track_id),
-        );
+    let mut audio = if kind == AudioCodecKind::Opus {
+        decode_opus_track(format.as_mut(), track_id, &codec_params)?
+    } else if kind == AudioCodecKind::Ac3 {
+        decode_ac3_track(format.as_mut(), track_id)?
+    } else {
+        decode_symphonia_track(format.as_mut(), track_id, &codec_params, track_channels)?
+    };
+
+    if let Some(info) = mp4_gapless {
+        apply_audio_trim(&mut audio, mp4_trim_for_kind(info, kind, pre_skip));
     }
-    if kind == AudioCodecKind::Ac3 {
-        return decode_ac3_track(format.as_mut(), track_id);
+    if matches!(extension, "mkv" | "webm") && kind == AudioCodecKind::Opus {
+        let timing = matroska_audio_timing(input, track_id);
+        apply_audio_trim(&mut audio, timing.to_trim());
     }
+    if audio.samples.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    Ok(audio)
+}
+
+fn decode_symphonia_track(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track_id: u32,
+    codec_params: &symphonia::core::codecs::CodecParameters,
+    track_channels: usize,
+) -> Result<DecodedAudio, ConvertError> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+        .make(codec_params, &DecoderOptions::default())
         .map_err(|error| {
             if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_AAC
                 && track_channels > 2
@@ -2066,25 +2118,6 @@ fn decode_audio(
         return Err(ConvertError::NoAudioTrack);
     }
 
-    // MP4 edit lists carry the AAC encoder delay and the intended duration.
-    // Symphonia exposes neither, so apply them here for non-Opus tracks.
-    if let Some(moov) = mp4_find(input, b"moov") {
-        if let Some((skip, total)) = mp4_gapless_info(moov, track_index) {
-            let frames = samples.len() / channels;
-            let skip = skip.min(frames);
-            samples.drain(..skip * channels);
-            if let Some(total) = total {
-                let available = samples.len() / channels;
-                if total < available {
-                    samples.truncate(total * channels);
-                }
-            }
-        }
-    }
-    if samples.is_empty() {
-        return Err(ConvertError::NoAudioTrack);
-    }
-
     let source_bits = codec_params
         .bits_per_sample
         .and_then(|bits| u16::try_from(bits).ok());
@@ -2094,6 +2127,46 @@ fn decode_audio(
         sample_rate,
         source_bits,
     })
+}
+
+fn mp4_trim_for_kind(info: Mp4Gapless, kind: AudioCodecKind, pre_skip: u32) -> AudioTrim {
+    let pre_skip = pre_skip as usize;
+    let skip_frames = if kind == AudioCodecKind::Opus {
+        info.skip.saturating_sub(pre_skip)
+    } else {
+        info.skip
+    };
+    let limit_frames = if kind == AudioCodecKind::Opus && !info.limit_is_presentation {
+        info.limit.map(|limit| limit.saturating_sub(pre_skip))
+    } else {
+        info.limit
+    };
+    AudioTrim {
+        skip_frames,
+        limit_frames,
+        tail_padding: 0,
+    }
+}
+
+fn apply_audio_trim(audio: &mut DecodedAudio, trim: AudioTrim) {
+    let channels = audio.channels.max(1);
+    let frames = audio.samples.len() / channels;
+    let skip = trim.skip_frames.min(frames);
+    if skip > 0 {
+        audio.samples.drain(..skip * channels);
+    }
+    if let Some(limit) = trim.limit_frames {
+        let available = audio.samples.len() / channels;
+        if limit < available {
+            audio.samples.truncate(limit * channels);
+        }
+    }
+    let padding = trim.tail_padding.min(audio.samples.len() / channels);
+    if padding > 0 {
+        audio
+            .samples
+            .truncate(audio.samples.len() - padding * channels);
+    }
 }
 
 fn is_mp4_container(input: &[u8]) -> bool {
@@ -2208,7 +2281,6 @@ fn decode_opus_track(
     format: &mut dyn symphonia::core::formats::FormatReader,
     track_id: u32,
     codec_params: &symphonia::core::codecs::CodecParameters,
-    end_padding_ns: Option<u64>,
 ) -> Result<DecodedAudio, ConvertError> {
     use opus_pure::{OpusDecoder, MAX_PACKET_SAMPLES};
 
@@ -2244,15 +2316,6 @@ fn decode_opus_track(
 
     let skip = (pre_skip as usize * channels).min(samples.len());
     samples.drain(..skip);
-
-    // Matroska's DiscardPadding trims the encoder's padding from the end of
-    // the last block. Symphonia does not expose it, so it comes from the
-    // container; round nanoseconds to the nearest 48 kHz sample.
-    if let Some(padding_ns) = end_padding_ns {
-        let padding = ((u128::from(padding_ns) * 48_000 + 500_000_000) / 1_000_000_000) as usize;
-        let padding = (padding * channels).min(samples.len());
-        samples.truncate(samples.len() - padding);
-    }
 
     if samples.is_empty() {
         return Err(ConvertError::NoAudioTrack);
@@ -2444,12 +2507,173 @@ fn read_ebml_signed(input: &[u8], pos: usize, size: u64) -> Option<i64> {
     Some(value)
 }
 
-/// Returns the Matroska `DiscardPadding` of the final block on `track_id`, in
-/// nanoseconds. Symphonia's Matroska reader ignores the element, but it is what
-/// trims the encoder's padding from the end of an Opus stream.
-fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
+const EBML_INFO_ID: u32 = 0x1549_A966;
+const EBML_TIMECODE_SCALE_ID: u32 = 0x002A_D7B1;
+const EBML_TIMECODE_ID: u32 = 0xE7;
+const EBML_SIMPLE_BLOCK_ID: u32 = 0xA3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MatroskaAudioTiming {
+    discard_padding_ns: Option<u64>,
+    last_block_timestamp_ns: Option<u64>,
+}
+
+impl MatroskaAudioTiming {
+    fn to_trim(self) -> AudioTrim {
+        let mut trim = AudioTrim::default();
+        if let Some(padding_ns) = self.discard_padding_ns {
+            trim.tail_padding = ns_to_frames(padding_ns, 48_000);
+        } else if let Some(timestamp_ns) = self.last_block_timestamp_ns.filter(|value| *value > 0) {
+            // Without DiscardPadding, the last block's timestamp is the only
+            // per-track presentation bound left in a remux. Do not include the
+            // final packet's decoder padding in the output.
+            trim.limit_frames = Some(ns_to_frames(timestamp_ns, 48_000));
+        }
+        trim
+    }
+}
+
+fn ns_to_frames(ns: u64, sample_rate: u32) -> usize {
+    ((u128::from(ns) * u128::from(sample_rate) + 500_000_000) / 1_000_000_000) as usize
+}
+
+fn ebml_element_end(start: usize, size: Option<u64>, limit: usize) -> usize {
+    size.and_then(|size| (start as u64).checked_add(size))
+        .map(|value| value.min(limit as u64) as usize)
+        .unwrap_or(limit)
+}
+
+fn read_ebml_uint(input: &[u8], pos: usize, size: u64) -> Option<u64> {
+    if size > 8 {
+        return None;
+    }
+    let bytes = input.get(pos..pos + size as usize)?;
+    let mut value = 0_u64;
+    for byte in bytes {
+        value = value.checked_shl(8)? | u64::from(*byte);
+    }
+    Some(value)
+}
+
+fn matroska_block_track_and_time(input: &[u8], start: usize, size: u64) -> Option<(u64, i64)> {
+    let end = start.checked_add(size as usize)?;
+    if end > input.len() {
+        return None;
+    }
+    let mut cursor = start;
+    let (track, _) = read_ebml_vint(input, &mut cursor, 8, false)?;
+    let relative = i16::from_be_bytes(input.get(cursor..cursor + 2)?.try_into().ok()?);
+    Some((track, i64::from(relative)))
+}
+
+fn matroska_timecode_scale(input: &[u8]) -> Option<u64> {
     if !input.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         return None;
+    }
+    let mut pos = 0;
+    let (segment_size, segment_start) = loop {
+        let (id, size) = read_ebml_element(input, &mut pos)?;
+        if id == EBML_SEGMENT_ID {
+            break (size, pos);
+        }
+        skip_ebml_element(input, &mut pos, size)?;
+    };
+    let segment_end = ebml_element_end(segment_start, segment_size, input.len());
+    let mut scan = segment_start;
+    while scan < segment_end {
+        let (id, size) = read_ebml_element(input, &mut scan)?;
+        let end = ebml_element_end(scan, size, segment_end);
+        if id == EBML_INFO_ID {
+            let mut info_pos = scan;
+            while info_pos < end {
+                let (child_id, child_size) = read_ebml_element(input, &mut info_pos)?;
+                let child_end = ebml_element_end(info_pos, child_size, end);
+                if child_id == EBML_TIMECODE_SCALE_ID {
+                    if let Some(value) = child_size
+                        .and_then(|size| read_ebml_uint(input, info_pos, size))
+                        .filter(|value| *value > 0)
+                    {
+                        return Some(value);
+                    }
+                }
+                info_pos = child_end;
+            }
+        }
+        scan = end;
+    }
+    None
+}
+
+fn matroska_audio_timing_from_path(path: &Path, track_id: u32) -> MatroskaAudioTiming {
+    const HEAD_BYTES: u64 = 4 * 1024 * 1024;
+    const TAIL_BYTES: u64 = 8 * 1024 * 1024;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return MatroskaAudioTiming::default(),
+    };
+    let length = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return MatroskaAudioTiming::default(),
+    };
+    let head_length = length.min(HEAD_BYTES);
+    let mut head = vec![0_u8; head_length as usize];
+    if file.read_exact(&mut head).is_err() {
+        return MatroskaAudioTiming::default();
+    }
+    let timecode_scale_ns = matroska_timecode_scale(&head).unwrap_or(1_000_000);
+
+    let tail_length = length.min(TAIL_BYTES);
+    if file.seek(SeekFrom::Start(length - tail_length)).is_err() {
+        return MatroskaAudioTiming::default();
+    }
+    let mut tail = vec![0_u8; tail_length as usize];
+    if file.read_exact(&mut tail).is_err() {
+        return MatroskaAudioTiming::default();
+    }
+
+    // The final cluster starts within the bounded tail for normal Matroska
+    // muxes. Search backwards so the first valid candidate is the latest one;
+    // the ID can also occur in compressed block data, so candidates are only
+    // accepted when parsing yields timing for the selected track.
+    let cluster_id = EBML_CLUSTER_ID.to_be_bytes();
+    if tail.len() >= cluster_id.len() {
+        for position in (0..=tail.len() - cluster_id.len()).rev() {
+            if tail[position..position + cluster_id.len()] != cluster_id {
+                continue;
+            }
+            let mut cursor = position;
+            let Some((id, size)) = read_ebml_element(&tail, &mut cursor) else {
+                continue;
+            };
+            if id != EBML_CLUSTER_ID {
+                continue;
+            }
+            let cluster_end = ebml_element_end(cursor, size, tail.len());
+            let mut timing = MatroskaAudioTiming::default();
+            if parse_matroska_cluster(
+                &tail,
+                cursor,
+                cluster_end,
+                timecode_scale_ns,
+                track_id,
+                &mut timing,
+            ) && (timing.discard_padding_ns.is_some()
+                || timing.last_block_timestamp_ns.is_some())
+            {
+                return timing;
+            }
+        }
+    }
+    MatroskaAudioTiming::default()
+}
+
+/// Reads per-track Opus timing from Matroska. `DiscardPadding` is the precise
+/// end trim when a muxer kept it. A remux often drops it, leaving only the last
+/// block timestamp; that timestamp still excludes the final packet's padding.
+fn matroska_audio_timing(input: &[u8], track_id: u32) -> MatroskaAudioTiming {
+    let mut timing = MatroskaAudioTiming::default();
+    if !input.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return timing;
     }
 
     let mut pos = 0;
@@ -2457,84 +2681,184 @@ fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
     let (segment_size, segment_start) = loop {
         visited += 1;
         if visited > 1_000_000 {
-            return None;
+            return timing;
         }
-        let (id, size) = read_ebml_element(input, &mut pos)?;
+        let Some((id, size)) = read_ebml_element(input, &mut pos) else {
+            return timing;
+        };
         if id == EBML_SEGMENT_ID {
             break (size, pos);
         }
-        skip_ebml_element(input, &mut pos, size)?;
+        if skip_ebml_element(input, &mut pos, size).is_none() {
+            return timing;
+        }
     };
-    let segment_end = match segment_size {
-        Some(size) => ((segment_start as u64).checked_add(size)?).min(input.len() as u64) as usize,
-        None => input.len(),
-    };
+    let segment_end = ebml_element_end(segment_start, segment_size, input.len());
 
-    let mut padding = None;
-    while pos < segment_end {
-        visited += 1;
-        if visited > 1_000_000 {
-            return None;
-        }
-        let (id, size) = read_ebml_element(input, &mut pos)?;
-        if id != EBML_CLUSTER_ID {
-            skip_ebml_element(input, &mut pos, size)?;
-            continue;
-        }
-        // An unknown-size cluster runs to the end of the segment; scanning it
-        // as one block still finds the last BlockGroup.
-        let cluster_end = match size {
-            Some(size) => ((pos as u64).checked_add(size)?).min(segment_end as u64) as usize,
-            None => segment_end,
+    let mut timecode_scale_ns = 1_000_000_u64;
+    let mut scan = segment_start;
+    while scan < segment_end {
+        let Some((id, size)) = read_ebml_element(input, &mut scan) else {
+            break;
         };
-        while pos < cluster_end {
-            visited += 1;
-            if visited > 1_000_000 {
-                return None;
-            }
-            let (id, size) = read_ebml_element(input, &mut pos)?;
-            if id != EBML_BLOCK_GROUP_ID {
-                skip_ebml_element(input, &mut pos, size)?;
-                continue;
-            }
-            let group_end = match size {
-                Some(size) => ((pos as u64).checked_add(size)?).min(cluster_end as u64) as usize,
-                None => cluster_end,
-            };
-            let mut block_track = None;
-            let mut group_padding = None;
-            while pos < group_end {
-                visited += 1;
-                if visited > 1_000_000 {
-                    return None;
-                }
-                let (id, size) = read_ebml_element(input, &mut pos)?;
-                if id == EBML_BLOCK_ID {
-                    let mut block_pos = pos;
-                    if let Some((number, _)) = read_ebml_vint(input, &mut block_pos, 8, false) {
-                        block_track = Some(number);
-                    }
-                } else if id == EBML_DISCARD_PADDING_ID {
-                    if let Some(size) = size {
-                        if let Some(value) = read_ebml_signed(input, pos, size) {
-                            if value > 0 {
-                                group_padding = Some(value as u64);
-                            }
+        let end = ebml_element_end(scan, size, segment_end);
+        if id == EBML_INFO_ID {
+            let mut info_pos = scan;
+            while info_pos < end {
+                let Some((child_id, child_size)) = read_ebml_element(input, &mut info_pos) else {
+                    break;
+                };
+                let child_end = child_size
+                    .and_then(|size| (info_pos as u64).checked_add(size))
+                    .map(|value| value.min(end as u64) as usize)
+                    .unwrap_or(end);
+                if child_id == EBML_TIMECODE_SCALE_ID {
+                    if let Some(value) =
+                        child_size.and_then(|size| read_ebml_uint(input, info_pos, size))
+                    {
+                        if value > 0 {
+                            timecode_scale_ns = value;
                         }
                     }
                 }
-                skip_ebml_element(input, &mut pos, size)?;
+                info_pos = child_end;
             }
-            if block_track == Some(u64::from(track_id)) {
-                if let Some(value) = group_padding {
-                    padding = Some(value);
+        }
+        scan = end;
+    }
+
+    scan = segment_start;
+    while scan < segment_end {
+        visited += 1;
+        if visited > 1_000_000 {
+            return timing;
+        }
+        let Some((id, size)) = read_ebml_element(input, &mut scan) else {
+            break;
+        };
+        let cluster_end = ebml_element_end(scan, size, segment_end);
+        if id != EBML_CLUSTER_ID {
+            scan = cluster_end;
+            continue;
+        }
+
+        if !parse_matroska_cluster(
+            input,
+            scan,
+            cluster_end,
+            timecode_scale_ns,
+            track_id,
+            &mut timing,
+        ) {
+            return timing;
+        }
+        scan = cluster_end;
+    }
+    timing
+}
+
+fn parse_matroska_cluster(
+    input: &[u8],
+    cluster_start: usize,
+    cluster_end: usize,
+    timecode_scale_ns: u64,
+    track_id: u32,
+    timing: &mut MatroskaAudioTiming,
+) -> bool {
+    let mut cluster_pos = cluster_start;
+    let mut cluster_time_ns = 0_u64;
+    let mut visited = 0usize;
+    while cluster_pos < cluster_end {
+        visited += 1;
+        if visited > 1_000_000 {
+            return false;
+        }
+        let Some((child_id, child_size)) = read_ebml_element(input, &mut cluster_pos) else {
+            break;
+        };
+        let child_end = ebml_element_end(cluster_pos, child_size, cluster_end);
+        match child_id {
+            EBML_TIMECODE_ID => {
+                if let Some(value) =
+                    child_size.and_then(|size| read_ebml_uint(input, cluster_pos, size))
+                {
+                    cluster_time_ns = value.saturating_mul(timecode_scale_ns);
                 }
             }
-            pos = group_end;
+            EBML_SIMPLE_BLOCK_ID => {
+                if let Some((track, relative)) = child_size
+                    .and_then(|size| matroska_block_track_and_time(input, cluster_pos, size))
+                {
+                    if track == u64::from(track_id) {
+                        timing.last_block_timestamp_ns = Some(block_timestamp_ns(
+                            cluster_time_ns,
+                            relative,
+                            timecode_scale_ns,
+                        ));
+                        timing.discard_padding_ns = None;
+                    }
+                }
+            }
+            EBML_BLOCK_GROUP_ID => {
+                let mut group_pos = cluster_pos;
+                let mut group_track = None;
+                let mut group_relative = None;
+                let mut group_padding = None;
+                while group_pos < child_end {
+                    let Some((group_child_id, group_child_size)) =
+                        read_ebml_element(input, &mut group_pos)
+                    else {
+                        break;
+                    };
+                    let group_child_end = ebml_element_end(group_pos, group_child_size, child_end);
+                    match group_child_id {
+                        EBML_BLOCK_ID => {
+                            if let Some((track, relative)) = group_child_size.and_then(|size| {
+                                matroska_block_track_and_time(input, group_pos, size)
+                            }) {
+                                group_track = Some(track);
+                                group_relative = Some(relative);
+                            }
+                        }
+                        EBML_DISCARD_PADDING_ID => {
+                            if let Some(value) = group_child_size
+                                .and_then(|size| read_ebml_signed(input, group_pos, size))
+                                .filter(|value| *value > 0)
+                            {
+                                group_padding = Some(value as u64);
+                            }
+                        }
+                        _ => {}
+                    }
+                    group_pos = group_child_end;
+                }
+                if group_track == Some(u64::from(track_id)) {
+                    if let Some(relative) = group_relative {
+                        timing.last_block_timestamp_ns = Some(block_timestamp_ns(
+                            cluster_time_ns,
+                            relative,
+                            timecode_scale_ns,
+                        ));
+                    }
+                    timing.discard_padding_ns = group_padding;
+                }
+            }
+            _ => {}
         }
-        pos = cluster_end;
+        cluster_pos = child_end;
     }
-    padding
+    true
+}
+
+fn block_timestamp_ns(cluster_time_ns: u64, relative: i64, timecode_scale_ns: u64) -> u64 {
+    let timestamp =
+        i128::from(cluster_time_ns) + i128::from(relative) * i128::from(timecode_scale_ns);
+    timestamp.max(0) as u64
+}
+
+#[cfg(test)]
+fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
+    matroska_audio_timing(input, track_id).discard_padding_ns
 }
 
 fn mp4_child_boxes(data: &[u8]) -> Vec<([u8; 4], &[u8])> {
@@ -2635,9 +2959,23 @@ fn mp4_timescale(mvhd_or_mdhd: &[u8]) -> Option<u32> {
     ))
 }
 
-/// Returns the AAC priming skip and intended duration from an MP4 edit list
-/// (or iTunes' `iTunSMPB` tag), both in media samples.
-fn mp4_gapless_info(moov: &[u8], track_index: usize) -> Option<(usize, Option<usize>)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mp4Gapless {
+    /// Samples to skip on the media timeline. This includes any codec delay
+    /// that a container-level edit list covers.
+    skip: usize,
+    /// Presentation samples after the skip, when the container declares an
+    /// exact length.
+    limit: Option<usize>,
+    /// Whether `limit` is a presentation length (edit list / `iTunSMPB`) rather
+    /// than the raw media duration from `mdhd`.
+    limit_is_presentation: bool,
+}
+
+/// Returns the MP4 priming skip and intended duration from an edit list (or
+/// iTunes' `iTunSMPB` tag), both in media samples. If neither is present, the
+/// track's own `mdhd` duration is used rather than the movie duration.
+fn mp4_gapless_info(moov: &[u8], track_index: usize) -> Option<Mp4Gapless> {
     let movie_timescale = mp4_timescale(mp4_find(moov, b"mvhd")?)?;
     let traks: Vec<&[u8]> = mp4_child_boxes(moov)
         .into_iter()
@@ -2650,28 +2988,24 @@ fn mp4_gapless_info(moov: &[u8], track_index: usize) -> Option<(usize, Option<us
     if hdlr.get(8..12) != Some(b"soun") {
         return None;
     }
-    let media_timescale = mp4_timescale(mp4_find(mdia, b"mdhd")?)?;
+    let mdhd = mp4_find(mdia, b"mdhd")?;
+    let media_timescale = mp4_timescale(mdhd)?;
+    let media_duration = mp4_media_duration(mdhd);
 
     if let Some(edts) = mp4_find(trak, b"edts") {
         if let Some(elst) = mp4_find(edts, b"elst") {
-            let version = *elst.first()?;
-            let count = u32::from_be_bytes(elst.get(4..8)?.try_into().ok()?) as usize;
-            if count > 0 {
-                let (duration, media_time) = if version == 1 {
-                    let duration = u64::from_be_bytes(elst.get(8..16)?.try_into().ok()?);
-                    let media_time = i64::from_be_bytes(elst.get(16..24)?.try_into().ok()?);
-                    (duration, media_time)
-                } else {
-                    let duration = u64::from(u32::from_be_bytes(elst.get(8..12)?.try_into().ok()?));
-                    let media_time =
-                        i64::from(i32::from_be_bytes(elst.get(12..16)?.try_into().ok()?));
-                    (duration, media_time)
-                };
-                if media_time >= 0 && media_timescale > 0 {
-                    let skip = media_time as usize;
-                    let total = (u128::from(duration) * u128::from(media_timescale)
-                        / u128::from(movie_timescale)) as usize;
-                    return Some((skip, Some(total)));
+            if let Some((duration, media_time)) = mp4_media_edit(elst) {
+                if media_time >= 0 && media_timescale > 0 && movie_timescale > 0 {
+                    let total = (duration > 0).then(|| {
+                        let scaled = u128::from(duration) * u128::from(media_timescale);
+                        ((scaled + u128::from(movie_timescale) / 2) / u128::from(movie_timescale))
+                            as usize
+                    });
+                    return Some(Mp4Gapless {
+                        skip: media_time as usize,
+                        limit: total,
+                        limit_is_presentation: true,
+                    });
                 }
             }
         }
@@ -2679,6 +3013,57 @@ fn mp4_gapless_info(moov: &[u8], track_index: usize) -> Option<(usize, Option<us
 
     // iTunes stores the same numbers as hex text in a freeform tag. It is the
     // fallback for files whose muxer omitted the edit list.
+    if let Some((skip, original)) = mp4_itunes_gapless_info(moov) {
+        return Some(Mp4Gapless {
+            skip,
+            limit: (original > 0).then_some(original),
+            limit_is_presentation: true,
+        });
+    }
+
+    // No edit list means the track has no priming trim, but its media header
+    // still gives the correct per-track duration. A movie-level duration is not
+    // usable here: a short video track or a different movie timescale would
+    // change the count.
+    media_duration
+        .filter(|duration| *duration > 0)
+        .map(|duration| Mp4Gapless {
+            skip: 0,
+            limit: Some(duration),
+            limit_is_presentation: false,
+        })
+}
+
+fn mp4_media_edit(elst: &[u8]) -> Option<(u64, i64)> {
+    let version = *elst.first()?;
+    let count = u32::from_be_bytes(elst.get(4..8)?.try_into().ok()?) as usize;
+    let entry_size = if version == 1 { 20 } else { 12 };
+    for index in 0..count {
+        let start = 8usize.checked_add(index.checked_mul(entry_size)?)?;
+        let (duration, media_time) = if version == 1 {
+            (
+                u64::from_be_bytes(elst.get(start..start + 8)?.try_into().ok()?),
+                i64::from_be_bytes(elst.get(start + 8..start + 16)?.try_into().ok()?),
+            )
+        } else {
+            (
+                u64::from(u32::from_be_bytes(
+                    elst.get(start..start + 4)?.try_into().ok()?,
+                )),
+                i64::from(i32::from_be_bytes(
+                    elst.get(start + 4..start + 8)?.try_into().ok()?,
+                )),
+            )
+        };
+        // Negative media times are empty edits (initial delay), not samples.
+        if media_time >= 0 {
+            return Some((duration, media_time));
+        }
+    }
+    None
+}
+
+fn mp4_itunes_gapless_info(moov: &[u8]) -> Option<(usize, usize)> {
     let tag = b"iTunSMPB";
     let tag_position = moov.windows(tag.len()).position(|window| window == tag)?;
     let data_position = moov[tag_position..]
@@ -2698,10 +3083,23 @@ fn mp4_gapless_info(moov: &[u8], track_index: usize) -> Option<(usize, Option<us
     }
     let skip = usize::from_str_radix(fields[0], 16).ok()?;
     let original = usize::from_str_radix(fields[2], 16).ok()?;
-    if original == 0 {
-        return None;
-    }
-    Some((skip, Some(original)))
+    Some((skip, original))
+}
+
+fn mp4_media_duration(mdhd: &[u8]) -> Option<usize> {
+    let offset = match mdhd.first()? {
+        0 => 16,
+        1 => 24,
+        _ => return None,
+    };
+    let duration = match mdhd.first()? {
+        0 => u64::from(u32::from_be_bytes(
+            mdhd.get(offset..offset + 4)?.try_into().ok()?,
+        )),
+        1 => u64::from_be_bytes(mdhd.get(offset..offset + 8)?.try_into().ok()?),
+        _ => return None,
+    };
+    usize::try_from(duration).ok()
 }
 
 fn opus_stream_info(
@@ -4822,56 +5220,74 @@ mod tests {
 
     #[test]
     fn extracts_audio_from_vp9_opus_webm_mp4_webm_round_trip() {
-        for name in [
-            "sample-vp9-opus.webm",
-            "sample-vp9-opus.mp4",
-            "sample-vp9-opus-roundtrip.webm",
+        for (name, expected) in [
+            // The source WebM carries 13.5 ms of DiscardPadding after the
+            // 2 s tone, so the precise trim is 96,000 samples.
+            ("sample-vp9-opus.webm", 96_000),
+            // The MP4 edit list starts 336 samples into the media and presents
+            // 2,001 ms. The Opus header's 312-sample pre-skip is already
+            // removed by the decoder, leaving a 24-sample additional skip.
+            ("sample-vp9-opus.mp4", 96_048),
+            // The remux dropped DiscardPadding. The final Opus block starts at
+            // 2,001 ms, which is the per-track end bound, so the final packet's
+            // padding must not be emitted.
+            ("sample-vp9-opus-roundtrip.webm", 96_048),
         ] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata")
-                .join(name);
-            let input = std::fs::read(path).unwrap();
+            let path = fixture_path(name);
+            let input = std::fs::read(&path).unwrap();
 
             let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
             let parsed = parse_wav(&wav[0].bytes);
             assert_eq!(parsed.sample_rate, 48_000, "{name}");
             assert_eq!(parsed.channels, 1, "{name}");
-            if name == "sample-vp9-opus.webm" {
-                // The source WebM carries the Opus end trim, so its audio is
-                // exactly 2 s long.
-                assert_eq!(parsed.samples.len(), 96_000, "{name}");
-            } else {
-                // The MP4 and remuxed WebM do not carry the end trim, so their
-                // decoded audio keeps the final packet's padding.
-                assert!(
-                    (parsed.samples.len() as i64 - 96_000).abs() <= 1_000,
-                    "{name} decoded {} samples",
-                    parsed.samples.len()
-                );
-            }
+            assert_eq!(parsed.samples.len(), expected, "{name} buffered");
             assert_audible(&parsed.samples);
+
+            let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+            assert_eq!(streamed.sample_rate, 48_000, "{name}");
+            assert_eq!(streamed.channels, 1, "{name}");
+            assert_eq!(streamed.samples.len(), expected, "{name} streaming");
+            assert_eq!(streamed.samples, parsed.samples, "{name} differs");
         }
+
+        let source = fixture("sample-vp9-opus.webm");
+        let source_timing = super::matroska_audio_timing(&source, 2);
+        assert_eq!(source_timing.discard_padding_ns, Some(13_500_000));
+        assert_eq!(source_timing.last_block_timestamp_ns, Some(2_001_000_000));
+
+        let remux = fixture("sample-vp9-opus-roundtrip.webm");
+        let remux_timing = super::matroska_audio_timing(&remux, 2);
+        assert_eq!(remux_timing.discard_padding_ns, None);
+        assert_eq!(remux_timing.last_block_timestamp_ns, Some(2_001_000_000));
     }
 
     #[test]
     fn converts_vp9_opus_webm_directly_to_opus_and_back() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-vp9-opus.webm");
-        let input = std::fs::read(path).unwrap();
+        for (name, expected) in [
+            // The source WebM carries the exact DiscardPadding trim.
+            ("sample-vp9-opus.webm", 96_000),
+            // The remuxed WebM has no DiscardPadding, so its final block
+            // timestamp supplies the 2,001 ms presentation length.
+            ("sample-vp9-opus-roundtrip.webm", 96_048),
+        ] {
+            let input = fixture(name);
+            let opus = convert_bytes(name, &input, OutputFormat::Opus).unwrap();
+            assert_eq!(
+                opus[0].name,
+                PathBuf::from(name).with_extension("opus"),
+                "{name}"
+            );
+            assert!(opus[0].bytes.starts_with(b"OggS"), "{name}");
 
-        let opus = convert_bytes("sample-vp9-opus.webm", &input, OutputFormat::Opus).unwrap();
-        assert_eq!(opus[0].name, PathBuf::from("sample-vp9-opus.opus"));
-        assert!(opus[0].bytes.starts_with(b"OggS"));
-
-        let back =
-            convert_bytes("sample-vp9-opus.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
-        let decoded = parse_wav(&back[0].bytes);
-        assert_eq!(decoded.sample_rate, 48_000);
-        assert_eq!(decoded.channels, 1);
-        // The fixture holds exactly 2 s of audio, and the WebM end trim is
-        // applied, so the round trip must reproduce the exact sample count.
-        assert_eq!(decoded.samples.len(), 96_000);
-        assert_audible(&decoded.samples);
+            let back = convert_bytes("tone.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+            let decoded = parse_wav(&back[0].bytes);
+            assert_eq!(decoded.sample_rate, 48_000, "{name}");
+            assert_eq!(decoded.channels, 1, "{name}");
+            // The end trim survives the decode and re-encode; no final-packet
+            // padding may reappear on the round trip.
+            assert_eq!(decoded.samples.len(), expected, "{name}");
+            assert_audible(&decoded.samples);
+        }
     }
 
     #[test]
@@ -5203,12 +5619,14 @@ mod tests {
 
     fn stream_wav(input: &Path, options: ConversionOptions) -> Vec<u8> {
         let mut output = std::io::Cursor::new(Vec::new());
-        super::convert_audio_file_to_writer(
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        super::convert_audio_file_to_writer_with_cancel(
             input,
             &input.file_name().unwrap().to_string_lossy(),
             OutputFormat::Wav,
             options,
             &mut output,
+            &cancel,
         )
         .unwrap();
         output.into_inner()
@@ -5831,7 +6249,14 @@ mod tests {
             let parsed = parse_wav(&wav[0].bytes);
             assert_eq!(parsed.sample_rate, 48_000, "{name}");
             assert_eq!(parsed.channels, 6, "{name}");
-            assert_eq!(parsed.samples.len(), 96_768 * 6, "{name}");
+            let expected_frames = if name == "sample-ac3.mp4" {
+                // The MP4 edit list skips 256 samples and presents 2 s.
+                96_000
+            } else {
+                // The elementary stream and Matroska fixture have no edit list.
+                96_768
+            };
+            assert_eq!(parsed.samples.len(), expected_frames * 6, "{name}");
             assert_audible(&parsed.samples);
 
             let stereo = convert_bytes_with_options(
@@ -5846,7 +6271,7 @@ mod tests {
             .unwrap();
             let stereo = parse_wav(&stereo[0].bytes);
             assert_eq!(stereo.channels, 2, "{name}");
-            assert_eq!(stereo.samples.len(), 96_768 * 2, "{name}");
+            assert_eq!(stereo.samples.len(), expected_frames * 2, "{name}");
             assert_audible(&stereo.samples);
         }
     }
@@ -5930,13 +6355,85 @@ mod tests {
 
     #[test]
     fn applies_mp4_edit_list_gapless_trimming() {
-        let input = fixture("sample-aac.m4a");
-        let wav = convert_bytes("sample-aac.m4a", &input, OutputFormat::Wav).unwrap();
-        let parsed = parse_wav(&wav[0].bytes);
-        assert_eq!(parsed.sample_rate, 44_100);
-        assert_eq!(parsed.channels, 1);
-        assert_eq!(parsed.samples.len(), 88_200);
-        assert_audible(&parsed.samples);
+        for (name, expected, channels, sample_rate) in [
+            // 2 s AAC: 1024 samples of encoder priming are removed, then the
+            // edit list's 88,200-sample presentation length is applied.
+            ("sample-aac.m4a", 88_200, 1, 44_100),
+            // No edit list here. The audio track's mdhd duration is 135,168
+            // samples; the movie duration is only 3,036 ms and would be wrong.
+            ("sample.m4a", 135_168, 1, 44_100),
+            // The video track's movie timing must not determine the audio
+            // track's length. This track is also 135,168 samples.
+            ("sample-video.mp4", 135_168, 1, 44_100),
+            // MP4 Opus: edit list media_time 336, duration 2,001 ms. The
+            // decoder already removed the 312-sample Opus pre-skip.
+            ("sample-vp9-opus.mp4", 96_048, 1, 48_000),
+            // MP4 AC-3: edit list skips 256 samples and presents 2 s.
+            ("sample-ac3.mp4", 96_000, 6, 48_000),
+        ] {
+            let path = fixture_path(name);
+            let input = std::fs::read(&path).unwrap();
+
+            let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&wav[0].bytes);
+            assert_eq!(parsed.sample_rate, sample_rate, "{name}");
+            assert_eq!(parsed.channels, channels, "{name}");
+            assert_eq!(
+                parsed.samples.len(),
+                expected * usize::from(channels),
+                "{name} buffered"
+            );
+            assert_audible(&parsed.samples);
+
+            let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+            assert_eq!(streamed.sample_rate, sample_rate, "{name}");
+            assert_eq!(streamed.channels, channels, "{name}");
+            assert_eq!(
+                streamed.samples.len(),
+                expected * usize::from(channels),
+                "{name} streaming"
+            );
+            assert_eq!(streamed.samples, parsed.samples, "{name} differs");
+        }
+
+        let aac = fixture("sample-aac.m4a");
+        let aac_info = super::mp4_gapless_info(super::mp4_find(&aac, b"moov").unwrap(), 0)
+            .expect("the AAC edit list is present");
+        assert_eq!(aac_info.skip, 1_024, "AAC priming was not read");
+        assert_eq!(aac_info.limit, Some(88_200));
+        assert!(aac_info.limit_is_presentation);
+
+        let m4a = fixture("sample.m4a");
+        let m4a_info = super::mp4_gapless_info(super::mp4_find(&m4a, b"moov").unwrap(), 0)
+            .expect("the audio track duration is present");
+        assert_eq!(m4a_info.skip, 0);
+        assert_eq!(m4a_info.limit, Some(135_168));
+        assert!(!m4a_info.limit_is_presentation);
+
+        let opus = fixture("sample-vp9-opus.mp4");
+        let opus_info = super::mp4_gapless_info(super::mp4_find(&opus, b"moov").unwrap(), 1)
+            .expect("the Opus edit list is present");
+        assert_eq!(opus_info.skip, 336);
+        assert_eq!(opus_info.limit, Some(96_048));
+        assert!(opus_info.limit_is_presentation);
+
+        let ac3 = fixture("sample-ac3.mp4");
+        let ac3_info = super::mp4_gapless_info(super::mp4_find(&ac3, b"moov").unwrap(), 0)
+            .expect("the AC-3 edit list is present");
+        assert_eq!(ac3_info.skip, 256);
+        assert_eq!(ac3_info.limit, Some(96_000));
+        assert!(ac3_info.limit_is_presentation);
+
+        // The Opus decoder already consumed the 312-sample header delay, so
+        // only the remaining 24 samples of the edit list offset are skipped.
+        assert_eq!(
+            super::mp4_trim_for_kind(opus_info, super::AudioCodecKind::Opus, 312),
+            super::AudioTrim {
+                skip_frames: 24,
+                limit_frames: Some(96_048),
+                tail_padding: 0,
+            }
+        );
     }
 
     #[test]
