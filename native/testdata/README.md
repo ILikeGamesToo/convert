@@ -25,3 +25,42 @@ These files are used only by the `native` conversion tests to verify OGG, Opus, 
     -map 0:a -map 1:a -c:a libopus -b:a 96k -ar 48000 -ac 1 \
     sample-two-opus-tracks.webm
   ```
+- `sample-aac.m4a` — 2 s of 440 Hz mono AAC-LC at 44.1 kHz with an MP4 edit list (1024-sample priming, 88,200-sample duration). Used to verify that the edit list trims AAC priming and padding. Generated with FFmpeg 9.1's native AAC encoder:
+
+  ```sh
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=44100:duration=2 \
+    -c:a aac -b:a 128k sample-aac.m4a
+  ```
+- `sample-aac-51.m4a` — 2 s of 440 Hz AAC-LC in 5.1 at 48 kHz. The track is listed with six channels; Symphonia's AAC decoder only handles up to stereo, so this fixture also verifies the clear multichannel-AAC error:
+
+  ```sh
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
+    -af "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0" \
+    -c:a aac -b:a 384k sample-aac-51.m4a
+  ```
+- `sample-ac3.ac3`, `sample-ac3.mkv`, and `sample-ac3.mp4` — the same 2 s of 440 Hz AC-3 in 5.1 at 48 kHz, as an elementary stream, in Matroska, and in MP4. The three containers exercise the raw syncframe walker and the packet paths:
+
+  ```sh
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
+    -af "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0" \
+    -c:a ac3 -b:a 384k sample-ac3.ac3
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
+    -af "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0" \
+    -c:a ac3 -b:a 384k sample-ac3.mkv
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
+    -af "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0" \
+    -c:a ac3 -b:a 384k sample-ac3.mp4
+  ```
+- `sample-eac3.mkv` — 2 s of 440 Hz E-AC-3 in 5.1 at 48 kHz:
+
+  ```sh
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
+    -af "pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0" \
+    -c:a eac3 -b:a 384k sample-eac3.mkv
+  ```
+- `sample-ac3-center.ac3` — 2 s of 440 Hz AC-3 in 5.1 with audio only in the centre channel. A stereo downmix that keeps just the first two channels would be silent, so this fixture proves the standard centre/surround coefficients are applied:
+
+  ```sh
+  ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
+    -af "pan=5.1|FC=c0" -c:a ac3 -b:a 192k sample-ac3-center.ac3
+  ```

@@ -16,6 +16,10 @@ pub use input_extensions::supported_input_extensions;
 const MAX_AUDIO_SAMPLES: usize = 120_000_000;
 const MAX_SVG_DIMENSION: u32 = 8_192;
 const MAX_SVG_PIXELS: u64 = 32_000_000;
+const MAX_IMAGE_DIMENSION: u32 = 32_768;
+const MAX_IMAGE_ALLOC: u64 = 512 * 1024 * 1024;
+const MAX_PDF_PAGES: usize = 5_000;
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputFormat {
@@ -51,6 +55,7 @@ pub enum OutputFormat {
     Aiff,
     Au,
     Opus,
+    Mp3,
     Zip,
     Tar,
     TarGz,
@@ -61,6 +66,78 @@ pub enum OutputFormat {
 pub enum AudioChannels {
     Mono,
     Stereo,
+}
+
+/// Sample format for WAV and FLAC output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AudioBitDepth {
+    #[default]
+    Bit16,
+    Bit24,
+    Float32,
+}
+
+impl AudioBitDepth {
+    pub const ALL: [Self; 3] = [Self::Bit16, Self::Bit24, Self::Float32];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bit16 => "16-bit",
+            Self::Bit24 => "24-bit",
+            Self::Float32 => "32-bit float",
+        }
+    }
+
+    /// Bits used to store one sample.
+    pub fn bits(self) -> u16 {
+        match self {
+            Self::Bit16 => 16,
+            Self::Bit24 => 24,
+            Self::Float32 => 32,
+        }
+    }
+}
+
+/// One audio track that can be decoded from an input file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTrackInfo {
+    /// Container track ID.
+    pub id: u32,
+    /// Human-readable codec name, such as `AAC` or `AC-3`.
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub channels: usize,
+    pub sample_rate: u32,
+    /// The first audio track, used when no track is selected.
+    pub default: bool,
+}
+
+impl AudioTrackInfo {
+    /// A compact label for pickers: `#2 · eng · AC-3 · 5.1 · 48 kHz`.
+    pub fn label(&self) -> String {
+        let mut parts = vec![format!("#{}", self.id)];
+        if let Some(language) = self.language.as_deref().filter(|value| *value != "und") {
+            parts.push(language.to_owned());
+        }
+        parts.push(self.codec.clone());
+        parts.push(channel_label(self.channels).to_owned());
+        if self.sample_rate > 0 {
+            parts.push(format!("{:.1} kHz", f64::from(self.sample_rate) / 1000.0));
+        }
+        parts.join(" · ")
+    }
+}
+
+fn channel_label(channels: usize) -> &'static str {
+    match channels {
+        0 => "unknown",
+        1 => "mono",
+        2 => "stereo",
+        6 => "5.1",
+        8 => "7.1",
+        _ => "multichannel",
+    }
 }
 
 impl AudioChannels {
@@ -163,6 +240,14 @@ pub struct ConversionOptions {
     pub archive_compression: Option<u8>,
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<AudioChannels>,
+    /// Zero-based index of the audio track to decode. `None` uses the first.
+    pub audio_track: Option<usize>,
+    pub audio_bit_depth: AudioBitDepth,
+    /// Background used when an image with transparency is saved to a format
+    /// without an alpha channel.
+    pub image_background: [u8; 3],
+    /// Apply the EXIF orientation tag when decoding photos.
+    pub image_apply_exif_orientation: bool,
     pub pdf_page_size: PdfPageSize,
     pub pdf_orientation: PdfOrientation,
     pub pdf_image_fit: PdfImageFit,
@@ -178,6 +263,10 @@ impl Default for ConversionOptions {
             archive_compression: None,
             audio_sample_rate: None,
             audio_channels: None,
+            audio_track: None,
+            audio_bit_depth: AudioBitDepth::Bit16,
+            image_background: Self::DEFAULT_IMAGE_BACKGROUND,
+            image_apply_exif_orientation: true,
             pdf_page_size: Self::DEFAULT_PDF_PAGE_SIZE,
             pdf_orientation: Self::DEFAULT_PDF_ORIENTATION,
             pdf_image_fit: Self::DEFAULT_PDF_IMAGE_FIT,
@@ -192,6 +281,7 @@ impl ConversionOptions {
     pub const DEFAULT_COMPRESSION_LEVEL: u8 = 6;
     pub const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 44_100;
     pub const MIN_AUDIO_SAMPLE_RATE: u32 = 1_000;
+    pub const DEFAULT_IMAGE_BACKGROUND: [u8; 3] = [255, 255, 255];
     /// FLAC's encoder accepts at most 96 kHz, so the shared audio control stays within that range.
     pub const MAX_AUDIO_SAMPLE_RATE: u32 = 96_000;
     pub const DEFAULT_PDF_PAGE_SIZE: PdfPageSize = PdfPageSize::A4;
@@ -206,7 +296,7 @@ impl ConversionOptions {
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 37] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -239,6 +329,7 @@ impl OutputFormat {
         Self::Aiff,
         Self::Au,
         Self::Opus,
+        Self::Mp3,
         Self::Zip,
         Self::Tar,
         Self::TarGz,
@@ -279,6 +370,7 @@ impl OutputFormat {
             Self::Aiff => "AIFF audio",
             Self::Au => "AU audio",
             Self::Opus => "Opus audio",
+            Self::Mp3 => "MP3 audio",
             Self::Zip => "ZIP archive",
             Self::Tar => "TAR archive",
             Self::TarGz => "TAR.GZ archive",
@@ -338,6 +430,7 @@ impl OutputFormat {
             Self::Aiff => "aiff",
             Self::Au => "au",
             Self::Opus => "opus",
+            Self::Mp3 => "mp3",
             Self::Zip => "zip",
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
@@ -374,7 +467,7 @@ impl OutputFormat {
             | Self::TextUtf16Be
             | Self::TextUtf32Le
             | Self::TextUtf32Be => extension == "txt",
-            Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus => {
+            Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus | Self::Mp3 => {
                 is_audio_extension(&extension)
             }
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
@@ -411,10 +504,16 @@ pub enum ConvertError {
     Svg(String),
     #[error("the SVG is too large to render")]
     SvgTooLarge,
+    #[error("the text needs {pages} PDF pages, more than the {max}-page limit")]
+    PdfTooManyPages { pages: usize, max: usize },
     #[error("the audio file has no decodable audio track")]
     NoAudioTrack,
+    #[error("audio track {requested} does not exist; the file has {available} audio track(s)")]
+    AudioTrackNotFound { requested: usize, available: usize },
     #[error("the audio file is too large to convert in memory")]
     AudioTooLarge,
+    #[error("the archive would contain {count} entries, more than the {max}-entry limit")]
+    ArchiveTooManyEntries { count: usize, max: usize },
     #[error("could not decode audio: {0}")]
     Audio(String),
     #[error("TOML output requires an object at the top level")]
@@ -498,7 +597,7 @@ pub fn convert_bytes_with_options(
         let image = if extension == "svg" {
             rasterize_svg(input)?
         } else {
-            image::load_from_memory(input)?
+            load_image(input, options)?
         };
         let bytes = encode_image(image, target, options)?;
         return Ok(vec![ConvertedFile {
@@ -514,6 +613,7 @@ pub fn convert_bytes_with_options(
             | OutputFormat::Aiff
             | OutputFormat::Au
             | OutputFormat::Opus
+            | OutputFormat::Mp3
     ) {
         if !is_audio_extension(&extension) {
             return Err(unsupported(&extension, target));
@@ -521,21 +621,28 @@ pub fn convert_bytes_with_options(
         // Opus only accepts 8/12/16/24/48 kHz. Map the requested rate before
         // the shared audio options resample so it goes straight to the rate the
         // encoder uses instead of resampling twice.
-        let audio_options = if target == OutputFormat::Opus {
-            ConversionOptions {
+        let audio_options = match target {
+            OutputFormat::Opus => ConversionOptions {
                 audio_sample_rate: options.audio_sample_rate.map(opus_sample_rate),
                 ..options
-            }
-        } else {
-            options
+            },
+            OutputFormat::Mp3 => ConversionOptions {
+                audio_sample_rate: options.audio_sample_rate.map(mp3_sample_rate),
+                ..options
+            },
+            _ => options,
         };
-        let audio = apply_audio_options(decode_audio(input, &extension)?, audio_options)?;
+        let audio = apply_audio_options(
+            decode_audio(input, &extension, options.audio_track)?,
+            audio_options,
+        )?;
         let bytes = match target {
-            OutputFormat::Wav => encode_wav(&audio)?,
-            OutputFormat::Flac => encode_flac(&audio)?,
+            OutputFormat::Wav => encode_wav(&audio, options.audio_bit_depth)?,
+            OutputFormat::Flac => encode_flac(&audio, options.audio_bit_depth)?,
             OutputFormat::Aiff => encode_aiff(&audio)?,
             OutputFormat::Au => encode_au(&audio)?,
             OutputFormat::Opus => encode_opus(audio)?,
+            OutputFormat::Mp3 => encode_mp3(audio)?,
             _ => unreachable!("only audio targets reach this branch"),
         };
         return Ok(vec![ConvertedFile {
@@ -567,6 +674,12 @@ pub fn convert_batch_with_options(
         target,
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
     ) {
+        if inputs.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(ConvertError::ArchiveTooManyEntries {
+                count: inputs.len(),
+                max: MAX_ARCHIVE_ENTRIES,
+            });
+        }
         let mut seen_names = HashSet::new();
         let mut entries = Vec::with_capacity(inputs.len());
 
@@ -725,13 +838,14 @@ fn decode_text(input: &[u8]) -> Result<String, ConvertError> {
 
 fn decode_utf16(input: &[u8], little_endian: bool) -> String {
     let words = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
-            let bytes = [pair[0], pair[1]];
             if little_endian {
-                u16::from_le_bytes(bytes)
+                u16::from_le_bytes(*pair)
             } else {
-                u16::from_be_bytes(bytes)
+                u16::from_be_bytes(*pair)
             }
         })
         .collect::<Vec<_>>();
@@ -740,9 +854,11 @@ fn decode_utf16(input: &[u8], little_endian: bool) -> String {
 
 fn decode_utf32(input: &[u8], little_endian: bool) -> Result<String, ConvertError> {
     input
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| {
-            let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let bytes = *chunk;
             let code_point = if little_endian {
                 u32::from_le_bytes(bytes)
             } else {
@@ -929,6 +1045,145 @@ fn is_audio_extension(extension: &str) -> bool {
     input_extensions::AUDIO_INPUT_EXTENSIONS.contains(&extension)
 }
 
+fn load_image(
+    input: &[u8],
+    options: ConversionOptions,
+) -> Result<image::DynamicImage, ConvertError> {
+    let mut reader = image::ImageReader::new(Cursor::new(input)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    if !options.image_apply_exif_orientation {
+        return Ok(image);
+    }
+    Ok(match exif_orientation(input) {
+        Some(orientation) if orientation != 1 => apply_orientation(image, orientation),
+        _ => image,
+    })
+}
+
+/// Reads the EXIF orientation tag from JPEG, TIFF, or PNG (`eXIf`) input.
+fn exif_orientation(input: &[u8]) -> Option<u16> {
+    if input.starts_with(&[0xFF, 0xD8]) {
+        let mut position = 2;
+        while position + 4 <= input.len() {
+            if input[position] != 0xFF {
+                position += 1;
+                continue;
+            }
+            let marker = input[position + 1];
+            if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                position += 2;
+                continue;
+            }
+            if marker == 0xDA || marker == 0xD9 {
+                break;
+            }
+            let length = u16::from_be_bytes([input[position + 2], input[position + 3]]) as usize;
+            if length < 2 {
+                break;
+            }
+            if marker == 0xE1 {
+                let segment = input.get(position + 4..position + 2 + length)?;
+                if let Some(tiff) = segment.strip_prefix(b"Exif\0\0") {
+                    if let Some(orientation) = tiff_orientation(tiff) {
+                        return Some(orientation);
+                    }
+                }
+            }
+            position += 2 + length;
+        }
+        return None;
+    }
+    if input.starts_with(b"II*\0") || input.starts_with(b"MM\0*") {
+        return tiff_orientation(input);
+    }
+    if input.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let mut position = 8;
+        while position + 8 <= input.len() {
+            let length =
+                u32::from_be_bytes(input[position..position + 4].try_into().ok()?) as usize;
+            let kind = &input[position + 4..position + 8];
+            let body = input.get(position + 8..position + 8 + length)?;
+            if kind == b"eXIf" {
+                return tiff_orientation(body);
+            }
+            if kind == b"IEND" {
+                break;
+            }
+            position = position.checked_add(12 + length)?;
+        }
+    }
+    None
+}
+
+fn tiff_orientation(tiff: &[u8]) -> Option<u16> {
+    let little = tiff.starts_with(b"II");
+    if !little && !tiff.starts_with(b"MM") {
+        return None;
+    }
+    let read16 = |position: usize| -> Option<u16> {
+        let bytes = tiff.get(position..position + 2)?.try_into().ok()?;
+        Some(if little {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        })
+    };
+    let read32 = |position: usize| -> Option<u32> {
+        let bytes = tiff.get(position..position + 4)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    };
+    let ifd = read32(4)? as usize;
+    let entries = read16(ifd)? as usize;
+    for index in 0..entries {
+        let entry = ifd + 2 + index * 12;
+        if read16(entry)? == 0x0112 {
+            return read16(entry + 8);
+        }
+    }
+    None
+}
+
+fn apply_orientation(image: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+    match orientation {
+        2 => image.fliph(),
+        3 => image.rotate180(),
+        4 => image.flipv(),
+        5 => image.rotate90().fliph(),
+        6 => image.rotate90(),
+        7 => image.rotate270().fliph(),
+        8 => image.rotate270(),
+        _ => image,
+    }
+}
+
+/// Composites transparent pixels onto an opaque background.
+fn flatten_image(image: image::DynamicImage, background: [u8; 3]) -> image::DynamicImage {
+    if !image.color().has_alpha() {
+        return image;
+    }
+    let rgba = image.to_rgba8();
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (pixel, output) in rgba.pixels().zip(rgb.pixels_mut()) {
+        let alpha = u16::from(pixel[3]);
+        let inverse = 255 - alpha;
+        for channel in 0..3 {
+            output[channel] = ((u16::from(pixel[channel]) * alpha
+                + u16::from(background[channel]) * inverse)
+                / 255) as u8;
+        }
+    }
+    image::DynamicImage::ImageRgb8(rgb)
+}
+
 fn encode_image(
     image: image::DynamicImage,
     target: OutputFormat,
@@ -937,6 +1192,20 @@ fn encode_image(
     let format = target
         .image_format()
         .expect("encode_image is only called for image targets");
+
+    let image = if matches!(
+        target,
+        OutputFormat::Jpeg
+            | OutputFormat::Bmp
+            | OutputFormat::Hdr
+            | OutputFormat::Ppm
+            | OutputFormat::Pbm
+            | OutputFormat::Pgm
+    ) {
+        flatten_image(image, options.image_background)
+    } else {
+        image
+    };
 
     if matches!(
         target,
@@ -1174,23 +1443,325 @@ fn is_end_of_stream(error: &symphonia::core::errors::Error) -> bool {
     }
 }
 
+#[derive(Clone, Debug)]
 struct DecodedAudio {
     samples: Vec<f32>,
     channels: usize,
     sample_rate: u32,
+    /// Precision of the source samples when known. Used to decide whether
+    /// reducing to 16-bit output needs dither.
+    source_bits: Option<u16>,
 }
 
-fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertError> {
+impl DecodedAudio {
+    fn frames(&self) -> usize {
+        self.samples.len() / self.channels.max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioCodecKind {
+    Symphonia,
+    Opus,
+    Ac3,
+}
+
+struct AudioTrackEntry {
+    info: AudioTrackInfo,
+    kind: AudioCodecKind,
+}
+
+/// Lists the audio tracks in a file so callers can choose one before
+/// converting. The first entry is the default track.
+pub fn audio_tracks(input: &[u8], extension: &str) -> Result<Vec<AudioTrackInfo>, ConvertError> {
+    Ok(audio_track_entries(input, extension)?
+        .into_iter()
+        .map(|entry| entry.info)
+        .collect())
+}
+
+fn audio_track_entries(
+    input: &[u8],
+    extension: &str,
+) -> Result<Vec<AudioTrackEntry>, ConvertError> {
     if extension == "flac" || input.starts_with(b"fLaC") {
-        return decode_flac(input);
+        let input = strip_id3v2(input);
+        let reader = claxon::FlacReader::new(Cursor::new(input)).map_err(|error| {
+            ConvertError::Audio(format!("could not open the FLAC stream: {error}"))
+        })?;
+        let info = reader.streaminfo();
+        return Ok(vec![AudioTrackEntry {
+            info: AudioTrackInfo {
+                id: 1,
+                codec: "FLAC".to_owned(),
+                language: None,
+                title: None,
+                channels: info.channels as usize,
+                sample_rate: info.sample_rate,
+                default: true,
+            },
+            kind: AudioCodecKind::Symphonia,
+        }]);
     }
     if is_ogg_opus(input) {
-        return decode_ogg_opus(input);
+        use opus_pure::OggOpusReader;
+        let reader = OggOpusReader::new(Cursor::new(input)).map_err(|error| {
+            ConvertError::Audio(format!("could not open the Opus stream: {error}"))
+        })?;
+        let head = reader.head();
+        return Ok(vec![AudioTrackEntry {
+            info: AudioTrackInfo {
+                id: 1,
+                codec: "Opus".to_owned(),
+                language: None,
+                title: None,
+                channels: head.channel_count as usize,
+                sample_rate: 48_000,
+                default: true,
+            },
+            kind: AudioCodecKind::Opus,
+        }]);
+    }
+    if is_raw_ac3(input, extension) {
+        let header = filmcraft_ac3::parse_header(input).map_err(|error| {
+            ConvertError::Audio(format!("could not read the AC-3 stream: {error}"))
+        })?;
+        return Ok(vec![AudioTrackEntry {
+            info: AudioTrackInfo {
+                id: 1,
+                codec: ac3_codec_label(&header).to_owned(),
+                language: None,
+                title: None,
+                channels: header.channels(),
+                sample_rate: header.sample_rate,
+                default: true,
+            },
+            kind: AudioCodecKind::Ac3,
+        }]);
+    }
+    symphonia_audio_track_entries(input, extension)
+}
+
+fn symphonia_audio_track_entries(
+    input: &[u8],
+    extension: &str,
+) -> Result<Vec<AudioTrackEntry>, ConvertError> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+
+    let mut format = probe_symphonia(input, extension)?;
+    let tracks: Vec<(
+        u32,
+        symphonia::core::codecs::CodecParameters,
+        Option<String>,
+    )> = format
+        .tracks()
+        .iter()
+        .map(|track| (track.id, track.codec_params.clone(), track.language.clone()))
+        .collect();
+
+    // Unknown codecs (AC-3/E-AC-3 in MKV and MP4 are reported as NULL) are
+    // identified from their first packet. Scanning stops once every track has
+    // been seen, so a long file is not read just to list its tracks.
+    let mut first_packets: Vec<(u32, Vec<u8>)> = Vec::new();
+    for _ in 0..1_024 {
+        if first_packets.len() == tracks.len() {
+            break;
+        }
+        match format.next_packet() {
+            Ok(packet) => {
+                if !first_packets.iter().any(|(id, _)| *id == packet.track_id()) {
+                    first_packets.push((
+                        packet.track_id(),
+                        packet.data[..packet.data.len().min(16)].to_vec(),
+                    ));
+                }
+            }
+            Err(_) => break,
+        }
     }
 
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_OPUS};
-    use symphonia::core::errors::Error as SymphoniaError;
+    let mut entries = Vec::new();
+    for (track_index, (id, codec_params, mut language)) in tracks.into_iter().enumerate() {
+        if language.is_none() && is_mp4_container(input) {
+            language = mp4_track_language(input, track_index);
+        }
+        let first_packet = first_packets
+            .iter()
+            .find(|(track, _)| *track == id)
+            .map(|(_, data)| data.as_slice());
+        let known_audio = is_known_audio_codec(codec_params.codec);
+        let ac3_header = first_packet
+            .filter(|data| data.starts_with(&[0x0B, 0x77]))
+            .and_then(|data| filmcraft_ac3::parse_header(data).ok());
+
+        let (kind, codec, channels, sample_rate) = if codec_params.codec
+            == symphonia::core::codecs::CODEC_TYPE_OPUS
+        {
+            let (channels, _) = opus_stream_info(&codec_params).unwrap_or((0, 0));
+            (
+                AudioCodecKind::Opus,
+                "Opus".to_owned(),
+                channels,
+                codec_params.sample_rate.unwrap_or(48_000),
+            )
+        } else if let Some(header) = ac3_header {
+            (
+                AudioCodecKind::Ac3,
+                ac3_codec_label(&header).to_owned(),
+                header.channels(),
+                header.sample_rate,
+            )
+        } else if known_audio {
+            let mut channels = codec_params
+                .channels
+                .map(|channels| channels.count())
+                .unwrap_or(0);
+            let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+            if (channels == 0 || sample_rate == 0) && is_mp4_container(input) {
+                if let Some((mp4_channels, mp4_rate)) = mp4_track_audio_layout(input, track_index) {
+                    if channels == 0 {
+                        channels = mp4_channels;
+                    }
+                    if sample_rate == 0 {
+                        sample_rate = mp4_rate;
+                    }
+                }
+            }
+            (
+                AudioCodecKind::Symphonia,
+                symphonia_codec_label(codec_params.codec).to_owned(),
+                channels,
+                sample_rate,
+            )
+        } else if codec_params.codec == CODEC_TYPE_NULL
+            && (codec_params.sample_rate.is_some() || codec_params.channels.is_some())
+        {
+            // A container that declares audio metadata but uses a codec
+            // Symphonia does not know still gets listed; decoding reports a
+            // clear error if it cannot handle the packets.
+            (
+                AudioCodecKind::Symphonia,
+                "Unknown".to_owned(),
+                codec_params
+                    .channels
+                    .map(|channels| channels.count())
+                    .unwrap_or(0),
+                codec_params.sample_rate.unwrap_or(0),
+            )
+        } else {
+            continue;
+        };
+
+        entries.push(AudioTrackEntry {
+            info: AudioTrackInfo {
+                id,
+                codec,
+                language,
+                title: None,
+                channels,
+                sample_rate,
+                default: entries.is_empty(),
+            },
+            kind,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    Ok(entries)
+}
+
+fn is_known_audio_codec(codec: symphonia::core::codecs::CodecType) -> bool {
+    use symphonia::core::codecs::*;
+    matches!(
+        codec,
+        CODEC_TYPE_AAC
+            | CODEC_TYPE_ALAC
+            | CODEC_TYPE_FLAC
+            | CODEC_TYPE_MP1
+            | CODEC_TYPE_MP2
+            | CODEC_TYPE_MP3
+            | CODEC_TYPE_OPUS
+            | CODEC_TYPE_VORBIS
+            | CODEC_TYPE_PCM_S32LE
+            | CODEC_TYPE_PCM_S32LE_PLANAR
+            | CODEC_TYPE_PCM_S32BE
+            | CODEC_TYPE_PCM_S32BE_PLANAR
+            | CODEC_TYPE_PCM_S24LE
+            | CODEC_TYPE_PCM_S24LE_PLANAR
+            | CODEC_TYPE_PCM_S24BE
+            | CODEC_TYPE_PCM_S24BE_PLANAR
+            | CODEC_TYPE_PCM_S16LE
+            | CODEC_TYPE_PCM_S16LE_PLANAR
+            | CODEC_TYPE_PCM_S16BE
+            | CODEC_TYPE_PCM_S16BE_PLANAR
+            | CODEC_TYPE_PCM_S8
+            | CODEC_TYPE_PCM_S8_PLANAR
+            | CODEC_TYPE_PCM_U32LE
+            | CODEC_TYPE_PCM_U32LE_PLANAR
+            | CODEC_TYPE_PCM_U32BE
+            | CODEC_TYPE_PCM_U32BE_PLANAR
+            | CODEC_TYPE_PCM_U24LE
+            | CODEC_TYPE_PCM_U24LE_PLANAR
+            | CODEC_TYPE_PCM_U24BE
+            | CODEC_TYPE_PCM_U24BE_PLANAR
+            | CODEC_TYPE_PCM_U16LE
+            | CODEC_TYPE_PCM_U16LE_PLANAR
+            | CODEC_TYPE_PCM_U16BE
+            | CODEC_TYPE_PCM_U16BE_PLANAR
+            | CODEC_TYPE_PCM_U8
+            | CODEC_TYPE_PCM_U8_PLANAR
+            | CODEC_TYPE_PCM_F32LE
+            | CODEC_TYPE_PCM_F32LE_PLANAR
+            | CODEC_TYPE_PCM_F32BE
+            | CODEC_TYPE_PCM_F32BE_PLANAR
+            | CODEC_TYPE_PCM_F64LE
+            | CODEC_TYPE_PCM_F64LE_PLANAR
+            | CODEC_TYPE_PCM_F64BE
+            | CODEC_TYPE_PCM_F64BE_PLANAR
+            | CODEC_TYPE_PCM_ALAW
+            | CODEC_TYPE_PCM_MULAW
+            | CODEC_TYPE_ADPCM_G722
+            | CODEC_TYPE_ADPCM_G726LE
+            | CODEC_TYPE_ADPCM_MS
+            | CODEC_TYPE_ADPCM_IMA_WAV
+    )
+}
+
+fn symphonia_codec_label(codec: symphonia::core::codecs::CodecType) -> &'static str {
+    use symphonia::core::codecs::*;
+    match codec {
+        CODEC_TYPE_AAC => "AAC",
+        CODEC_TYPE_ALAC => "ALAC",
+        CODEC_TYPE_FLAC => "FLAC",
+        CODEC_TYPE_MP1 => "MP1",
+        CODEC_TYPE_MP2 => "MP2",
+        CODEC_TYPE_MP3 => "MP3",
+        CODEC_TYPE_OPUS => "Opus",
+        CODEC_TYPE_VORBIS => "Vorbis",
+        CODEC_TYPE_PCM_ALAW => "A-law",
+        CODEC_TYPE_PCM_MULAW => "µ-law",
+        _ => "Audio",
+    }
+}
+
+fn ac3_codec_label(header: &filmcraft_ac3::Header) -> &'static str {
+    if header.is_eac3() {
+        "E-AC-3"
+    } else {
+        "AC-3"
+    }
+}
+
+fn is_raw_ac3(input: &[u8], extension: &str) -> bool {
+    matches!(extension, "ac3" | "eac3" | "ec3") && input.starts_with(&[0x0B, 0x77])
+}
+
+fn probe_symphonia(
+    input: &[u8],
+    extension: &str,
+) -> Result<Box<dyn symphonia::core::formats::FormatReader>, ConvertError> {
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
@@ -1199,36 +1770,55 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
     let source = MediaSourceStream::new(Box::new(Cursor::new(input.to_vec())), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(extension);
-    let probed = symphonia::default::get_probe()
+    symphonia::default::get_probe()
         .format(
             &hint,
             source,
             &FormatOptions::default(),
             &MetadataOptions::default(),
         )
-        .map_err(|error| {
-            ConvertError::Audio(format!("could not open the audio stream: {error}"))
-        })?;
-    let mut format = probed.format;
+        .map(|probed| probed.format)
+        .map_err(|error| ConvertError::Audio(format!("could not open the audio stream: {error}")))
+}
 
-    let (track_id, codec_params) = {
-        let track = format
-            .tracks()
-            .iter()
-            .find(|track| {
-                track.codec_params.channels.is_some() || track.codec_params.codec == CODEC_TYPE_OPUS
-            })
-            .or_else(|| {
-                format
-                    .tracks()
-                    .iter()
-                    .find(|track| track.codec_params.sample_rate.is_some())
-            })
-            .ok_or(ConvertError::NoAudioTrack)?;
-        (track.id, track.codec_params.clone())
-    };
+fn decode_audio(
+    input: &[u8],
+    extension: &str,
+    track: Option<usize>,
+) -> Result<DecodedAudio, ConvertError> {
+    let entries = audio_track_entries(input, extension)?;
+    let index = track.unwrap_or(0);
+    let entry = entries.get(index).ok_or(ConvertError::AudioTrackNotFound {
+        requested: index + 1,
+        available: entries.len(),
+    })?;
+    let track_id = entry.info.id;
+    let track_channels = entry.info.channels;
+    let kind = entry.kind;
 
-    if codec_params.codec == CODEC_TYPE_OPUS {
+    if extension == "flac" || input.starts_with(b"fLaC") {
+        return decode_flac(input);
+    }
+    if is_ogg_opus(input) {
+        return decode_ogg_opus(input);
+    }
+    if is_raw_ac3(input, extension) {
+        return decode_ac3_elementary(input);
+    }
+
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
+
+    let mut format = probe_symphonia(input, extension)?;
+    let codec_params = format
+        .tracks()
+        .iter()
+        .find(|candidate| candidate.id == track_id)
+        .map(|candidate| candidate.codec_params.clone())
+        .ok_or(ConvertError::NoAudioTrack)?;
+
+    if kind == AudioCodecKind::Opus {
         return decode_opus_track(
             format.as_mut(),
             track_id,
@@ -1236,11 +1826,23 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
             matroska_discard_padding(input, track_id),
         );
     }
+    if kind == AudioCodecKind::Ac3 {
+        return decode_ac3_track(format.as_mut(), track_id);
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
         .map_err(|error| {
-            ConvertError::Audio(format!("could not start the audio decoder: {error}"))
+            if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_AAC
+                && track_channels > 2
+            {
+                ConvertError::Audio(
+                    "multichannel AAC cannot be decoded; choose a stereo AAC track or an AC-3/E-AC-3 track"
+                        .to_owned(),
+                )
+            } else {
+                ConvertError::Audio(format!("could not start the audio decoder: {error}"))
+            }
         })?;
 
     let mut sample_buffer: Option<SampleBuffer<f32>> = None;
@@ -1283,7 +1885,7 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
         let capacity = decoded.capacity();
         if sample_buffer
             .as_ref()
-            .map_or(true, |buffer| buffer.capacity() < capacity)
+            .is_none_or(|buffer| buffer.capacity() < capacity)
         {
             sample_buffer = Some(SampleBuffer::<f32>::new(capacity as u64, spec));
         }
@@ -1300,11 +1902,44 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
     if samples.is_empty() || channels == 0 || sample_rate == 0 {
         return Err(ConvertError::NoAudioTrack);
     }
+
+    // MP4 edit lists carry the AAC encoder delay and the intended duration.
+    // Symphonia exposes neither, so apply them here for non-Opus tracks.
+    if is_mp4_container(input) {
+        let track_index = format
+            .tracks()
+            .iter()
+            .position(|candidate| candidate.id == track_id)
+            .unwrap_or(0);
+        if let Some((skip, total)) = mp4_gapless_info(input, track_index) {
+            let frames = samples.len() / channels;
+            let skip = skip.min(frames);
+            samples.drain(..skip * channels);
+            if let Some(total) = total {
+                let available = samples.len() / channels;
+                if total < available {
+                    samples.truncate(total * channels);
+                }
+            }
+        }
+    }
+    if samples.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+
+    let source_bits = codec_params
+        .bits_per_sample
+        .and_then(|bits| u16::try_from(bits).ok());
     Ok(DecodedAudio {
         samples,
         channels,
         sample_rate,
+        source_bits,
     })
+}
+
+fn is_mp4_container(input: &[u8]) -> bool {
+    input.get(4..8).is_some_and(|kind| kind == b"ftyp")
 }
 
 fn is_ogg_opus(input: &[u8]) -> bool {
@@ -1365,6 +2000,7 @@ fn decode_ogg_opus(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
         samples,
         channels,
         sample_rate: 48_000,
+        source_bits: None,
     })
 }
 
@@ -1425,7 +2061,123 @@ fn decode_opus_track(
         samples,
         channels,
         sample_rate: 48_000,
+        source_bits: None,
     })
+}
+
+/// Decodes an AC-3 or E-AC-3 elementary stream by walking its syncframes.
+fn decode_ac3_elementary(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
+    let mut decoder = filmcraft_ac3::Decoder::new();
+    let mut audio = Ac3Accumulator::default();
+    let mut offset = 0;
+    while offset + 7 <= input.len() {
+        if input[offset..].starts_with(&[0x0B, 0x77]) {
+            let header = filmcraft_ac3::parse_header(&input[offset..]).map_err(|error| {
+                ConvertError::Audio(format!("could not read the AC-3 stream: {error}"))
+            })?;
+            if offset + header.frame_bytes > input.len() {
+                break;
+            }
+            audio.push_frame(&mut decoder, &input[offset..offset + header.frame_bytes])?;
+            offset += header.frame_bytes;
+        } else {
+            offset += 1;
+        }
+    }
+    audio.finish()
+}
+
+fn decode_ac3_track(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track_id: u32,
+) -> Result<DecodedAudio, ConvertError> {
+    let mut decoder = filmcraft_ac3::Decoder::new();
+    let mut audio = Ac3Accumulator::default();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(error) if is_end_of_stream(&error) => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(error) => {
+                return Err(ConvertError::Audio(format!(
+                    "could not read audio packets: {error}"
+                )))
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let mut data: &[u8] = &packet.data;
+        while data.len() >= 7 {
+            if !data.starts_with(&[0x0B, 0x77]) {
+                data = &data[1..];
+                continue;
+            }
+            let header = filmcraft_ac3::parse_header(data).map_err(|error| {
+                ConvertError::Audio(format!("could not read the AC-3 stream: {error}"))
+            })?;
+            if data.len() < header.frame_bytes {
+                break;
+            }
+            audio.push_frame(&mut decoder, &data[..header.frame_bytes])?;
+            data = &data[header.frame_bytes..];
+        }
+    }
+    audio.finish()
+}
+
+#[derive(Default)]
+struct Ac3Accumulator {
+    samples: Vec<f32>,
+    channels: usize,
+    sample_rate: u32,
+}
+
+impl Ac3Accumulator {
+    fn push_frame(
+        &mut self,
+        decoder: &mut filmcraft_ac3::Decoder,
+        frame: &[u8],
+    ) -> Result<(), ConvertError> {
+        let decoded = decoder.decode(frame).map_err(|error| {
+            ConvertError::Audio(format!("could not decode AC-3 audio: {error}"))
+        })?;
+        if decoded.channels.is_empty() {
+            return Ok(());
+        }
+        let channels = decoded.channels.len();
+        if self.channels != 0 && self.channels != channels {
+            return Err(ConvertError::Audio(
+                "the AC-3 track changes its channel layout".to_owned(),
+            ));
+        }
+        self.channels = channels;
+        self.sample_rate = decoded.header.sample_rate;
+        let frames = decoded.channels[0].len();
+        self.samples.reserve(frames * channels);
+        for index in 0..frames {
+            for channel in &decoded.channels {
+                self.samples.push(channel[index]);
+            }
+        }
+        if self.samples.len() > MAX_AUDIO_SAMPLES {
+            return Err(ConvertError::AudioTooLarge);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<DecodedAudio, ConvertError> {
+        if self.samples.is_empty() || self.channels == 0 || self.sample_rate == 0 {
+            return Err(ConvertError::NoAudioTrack);
+        }
+        Ok(DecodedAudio {
+            samples: self.samples,
+            channels: self.channels,
+            sample_rate: self.sample_rate,
+            source_bits: None,
+        })
+    }
 }
 
 const EBML_SEGMENT_ID: u32 = 0x1853_8067;
@@ -1501,7 +2253,12 @@ fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
     }
 
     let mut pos = 0;
+    let mut visited = 0usize;
     let (segment_size, segment_start) = loop {
+        visited += 1;
+        if visited > 1_000_000 {
+            return None;
+        }
         let (id, size) = read_ebml_element(input, &mut pos)?;
         if id == EBML_SEGMENT_ID {
             break (size, pos);
@@ -1515,6 +2272,10 @@ fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
 
     let mut padding = None;
     while pos < segment_end {
+        visited += 1;
+        if visited > 1_000_000 {
+            return None;
+        }
         let (id, size) = read_ebml_element(input, &mut pos)?;
         if id != EBML_CLUSTER_ID {
             skip_ebml_element(input, &mut pos, size)?;
@@ -1527,6 +2288,10 @@ fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
             None => segment_end,
         };
         while pos < cluster_end {
+            visited += 1;
+            if visited > 1_000_000 {
+                return None;
+            }
             let (id, size) = read_ebml_element(input, &mut pos)?;
             if id != EBML_BLOCK_GROUP_ID {
                 skip_ebml_element(input, &mut pos, size)?;
@@ -1539,6 +2304,10 @@ fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
             let mut block_track = None;
             let mut group_padding = None;
             while pos < group_end {
+                visited += 1;
+                if visited > 1_000_000 {
+                    return None;
+                }
                 let (id, size) = read_ebml_element(input, &mut pos)?;
                 if id == EBML_BLOCK_ID {
                     let mut block_pos = pos;
@@ -1566,6 +2335,176 @@ fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
         pos = cluster_end;
     }
     padding
+}
+
+fn mp4_child_boxes(data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    let mut boxes = Vec::new();
+    let mut position = 0;
+    while position + 8 <= data.len() {
+        let size = u32::from_be_bytes([
+            data[position],
+            data[position + 1],
+            data[position + 2],
+            data[position + 3],
+        ]) as usize;
+        let kind: [u8; 4] = data[position + 4..position + 8]
+            .try_into()
+            .expect("the box type is four bytes");
+        let (header, size) = if size == 1 {
+            if position + 16 > data.len() {
+                break;
+            }
+            let large = u64::from_be_bytes(
+                data[position + 8..position + 16]
+                    .try_into()
+                    .expect("a 64-bit box size is eight bytes"),
+            ) as usize;
+            (16, large)
+        } else if size == 0 {
+            (8, data.len() - position)
+        } else {
+            (8, size)
+        };
+        if size < header || position + size > data.len() {
+            break;
+        }
+        boxes.push((kind, &data[position + header..position + size]));
+        position += size;
+    }
+    boxes
+}
+
+fn mp4_find<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+    mp4_child_boxes(data)
+        .into_iter()
+        .find(|(box_kind, _)| box_kind == kind)
+        .map(|(_, body)| body)
+}
+
+/// Reads the ISO 639-2 language code from an MP4 track's media header.
+fn mp4_track_language(input: &[u8], track_index: usize) -> Option<String> {
+    let moov = mp4_find(input, b"moov")?;
+    let traks: Vec<&[u8]> = mp4_child_boxes(moov)
+        .into_iter()
+        .filter(|(kind, _)| kind == b"trak")
+        .map(|(_, body)| body)
+        .collect();
+    let mdhd = mp4_find(mp4_find(traks.get(track_index)?, b"mdia")?, b"mdhd")?;
+    let offset = match mdhd.first()? {
+        0 => 20,
+        1 => 32,
+        _ => return None,
+    };
+    let packed = u16::from_be_bytes(mdhd.get(offset..offset + 2)?.try_into().ok()?);
+    if packed == 0 {
+        return None;
+    }
+    let mut language = String::new();
+    for shift in [10, 5, 0] {
+        let value = ((packed >> shift) & 0x1F) as u8;
+        language.push(char::from(value + 0x60));
+    }
+    Some(language)
+}
+
+/// Reads the channel count and sample rate from an MP4 audio sample entry.
+/// Symphonia leaves these unset for some AAC tracks until the first frame.
+fn mp4_track_audio_layout(input: &[u8], track_index: usize) -> Option<(usize, u32)> {
+    let moov = mp4_find(input, b"moov")?;
+    let traks: Vec<&[u8]> = mp4_child_boxes(moov)
+        .into_iter()
+        .filter(|(kind, _)| kind == b"trak")
+        .map(|(_, body)| body)
+        .collect();
+    let trak = traks.get(track_index)?;
+    let stsd = mp4_find(mp4_find(mp4_find(trak, b"mdia")?, b"minf")?, b"stbl")?;
+    let stsd = mp4_find(stsd, b"stsd")?;
+    let entries = mp4_child_boxes(stsd.get(8..)?);
+    let (_, sample_entry) = entries.first()?;
+    let channels = u16::from_be_bytes(sample_entry.get(16..18)?.try_into().ok()?) as usize;
+    let rate = u32::from_be_bytes(sample_entry.get(24..28)?.try_into().ok()?) >> 16;
+    Some((channels, rate))
+}
+
+fn mp4_timescale(mvhd_or_mdhd: &[u8]) -> Option<u32> {
+    let offset = match mvhd_or_mdhd.first()? {
+        0 => 12,
+        1 => 20,
+        _ => return None,
+    };
+    Some(u32::from_be_bytes(
+        mvhd_or_mdhd.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Returns the AAC priming skip and intended duration from an MP4 edit list
+/// (or iTunes' `iTunSMPB` tag), both in media samples.
+fn mp4_gapless_info(input: &[u8], track_index: usize) -> Option<(usize, Option<usize>)> {
+    let moov = mp4_find(input, b"moov")?;
+    let movie_timescale = mp4_timescale(mp4_find(moov, b"mvhd")?)?;
+    let traks: Vec<&[u8]> = mp4_child_boxes(moov)
+        .into_iter()
+        .filter(|(kind, _)| kind == b"trak")
+        .map(|(_, body)| body)
+        .collect();
+    let trak = traks.get(track_index)?;
+    let mdia = mp4_find(trak, b"mdia")?;
+    let hdlr = mp4_find(mdia, b"hdlr")?;
+    if hdlr.get(8..12) != Some(b"soun") {
+        return None;
+    }
+    let media_timescale = mp4_timescale(mp4_find(mdia, b"mdhd")?)?;
+
+    if let Some(edts) = mp4_find(trak, b"edts") {
+        if let Some(elst) = mp4_find(edts, b"elst") {
+            let version = *elst.first()?;
+            let count = u32::from_be_bytes(elst.get(4..8)?.try_into().ok()?) as usize;
+            if count > 0 {
+                let (duration, media_time) = if version == 1 {
+                    let duration = u64::from_be_bytes(elst.get(8..16)?.try_into().ok()?);
+                    let media_time = i64::from_be_bytes(elst.get(16..24)?.try_into().ok()?);
+                    (duration, media_time)
+                } else {
+                    let duration = u64::from(u32::from_be_bytes(elst.get(8..12)?.try_into().ok()?));
+                    let media_time =
+                        i64::from(i32::from_be_bytes(elst.get(12..16)?.try_into().ok()?));
+                    (duration, media_time)
+                };
+                if media_time >= 0 && media_timescale > 0 {
+                    let skip = media_time as usize;
+                    let total = (u128::from(duration) * u128::from(media_timescale)
+                        / u128::from(movie_timescale)) as usize;
+                    return Some((skip, Some(total)));
+                }
+            }
+        }
+    }
+
+    // iTunes stores the same numbers as hex text in a freeform tag. It is the
+    // fallback for files whose muxer omitted the edit list.
+    let tag = b"iTunSMPB";
+    let tag_position = moov.windows(tag.len()).position(|window| window == tag)?;
+    let data_position = moov[tag_position..]
+        .windows(4)
+        .take(256)
+        .position(|window| window == b"data")?;
+    let payload_start = tag_position.checked_add(data_position)?.checked_add(12)?;
+    let payload_end = moov
+        .get(payload_start..)?
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|length| payload_start + length)?;
+    let text = std::str::from_utf8(moov.get(payload_start..payload_end)?).ok()?;
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    if fields.len() < 3 {
+        return None;
+    }
+    let skip = usize::from_str_radix(fields[0], 16).ok()?;
+    let original = usize::from_str_radix(fields[2], 16).ok()?;
+    if original == 0 {
+        return None;
+    }
+    Some((skip, Some(original)))
 }
 
 fn opus_stream_info(
@@ -1634,6 +2573,7 @@ fn decode_flac(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
         samples,
         channels,
         sample_rate,
+        source_bits: u16::try_from(info.bits_per_sample).ok(),
     })
 }
 
@@ -1653,7 +2593,10 @@ fn apply_audio_options(
     Ok(audio)
 }
 
-fn remix_channels(audio: DecodedAudio, target: AudioChannels) -> DecodedAudio {
+/// Remixes any common channel layout to mono or stereo using the standard
+/// ITU-R BS.775 coefficients, so the centre and surround channels are not
+/// discarded. The result is scaled down only when the mix would clip.
+fn remix_channels(mut audio: DecodedAudio, target: AudioChannels) -> DecodedAudio {
     let target_channels = target.count();
     if audio.channels == target_channels {
         return audio;
@@ -1663,26 +2606,110 @@ fn remix_channels(audio: DecodedAudio, target: AudioChannels) -> DecodedAudio {
     let mut samples = Vec::with_capacity(frames * target_channels);
     for frame in audio.samples.chunks_exact(audio.channels) {
         match target {
-            AudioChannels::Mono => {
-                samples.push(frame.iter().sum::<f32>() / audio.channels as f32);
-            }
+            AudioChannels::Mono => samples.push(downmix_mono(frame)),
             AudioChannels::Stereo => {
                 if audio.channels == 1 {
                     samples.extend_from_slice(&[frame[0], frame[0]]);
                 } else {
-                    samples.extend_from_slice(&frame[..2]);
+                    let (left, right) = downmix_stereo(frame);
+                    samples.extend_from_slice(&[left, right]);
                 }
             }
         }
     }
 
-    DecodedAudio {
-        samples,
-        channels: target_channels,
-        sample_rate: audio.sample_rate,
+    // A 5.1 downmix can exceed full scale even when every source channel is
+    // within it. Attenuate the whole mix rather than clipping individual peaks.
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    if peak > 1.0 {
+        let scale = 1.0 / peak;
+        for sample in &mut samples {
+            *sample *= scale;
+        }
+    }
+
+    audio.samples = samples;
+    audio.channels = target_channels;
+    audio
+}
+
+fn downmix_mono(frame: &[f32]) -> f32 {
+    let channel = |index: usize| frame.get(index).copied().unwrap_or(0.0);
+    match frame.len() {
+        0 => 0.0,
+        1 => frame[0],
+        2 => 0.5 * (channel(0) + channel(1)),
+        3 => 0.5 * (channel(0) + channel(1)) + 0.707 * channel(2),
+        4 => 0.5 * (channel(0) + channel(1)) + 0.5 * (channel(2) + channel(3)),
+        5 => 0.5 * (channel(0) + channel(1)) + 0.707 * channel(2) + 0.5 * (channel(3) + channel(4)),
+        6 => {
+            0.5 * (channel(0) + channel(1))
+                + 0.707 * channel(2)
+                + 0.5 * channel(3)
+                + 0.5 * (channel(4) + channel(5))
+        }
+        7 => {
+            0.5 * (channel(0) + channel(1))
+                + 0.707 * channel(2)
+                + 0.5 * channel(3)
+                + 0.5 * (channel(4) + channel(5) + channel(6))
+        }
+        8 => {
+            0.5 * (channel(0) + channel(1))
+                + 0.707 * channel(2)
+                + 0.5 * channel(3)
+                + 0.5 * (channel(4) + channel(5) + channel(6) + channel(7))
+        }
+        channels => frame.iter().sum::<f32>() / channels as f32,
     }
 }
 
+/// Standard film-layout channel order: L, R, C, LFE, back L/R, side L/R.
+fn downmix_stereo(frame: &[f32]) -> (f32, f32) {
+    let channel = |index: usize| frame.get(index).copied().unwrap_or(0.0);
+    let mut left = channel(0);
+    let mut right = channel(1);
+    match frame.len() {
+        0 => return (0.0, 0.0),
+        1 => return (frame[0], frame[0]),
+        2 => return (left, right),
+        3 => {
+            left += 0.707 * channel(2);
+            right += 0.707 * channel(2);
+        }
+        4 => {
+            left += 0.707 * channel(2);
+            right += 0.707 * channel(3);
+        }
+        5 => {
+            left += 0.707 * channel(2) + 0.707 * channel(3);
+            right += 0.707 * channel(2) + 0.707 * channel(4);
+        }
+        6 => {
+            left += 0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(4);
+            right += 0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(5);
+        }
+        7 => {
+            left += 0.707 * channel(2) + 0.5 * channel(3) + 0.5 * channel(4) + 0.707 * channel(5);
+            right += 0.707 * channel(2) + 0.5 * channel(3) + 0.5 * channel(4) + 0.707 * channel(6);
+        }
+        _ => {
+            left += 0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(4) + 0.707 * channel(6);
+            right +=
+                0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(5) + 0.707 * channel(7);
+        }
+    }
+    (left, right)
+}
+
+const RESAMPLE_ZERO_CROSSINGS: usize = 16;
+const RESAMPLE_PHASES: usize = 256;
+
+/// Band-limited resampling with a windowed-sinc low-pass filter. The filter
+/// cutoff follows the lower of the two rates, so downsampling does not alias
+/// high frequencies back into the audible band.
 fn resample_audio(audio: DecodedAudio, target_rate: u32) -> Result<DecodedAudio, ConvertError> {
     let target_rate = target_rate.clamp(
         ConversionOptions::MIN_AUDIO_SAMPLE_RATE,
@@ -1697,6 +2724,7 @@ fn resample_audio(audio: DecodedAudio, target_rate: u32) -> Result<DecodedAudio,
     if source_frames == 0 {
         return Ok(audio);
     }
+
     let target_frames = ((source_frames as f64 * f64::from(target_rate))
         / f64::from(audio.sample_rate))
     .round()
@@ -1708,17 +2736,30 @@ fn resample_audio(audio: DecodedAudio, target_rate: u32) -> Result<DecodedAudio,
         return Err(ConvertError::AudioTooLarge);
     }
 
+    let ratio = f64::from(target_rate) / f64::from(audio.sample_rate);
+    let cutoff = ratio.min(1.0) * 0.95;
+    let table = resample_kernel_table(cutoff);
+    let taps = RESAMPLE_ZERO_CROSSINGS * 2;
     let mut samples = Vec::with_capacity(sample_count);
+    let mut mixed = vec![0.0_f64; channels];
+
     for frame in 0..target_frames {
-        let source_position = frame as f64 * f64::from(audio.sample_rate) / f64::from(target_rate);
-        let source_floor = source_position.floor();
-        let source_index = (source_floor as usize).min(source_frames - 1);
-        let next_index = (source_index + 1).min(source_frames - 1);
-        let fraction = (source_position - source_floor) as f32;
-        for channel in 0..channels {
-            let current = audio.samples[source_index * channels + channel];
-            let next = audio.samples[next_index * channels + channel];
-            samples.push(current + (next - current) * fraction);
+        let position = frame as f64 / ratio;
+        let base = position.floor();
+        let phase =
+            (((position - base) * RESAMPLE_PHASES as f64) as usize).min(RESAMPLE_PHASES - 1);
+        let weights = &table[phase * taps..phase * taps + taps];
+        mixed.fill(0.0);
+        for (tap, weight) in weights.iter().enumerate() {
+            let index = base as isize + tap as isize - (RESAMPLE_ZERO_CROSSINGS as isize - 1);
+            let index = index.clamp(0, source_frames as isize - 1) as usize;
+            let source = &audio.samples[index * channels..(index + 1) * channels];
+            for channel in 0..channels {
+                mixed[channel] += f64::from(source[channel]) * weight;
+            }
+        }
+        for value in &mixed {
+            samples.push(*value as f32);
         }
     }
 
@@ -1726,7 +2767,42 @@ fn resample_audio(audio: DecodedAudio, target_rate: u32) -> Result<DecodedAudio,
         samples,
         channels,
         sample_rate: target_rate,
+        source_bits: audio.source_bits,
     })
+}
+
+fn resample_kernel_table(cutoff: f64) -> Vec<f64> {
+    let taps = RESAMPLE_ZERO_CROSSINGS * 2;
+    let mut table = vec![0.0; RESAMPLE_PHASES * taps];
+    for phase in 0..RESAMPLE_PHASES {
+        let fraction = phase as f64 / RESAMPLE_PHASES as f64;
+        let mut sum = 0.0;
+        for tap in 0..taps {
+            let distance = tap as f64 - (RESAMPLE_ZERO_CROSSINGS as f64 - 1.0) - fraction;
+            let normalized = distance / RESAMPLE_ZERO_CROSSINGS as f64;
+            let window = if normalized.abs() <= 1.0 {
+                0.42 + 0.5 * (std::f64::consts::PI * normalized).cos()
+                    + 0.08 * (2.0 * std::f64::consts::PI * normalized).cos()
+            } else {
+                0.0
+            };
+            let argument = std::f64::consts::PI * cutoff * distance;
+            let sinc = if argument.abs() < 1e-9 {
+                1.0
+            } else {
+                argument.sin() / argument
+            };
+            let weight = cutoff * sinc * window;
+            table[phase * taps + tap] = weight;
+            sum += weight;
+        }
+        if sum.abs() > 1e-12 {
+            for tap in 0..taps {
+                table[phase * taps + tap] /= sum;
+            }
+        }
+    }
+    table
 }
 
 fn strip_id3v2(input: &[u8]) -> &[u8] {
@@ -1747,42 +2823,161 @@ fn strip_id3v2(input: &[u8]) -> &[u8] {
     }
 }
 
-fn encode_wav(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+/// Converts an audio input and writes WAV output directly to `writer`,
+/// avoiding a second full-size copy of the encoded file in memory.
+pub fn convert_audio_to_wav_writer<W: Write>(
+    input_name: &str,
+    input: &[u8],
+    options: ConversionOptions,
+    writer: &mut W,
+) -> Result<(), ConvertError> {
+    let extension = file_extension(input_name);
+    if !is_audio_extension(&extension) {
+        return Err(unsupported(&extension, OutputFormat::Wav));
+    }
+    let audio = apply_audio_options(
+        decode_audio(input, &extension, options.audio_track)?,
+        options,
+    )?;
+    write_wav(writer, &audio, options.audio_bit_depth)
+}
+
+/// The output name used by [`convert_audio_to_wav_writer`].
+pub fn wav_output_name(input_name: &str) -> PathBuf {
+    output_name(input_name, "wav")
+}
+
+fn encode_wav(audio: &DecodedAudio, bit_depth: AudioBitDepth) -> Result<Vec<u8>, ConvertError> {
+    let mut output = Vec::new();
+    write_wav(&mut output, audio, bit_depth)?;
+    Ok(output)
+}
+
+fn write_wav<W: Write>(
+    writer: &mut W,
+    audio: &DecodedAudio,
+    bit_depth: AudioBitDepth,
+) -> Result<(), ConvertError> {
+    if audio.channels == 0 {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    let usable_samples = audio.samples.len() - audio.samples.len() % audio.channels;
+    let samples = &audio.samples[..usable_samples];
+    let frames = samples.len() / audio.channels;
     let channels = u16::try_from(audio.channels).map_err(|_| ConvertError::AudioTooLarge)?;
-    let block_align = channels.checked_mul(2).ok_or(ConvertError::AudioTooLarge)?;
+    let bytes_per_sample = match bit_depth {
+        AudioBitDepth::Bit16 => 2_u16,
+        AudioBitDepth::Bit24 => 3,
+        AudioBitDepth::Float32 => 4,
+    };
+    let block_align = channels
+        .checked_mul(bytes_per_sample)
+        .ok_or(ConvertError::AudioTooLarge)?;
     let byte_rate = audio
         .sample_rate
         .checked_mul(u32::from(block_align))
         .ok_or(ConvertError::AudioTooLarge)?;
     let data_size = u32::try_from(
-        audio
-            .samples
+        samples
             .len()
-            .checked_mul(2)
+            .checked_mul(bytes_per_sample as usize)
             .ok_or(ConvertError::AudioTooLarge)?,
     )
     .map_err(|_| ConvertError::AudioTooLarge)?;
+    let is_float = bit_depth == AudioBitDepth::Float32;
+    let fact_size = if is_float { 12 } else { 0 };
     let riff_size = 36_u32
-        .checked_add(data_size)
+        .checked_add(fact_size)
+        .and_then(|size| size.checked_add(data_size))
         .ok_or(ConvertError::AudioTooLarge)?;
 
-    let mut output = Vec::with_capacity(44 + data_size as usize);
+    let mut output = Vec::with_capacity(44 + fact_size as usize);
     output.extend_from_slice(b"RIFF");
     output.extend_from_slice(&riff_size.to_le_bytes());
     output.extend_from_slice(b"WAVEfmt ");
     output.extend_from_slice(&16_u32.to_le_bytes());
-    output.extend_from_slice(&1_u16.to_le_bytes());
+    output.extend_from_slice(&if is_float { 3_u16 } else { 1 }.to_le_bytes());
     output.extend_from_slice(&channels.to_le_bytes());
     output.extend_from_slice(&audio.sample_rate.to_le_bytes());
     output.extend_from_slice(&byte_rate.to_le_bytes());
     output.extend_from_slice(&block_align.to_le_bytes());
-    output.extend_from_slice(&16_u16.to_le_bytes());
+    output.extend_from_slice(&bit_depth.bits().to_le_bytes());
+    if is_float {
+        output.extend_from_slice(b"fact");
+        output.extend_from_slice(&4_u32.to_le_bytes());
+        output.extend_from_slice(&(frames as u32).to_le_bytes());
+    }
     output.extend_from_slice(b"data");
     output.extend_from_slice(&data_size.to_le_bytes());
-    for sample in &audio.samples {
-        output.extend_from_slice(&sample_to_i16(*sample).to_le_bytes());
+    writer.write_all(&output)?;
+
+    let mut dither = Dither::new();
+    let mut samples_buffer = Vec::with_capacity(64 * 1024);
+    for sample in samples {
+        match bit_depth {
+            AudioBitDepth::Bit16 => samples_buffer.extend_from_slice(
+                &dither
+                    .quantize_i16(*sample, audio.source_bits)
+                    .to_le_bytes(),
+            ),
+            AudioBitDepth::Bit24 => {
+                let value = dither.quantize_i32(*sample, 24, audio.source_bits);
+                samples_buffer.extend_from_slice(&value.to_le_bytes()[..3]);
+            }
+            AudioBitDepth::Float32 => samples_buffer.extend_from_slice(&sample.to_le_bytes()),
+        }
+        if samples_buffer.len() >= 32 * 1024 {
+            writer.write_all(&samples_buffer)?;
+            samples_buffer.clear();
+        }
     }
-    Ok(output)
+    writer.write_all(&samples_buffer)?;
+    Ok(())
+}
+
+/// Triangular-PDF dither for reductions to a lower integer bit depth. The
+/// generator is deterministic so conversions are reproducible.
+struct Dither {
+    state: u32,
+}
+
+impl Dither {
+    fn new() -> Self {
+        Self { state: 0x1234_5678 }
+    }
+
+    fn next(&mut self) -> f32 {
+        self.state = self
+            .state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        let first = (self.state >> 8) as f32 / 16_777_216.0;
+        self.state = self
+            .state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        let second = (self.state >> 8) as f32 / 16_777_216.0;
+        first - second
+    }
+
+    fn quantize_i16(&mut self, sample: f32, source_bits: Option<u16>) -> i16 {
+        if source_bits.is_some_and(|bits| bits > 16) {
+            let dither = self.next() / f32::from(i16::MAX);
+            sample_to_i16((sample + dither).clamp(-1.0, 1.0))
+        } else {
+            sample_to_i16(sample)
+        }
+    }
+
+    fn quantize_i32(&mut self, sample: f32, bits: u32, source_bits: Option<u16>) -> i32 {
+        let scale = ((1_i64 << (bits - 1)) - 1) as f32;
+        let dither = if source_bits.is_some_and(|source| u32::from(source) > bits) {
+            self.next() / scale
+        } else {
+            0.0
+        };
+        ((sample + dither).clamp(-1.0, 1.0) * scale).round() as i32
+    }
 }
 
 fn encode_aiff(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
@@ -1890,7 +3085,7 @@ fn encode_opus(audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     // The encoder runs `pre_skip` samples behind its input, so flush that much
     // silence and round up to whole frames.
     let flush = (pre_skip + u64::from(ticks) - 1) / u64::from(ticks);
-    let frames = (total + flush as usize + frame_size - 1) / frame_size;
+    let frames = (total + flush as usize).div_ceil(frame_size);
     let final_granule = pre_skip + total as u64 * 48_000 / u64::from(sample_rate);
     let mut packet = vec![0_u8; MAX_PACKET_BYTES];
     let mut block = vec![0.0f32; frame_size * channels];
@@ -1931,14 +3126,99 @@ fn sample_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
 }
 
-fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+fn mp3_sample_rate(sample_rate: u32) -> u32 {
+    match sample_rate {
+        0..=8_000 => 8_000,
+        8_001..=11_025 => 11_025,
+        11_026..=12_000 => 12_000,
+        12_001..=16_000 => 16_000,
+        16_001..=22_050 => 22_050,
+        22_051..=24_000 => 24_000,
+        24_001..=32_000 => 32_000,
+        32_001..=44_100 => 44_100,
+        _ => 48_000,
+    }
+}
+
+fn encode_mp3(audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+    use mp3lame_encoder::{Bitrate, Builder, FlushNoGap, InterleavedPcm, MonoPcm, Quality};
+
+    if audio.channels == 0 || audio.sample_rate == 0 || audio.samples.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    let mut audio = if audio.channels > 2 {
+        remix_channels(audio, AudioChannels::Stereo)
+    } else {
+        audio
+    };
+    let sample_rate = mp3_sample_rate(audio.sample_rate);
+    if audio.sample_rate != sample_rate {
+        audio = resample_audio(audio, sample_rate)?;
+    }
+    let channels = audio.channels;
+
+    let mut builder = Builder::new()
+        .ok_or_else(|| ConvertError::Audio("could not start the MP3 encoder".to_owned()))?;
+    builder
+        .set_num_channels(channels as u8)
+        .and_then(|_| builder.set_sample_rate(sample_rate))
+        .and_then(|_| {
+            builder.set_brate(if channels == 1 {
+                Bitrate::Kbps96
+            } else {
+                Bitrate::Kbps192
+            })
+        })
+        .and_then(|_| builder.set_quality(Quality::NearBest))
+        .map_err(|error| {
+            ConvertError::Audio(format!("could not configure the MP3 encoder: {error}"))
+        })?;
+    let mut encoder = builder.build().map_err(|error| {
+        ConvertError::Audio(format!("could not start the MP3 encoder: {error}"))
+    })?;
+
+    let mut output = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(audio.frames()));
+    if channels == 1 {
+        encoder
+            .encode_to_vec(MonoPcm(&audio.samples), &mut output)
+            .map_err(|error| ConvertError::Audio(format!("could not encode MP3 audio: {error}")))?;
+    } else {
+        encoder
+            .encode_to_vec(InterleavedPcm(&audio.samples), &mut output)
+            .map_err(|error| ConvertError::Audio(format!("could not encode MP3 audio: {error}")))?;
+    }
+    encoder
+        .flush_to_vec::<FlushNoGap>(&mut output)
+        .map_err(|error| {
+            ConvertError::Audio(format!("could not finish the MP3 stream: {error}"))
+        })?;
+    Ok(output)
+}
+
+fn encode_flac(audio: &DecodedAudio, bit_depth: AudioBitDepth) -> Result<Vec<u8>, ConvertError> {
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
 
+    let bits = match bit_depth {
+        AudioBitDepth::Bit16 => 16,
+        AudioBitDepth::Bit24 => 24,
+        AudioBitDepth::Float32 => {
+            return Err(ConvertError::Audio(
+                "FLAC cannot store 32-bit float samples; choose 16-bit or 24-bit".to_owned(),
+            ))
+        }
+    };
     let usable_samples = audio.samples.len() - audio.samples.len() % audio.channels;
+    let mut dither = Dither::new();
     let integer_samples: Vec<i32> = audio.samples[..usable_samples]
         .iter()
-        .map(|sample| i32::from(sample_to_i16(*sample)))
+        .map(|sample| {
+            if bits == 16 {
+                i32::from(dither.quantize_i16(*sample, audio.source_bits))
+            } else {
+                dither.quantize_i32(*sample, 24, audio.source_bits)
+            }
+        })
         .collect();
 
     let config = flacenc::config::Encoder::default()
@@ -1947,7 +3227,7 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     let source = flacenc::source::MemSource::from_samples(
         &integer_samples,
         audio.channels,
-        16,
+        bits as usize,
         audio.sample_rate as usize,
     );
     let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
@@ -1968,28 +3248,31 @@ fn image_to_pdf(
     extension: &str,
     options: ConversionOptions,
 ) -> Result<Vec<u8>, ConvertError> {
-    if let Some(components @ (1 | 3)) = jpeg_component_count(input) {
-        let (width, height) = image::ImageReader::new(Cursor::new(input))
-            .with_guessed_format()?
-            .into_dimensions()?;
-        return Ok(build_image_pdf(
-            input,
-            width,
-            height,
-            Filter::DctDecode,
-            components == 1,
-            options,
-        ));
+    let orientation = exif_orientation(input).unwrap_or(1);
+    if orientation == 1 {
+        if let Some(components @ (1 | 3)) = jpeg_component_count(input) {
+            let (width, height) = image::ImageReader::new(Cursor::new(input))
+                .with_guessed_format()?
+                .into_dimensions()?;
+            return Ok(build_image_pdf(
+                input,
+                width,
+                height,
+                Filter::DctDecode,
+                components == 1,
+                options,
+            ));
+        }
     }
 
     let image = if extension == "svg" {
         rasterize_svg(input)?
     } else {
-        image::load_from_memory(input)?
+        load_image(input, options)?
     };
     let width = image.width();
     let height = image.height();
-    let compressed = deflate_bytes(&flatten_to_rgb(&image))?;
+    let compressed = deflate_bytes(&flatten_to_rgb(&image, options.image_background))?;
     Ok(build_image_pdf(
         &compressed,
         width,
@@ -2130,7 +3413,7 @@ fn jpeg_component_count(bytes: &[u8]) -> Option<u8> {
     None
 }
 
-fn flatten_to_rgb(image: &image::DynamicImage) -> Vec<u8> {
+fn flatten_to_rgb(image: &image::DynamicImage, background: [u8; 3]) -> Vec<u8> {
     if !image.color().has_alpha() {
         return image.to_rgb8().into_raw();
     }
@@ -2138,8 +3421,9 @@ fn flatten_to_rgb(image: &image::DynamicImage) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     for pixel in rgba.pixels() {
         let alpha = u16::from(pixel[3]);
-        for channel in &pixel.0[..3] {
-            let value = (u16::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255;
+        let inverse = 255 - alpha;
+        for (channel, background) in pixel.0[..3].iter().zip(background) {
+            let value = (u16::from(*channel) * alpha + u16::from(background) * inverse + 127) / 255;
             rgb.push(value as u8);
         }
     }
@@ -2169,6 +3453,12 @@ fn text_to_pdf(input: &[u8], options: ConversionOptions) -> Result<Vec<u8>, Conv
     let lines_per_page = (((page_height - 2.0 * margin) / leading).floor() as usize).max(1);
     let lines = wrap_text_lines(&text, max_chars);
     let page_count = lines.len().div_ceil(lines_per_page);
+    if page_count > MAX_PDF_PAGES {
+        return Err(ConvertError::PdfTooManyPages {
+            pages: page_count,
+            max: MAX_PDF_PAGES,
+        });
+    }
 
     let catalog_id = Ref::new(1);
     let pages_id = Ref::new(2);
@@ -2631,6 +3921,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_archives_with_too_many_entries() {
+        let inputs: Vec<(PathBuf, Vec<u8>)> = (0..=MAX_ARCHIVE_ENTRIES)
+            .map(|index| (PathBuf::from(format!("{index}.txt")), Vec::new()))
+            .collect();
+        assert!(matches!(
+            convert_batch(&inputs, OutputFormat::Zip),
+            Err(ConvertError::ArchiveTooManyEntries { max, .. }) if max == MAX_ARCHIVE_ENTRIES
+        ));
+    }
+
+    #[test]
     fn rejects_empty_batches() {
         assert!(matches!(
             convert_batch(&[], OutputFormat::Json),
@@ -2871,8 +4172,10 @@ mod tests {
                     "16-bit PCM data must have an even length"
                 );
                 pcm = Some(
-                    body.chunks_exact(2)
-                        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                    body.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| i16::from_le_bytes(*pair))
                         .collect::<Vec<_>>(),
                 );
             }
@@ -2987,8 +4290,10 @@ mod tests {
             u32::from(original.channels)
         );
         let au_samples: Vec<i16> = au[0].bytes[24..]
-            .chunks_exact(2)
-            .map(|bytes| i16::from_be_bytes([bytes[0], bytes[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_be_bytes(*bytes))
             .collect();
         assert_eq!(au_samples, original.samples);
     }
@@ -3251,6 +4556,11 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-video.mp4");
         let input = std::fs::read(path).unwrap();
+
+        let tracks = super::audio_tracks(&input, "mp4").unwrap();
+        assert_eq!(tracks.len(), 1, "the video track must not be listed");
+        assert_eq!(tracks[0].codec, "AAC");
+        assert_eq!(tracks[0].channels, 1);
 
         let wav = convert_bytes("sample-video.mp4", &input, OutputFormat::Wav).unwrap();
         let parsed = parse_wav(&wav[0].bytes);
@@ -3614,5 +4924,519 @@ mod tests {
     fn rejects_pdf_output_for_unstructured_data() {
         let error = convert_bytes("data.csv", b"name\nvalue\n", OutputFormat::Pdf).unwrap_err();
         assert!(matches!(error, ConvertError::Unsupported { .. }));
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    /// Returns (format tag, channels, sample rate, bits, data offset, data size).
+    fn wav_layout(bytes: &[u8]) -> (u16, u16, u32, u16, usize, usize) {
+        assert!(bytes.len() >= 12);
+        let mut offset = 12;
+        let mut format: (u16, u16, u32, u16) = (0, 0, 0, 0);
+        let mut data: (usize, usize) = (0, 0);
+        while offset + 8 <= bytes.len() {
+            let id = &bytes[offset..offset + 4];
+            let size =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            let body = offset + 8;
+            if id == b"fmt " {
+                format = (
+                    u16::from_le_bytes(bytes[body..body + 2].try_into().unwrap()),
+                    u16::from_le_bytes(bytes[body + 2..body + 4].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[body + 4..body + 8].try_into().unwrap()),
+                    u16::from_le_bytes(bytes[body + 14..body + 16].try_into().unwrap()),
+                );
+            } else if id == b"data" {
+                data = (body, size);
+            }
+            offset = body + size + (size & 1);
+        }
+        (format.0, format.1, format.2, format.3, data.0, data.1)
+    }
+
+    #[test]
+    fn writes_wav_directly_to_a_writer() {
+        let input = wav_fixture();
+        let mut output = Vec::new();
+        convert_audio_to_wav_writer(
+            "tone.wav",
+            &input,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.bits_per_sample, 16);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+        assert_eq!(
+            wav_output_name("tone.wav"),
+            std::path::PathBuf::from("tone.wav")
+        );
+    }
+
+    #[test]
+    fn lists_and_selects_audio_tracks() {
+        let input = fixture("sample-two-opus-tracks.webm");
+        let tracks = super::audio_tracks(&input, "webm").unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, 1);
+        assert_eq!(tracks[1].id, 2);
+        assert_eq!(tracks[0].codec, "Opus");
+        assert_eq!(tracks[0].channels, 1);
+        assert_eq!(tracks[0].sample_rate, 48_000);
+        assert!(tracks[0].default);
+        assert!(!tracks[1].default);
+        assert!(tracks[1].label().starts_with("#2"));
+
+        let first =
+            convert_bytes("sample-two-opus-tracks.webm", &input, OutputFormat::Wav).unwrap();
+        assert_eq!(parse_wav(&first[0].bytes).samples.len(), 48_000);
+
+        let second = convert_bytes_with_options(
+            "sample-two-opus-tracks.webm",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = parse_wav(&second[0].bytes);
+        assert_eq!(second.samples.len(), 48_480);
+        assert_audible(&second.samples);
+
+        let error = convert_bytes_with_options(
+            "sample-two-opus-tracks.webm",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn decodes_ac3_and_eac3_audio() {
+        for (name, codec) in [
+            ("sample-ac3.ac3", "AC-3"),
+            ("sample-ac3.mkv", "AC-3"),
+            ("sample-ac3.mp4", "AC-3"),
+            ("sample-eac3.mkv", "E-AC-3"),
+        ] {
+            let input = fixture(name);
+            let extension = std::path::Path::new(name)
+                .extension()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let tracks = super::audio_tracks(&input, extension).unwrap();
+            assert_eq!(tracks.len(), 1, "{name}");
+            assert_eq!(tracks[0].codec, codec, "{name}");
+            assert_eq!(tracks[0].channels, 6, "{name}");
+            assert_eq!(tracks[0].sample_rate, 48_000, "{name}");
+
+            let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&wav[0].bytes);
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.channels, 6, "{name}");
+            assert_eq!(parsed.samples.len(), 96_768 * 6, "{name}");
+            assert_audible(&parsed.samples);
+
+            let stereo = convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_channels: Some(AudioChannels::Stereo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let stereo = parse_wav(&stereo[0].bytes);
+            assert_eq!(stereo.channels, 2, "{name}");
+            assert_eq!(stereo.samples.len(), 96_768 * 2, "{name}");
+            assert_audible(&stereo.samples);
+        }
+    }
+
+    #[test]
+    fn downmixes_centre_and_surround_channels() {
+        // Only the centre channel carries audio. Keeping the first two channels
+        // would produce silence, which is the bug this test guards against.
+        let input = fixture("sample-ac3-center.ac3");
+        let stereo = convert_bytes_with_options(
+            "sample-ac3-center.ac3",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stereo = parse_wav(&stereo[0].bytes);
+        assert_eq!(stereo.channels, 2);
+        assert_audible(&stereo.samples);
+
+        let mono = convert_bytes_with_options(
+            "sample-ac3-center.ac3",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mono = parse_wav(&mono[0].bytes);
+        assert_eq!(mono.channels, 1);
+        assert_audible(&mono.samples);
+    }
+
+    #[test]
+    fn surround_downmix_uses_standard_coefficients_and_avoids_clipping() {
+        let centre_only = super::DecodedAudio {
+            samples: vec![0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+            channels: 6,
+            sample_rate: 48_000,
+            source_bits: None,
+        };
+        let stereo = super::remix_channels(centre_only.clone(), AudioChannels::Stereo);
+        assert!((stereo.samples[0] - 0.353_553).abs() < 0.001);
+        assert!((stereo.samples[1] - 0.353_553).abs() < 0.001);
+        let mono = super::remix_channels(centre_only, AudioChannels::Mono);
+        assert!((mono.samples[0] - 0.353_553).abs() < 0.001);
+
+        let loud = super::DecodedAudio {
+            samples: vec![1.0; 6 * 100],
+            channels: 6,
+            sample_rate: 48_000,
+            source_bits: None,
+        };
+        let stereo = super::remix_channels(loud, AudioChannels::Stereo);
+        let peak = stereo
+            .samples
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert!(peak <= 1.0, "the downmix clipped at {peak}");
+        assert!(peak > 0.9, "the downmix was attenuated more than needed");
+    }
+
+    #[test]
+    fn multichannel_aac_reports_a_clear_error() {
+        let input = fixture("sample-aac-51.m4a");
+        let tracks = super::audio_tracks(&input, "m4a").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].channels, 6);
+        let error = convert_bytes("sample-aac-51.m4a", &input, OutputFormat::Wav).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("multichannel AAC"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn applies_mp4_edit_list_gapless_trimming() {
+        let input = fixture("sample-aac.m4a");
+        let wav = convert_bytes("sample-aac.m4a", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.samples.len(), 88_200);
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
+    fn resampler_preserves_the_passband_and_rejects_aliases() {
+        let tone = |rate: u32, frequency: f64, seconds: f64| super::DecodedAudio {
+            samples: (0..(rate as f64 * seconds) as usize)
+                .map(|frame| {
+                    (std::f64::consts::TAU * frequency * frame as f64 / f64::from(rate)).sin()
+                        as f32
+                        * 0.5
+                })
+                .collect(),
+            channels: 1,
+            sample_rate: rate,
+            source_bits: None,
+        };
+        let rms = |samples: &[f32]| {
+            (samples
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum::<f64>()
+                / samples.len() as f64)
+                .sqrt()
+        };
+
+        let passband = super::resample_audio(tone(48_000, 1_000.0, 0.5), 24_000).unwrap();
+        assert_eq!(passband.sample_rate, 24_000);
+        assert_eq!(passband.samples.len(), 12_000);
+        assert!(
+            (rms(&passband.samples) - 0.353_553).abs() < 0.03,
+            "passband RMS changed to {}",
+            rms(&passband.samples)
+        );
+        let crossings = passband
+            .samples
+            .windows(2)
+            .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
+            .count();
+        assert!(
+            (crossings as i64 - 1_000).abs() < 30,
+            "expected about 1000 zero crossings, got {crossings}"
+        );
+
+        // 20 kHz cannot exist at 24 kHz. A linear interpolator folds it to
+        // 4 kHz; the band-limited filter must remove it instead.
+        let alias = super::resample_audio(tone(48_000, 20_000.0, 0.5), 24_000).unwrap();
+        assert!(
+            rms(&alias.samples) < 0.01,
+            "20 kHz aliased through at RMS {}",
+            rms(&alias.samples)
+        );
+    }
+
+    #[test]
+    fn writes_24_bit_and_float_wav() {
+        let wav = wav_fixture();
+        let original = parse_wav(&wav);
+
+        let pcm24 = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (format, channels, rate, bits, offset, size) = wav_layout(&pcm24[0].bytes);
+        assert_eq!((format, channels, rate, bits), (1, 2, 8_000, 24));
+        assert_eq!(size, 16_000 * 3);
+        let sample = 300;
+        let bytes = &pcm24[0].bytes[offset + sample * 3..offset + sample * 3 + 3];
+        let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+        let value = (raw << 8) >> 8;
+        assert!(
+            (i32::from(original.samples[sample]) * 256 - value).abs() <= 300,
+            "24-bit sample {value} does not match {}",
+            original.samples[sample]
+        );
+
+        let float = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (format, channels, rate, bits, offset, size) = wav_layout(&float[0].bytes);
+        assert_eq!((format, channels, rate, bits), (3, 2, 8_000, 32));
+        assert_eq!(size, 16_000 * 4);
+        assert!(
+            float[0].bytes.windows(4).any(|window| window == b"fact"),
+            "a float WAV should carry a fact chunk"
+        );
+        let value = f32::from_le_bytes(
+            float[0].bytes[offset + sample * 4..offset + sample * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let expected = f32::from(original.samples[sample]) / f32::from(i16::MAX);
+        assert!((value - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn writes_24_bit_flac_and_rejects_float_flac() {
+        let wav = wav_fixture();
+        let flac = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&flac[0].bytes[0..4], b"fLaC");
+        let streaminfo = &flac[0].bytes[8..8 + 34];
+        let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+        assert_eq!(((packed >> 36) & 0x1F) + 1, 24);
+
+        let back = convert_bytes("tone.flac", &flac[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.samples.len(), 16_000);
+        assert_audible(&decoded.samples);
+
+        let error = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("32-bit float"));
+    }
+
+    #[test]
+    fn converts_wav_audio_to_mp3_and_back() {
+        let wav = wav_fixture_at(44_100, 44_100);
+        let mp3 = convert_bytes("tone.wav", &wav, OutputFormat::Mp3).unwrap();
+        assert_eq!(mp3[0].name, PathBuf::from("tone.mp3"));
+        assert!(
+            mp3[0].bytes.starts_with(b"ID3") || mp3[0].bytes[0] == 0xFF,
+            "the MP3 output has no MPEG frame or ID3 header"
+        );
+
+        let back = convert_bytes("tone.mp3", &mp3[0].bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&back[0].bytes);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            (parsed.samples.len() as i64 - 88_200).abs() < 2_500,
+            "MP3 round trip produced {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+
+        // LAME has to clamp its bitrate for low sample rates instead of
+        // failing the conversion.
+        let low_rate = convert_bytes("tone.wav", &wav_fixture(), OutputFormat::Mp3)
+            .expect("8 kHz stereo MP3 output should work");
+        assert!(low_rate[0].bytes.len() > 100);
+    }
+
+    #[test]
+    fn applies_exif_orientation_when_loading_images() {
+        let mut image = image::RgbImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        image.put_pixel(1, 0, image::Rgb([0, 0, 255]));
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&6_u16.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(&tiff);
+        let mut oriented = jpeg[..2].to_vec();
+        oriented.extend_from_slice(&[0xFF, 0xE1]);
+        oriented.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        oriented.extend_from_slice(&segment);
+        oriented.extend_from_slice(&jpeg[2..]);
+
+        assert_eq!(super::exif_orientation(&oriented), Some(6));
+        let converted = convert_bytes("photo.jpg", &oriented, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1, 2));
+        let pixels = decoded.to_rgb8();
+        let top = pixels.get_pixel(0, 0).0;
+        let bottom = pixels.get_pixel(0, 1).0;
+        assert!(top[0] > 200 && top[2] < 60, "top pixel is {top:?}");
+        assert!(
+            bottom[2] > 200 && bottom[0] < 60,
+            "bottom pixel is {bottom:?}"
+        );
+
+        let unrotated = convert_bytes_with_options(
+            "photo.jpg",
+            &oriented,
+            OutputFormat::Png,
+            ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = image::load_from_memory(&unrotated[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+    }
+
+    #[test]
+    fn composites_transparency_onto_the_configured_background() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 0]),
+        ))
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+        let bmp = convert_bytes_with_options(
+            "clear.png",
+            &png,
+            OutputFormat::Bmp,
+            ConversionOptions {
+                image_background: [0, 0, 255],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = image::load_from_memory(&bmp[0].bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 255]);
+
+        let default = convert_bytes("clear.png", &png, OutputFormat::Bmp).unwrap();
+        let decoded = image::load_from_memory(&default[0].bytes)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn malformed_containers_return_errors_instead_of_panicking() {
+        for (name, bytes) in [
+            ("broken.webm", b"\x1a\x45\xdf\xa3".as_slice()),
+            ("broken.mkv", &[0x1A, 0x45, 0xDF, 0xA3, 0x80][..]),
+            ("broken.mp4", b"\0\0\0\x08moov".as_slice()),
+            ("broken.ac3", b"\x0b\x77".as_slice()),
+            ("empty.flac", b"".as_slice()),
+        ] {
+            let _ = convert_bytes(name, bytes, OutputFormat::Wav);
+            let _ = super::audio_tracks(bytes, "webm");
+        }
+        assert_eq!(
+            super::matroska_discard_padding(b"\x1a\x45\xdf\xa3", 1),
+            None
+        );
+        assert_eq!(super::matroska_discard_padding(b"not matroska", 1), None);
+        assert_eq!(super::mp4_gapless_info(b"\0\0\0\x08moov", 0), None);
     }
 }

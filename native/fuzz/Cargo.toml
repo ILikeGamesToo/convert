@@ -1,0 +1,26 @@
+[package]
+name = "convert-to-it-native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+convert-to-it-native = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "convert_bytes"
+path = "fuzz_targets/convert_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "containers"
+path = "fuzz_targets/containers.rs"
+test = false
+doc = false
+bench = false

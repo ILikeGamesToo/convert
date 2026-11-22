@@ -586,9 +586,11 @@ dependencies = [
  "claxon",
  "csv",
  "eframe",
+ "filmcraft-ac3",
  "flacenc",
  "flate2",
  "image",
+ "mp3lame-encoder",
  "opus-pure",
  "pdf-writer",
  "resvg",
@@ -1095,6 +1097,15 @@ checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
 dependencies = [
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "filmcraft-ac3"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d17e68e57e0039be2264551c24f22b622079e43c4ec6d736626348220e98b79"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1970,6 +1981,24 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "mp3lame-encoder"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a768064bbfe7e0853bda4d0fd9c2ee65e4642f9a4d085265a2a12702a8d30f78"
+dependencies = [
+ "mp3lame-sys",
+]
+
+[[package]]
+name = "mp3lame-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a01c8bcc75d256a40b8e3c8dfefbbebe704eef1615cab5025bf362ba2a55f0c0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

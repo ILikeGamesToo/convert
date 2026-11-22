@@ -33,6 +33,7 @@ pub enum InputFormat {
     M4a,
     Aac,
     Aiff,
+    Ac3,
     Video,
     Archive,
     Any,
@@ -40,7 +41,7 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 30] = [
+    pub const SELECTABLE: [Self; 31] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -69,6 +70,7 @@ impl InputFormat {
         Self::M4a,
         Self::Aac,
         Self::Aiff,
+        Self::Ac3,
         Self::Video,
         Self::Archive,
     ];
@@ -102,6 +104,7 @@ impl InputFormat {
             Self::M4a => "M4A audio",
             Self::Aac => "AAC audio",
             Self::Aiff => "AIFF audio",
+            Self::Ac3 => "Dolby audio",
             Self::Video => "Video",
             Self::Archive => "Archive file",
             Self::Any => "Any file",
@@ -138,6 +141,7 @@ impl InputFormat {
             Self::M4a => "M4A or ALAC audio",
             Self::Aac => "Advanced Audio Coding",
             Self::Aiff => "Audio Interchange File Format",
+            Self::Ac3 => "AC-3 or E-AC-3 audio",
             Self::Video => "MP4, MOV, MKV, or WebM with an audio track",
             Self::Archive => "ZIP, TAR, TAR.GZ, or GZIP; archive creation only",
             Self::Any | Self::Mixed => "Archive creation only",
@@ -173,6 +177,7 @@ impl InputFormat {
             Self::M4a => "M4A",
             Self::Aac => "AAC",
             Self::Aiff => "AIFF",
+            Self::Ac3 => "AC3",
             Self::Video => "VIDEO",
             Self::Archive => "ARCHIVE",
             Self::Any => "ANY",
@@ -209,6 +214,7 @@ impl InputFormat {
             Self::M4a => "m4a",
             Self::Aac => "aac",
             Self::Aiff => "aiff",
+            Self::Ac3 => "ac3",
             Self::Video => "mp4",
             Self::Archive => "zip",
             Self::Any | Self::Mixed => return None,
@@ -316,6 +322,7 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "m4a" | "alac" => InputFormat::M4a,
         "aac" => InputFormat::Aac,
         "aiff" | "aif" => InputFormat::Aiff,
+        "ac3" | "eac3" | "ec3" => InputFormat::Ac3,
         "mp4" | "m4v" | "mov" | "mkv" | "webm" => InputFormat::Video,
         "zip" | "tar" | "gz" | "tgz" => InputFormat::Archive,
         _ => return None,
@@ -382,6 +389,9 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
     }
     if bytes.starts_with(b"ID3") {
         return Some(InputFormat::Mp3);
+    }
+    if bytes.starts_with(&[0x0B, 0x77]) {
+        return Some(InputFormat::Ac3);
     }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         return Some(match &bytes[8..12] {
@@ -474,6 +484,9 @@ mod tests {
             ("song.aac", InputFormat::Aac),
             ("song.aiff", InputFormat::Aiff),
             ("song.aif", InputFormat::Aiff),
+            ("movie.ac3", InputFormat::Ac3),
+            ("movie.eac3", InputFormat::Ac3),
+            ("movie.ec3", InputFormat::Ac3),
             ("movie.mp4", InputFormat::Video),
             ("movie.m4v", InputFormat::Video),
             ("movie.mov", InputFormat::Video),

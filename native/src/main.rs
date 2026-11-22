@@ -2,7 +2,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{
@@ -17,8 +17,10 @@ use std::{
 mod input_format;
 
 use convert_to_it_native::{
-    convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
-    AudioChannels, ConversionOptions, OutputFormat, PdfImageFit, PdfOrientation, PdfPageSize,
+    audio_tracks, convert_audio_to_wav_writer, convert_batch_with_options,
+    convert_bytes_with_options, supported_input_extensions, wav_output_name, AudioBitDepth,
+    AudioChannels, AudioTrackInfo, ConversionOptions, OutputFormat, PdfImageFit, PdfOrientation,
+    PdfPageSize,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
@@ -51,8 +53,10 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|creation_context| {
             apply_theme(&creation_context.egui_ctx);
-            let mut app = ConvertApp::default();
-            app.output_directory = default_output_directory();
+            let app = ConvertApp {
+                output_directory: default_output_directory(),
+                ..Default::default()
+            };
             Ok(Box::new(app))
         }),
     );
@@ -238,6 +242,8 @@ struct ConvertApp {
     output_directory: Option<PathBuf>,
     target: Option<OutputFormat>,
     conversion_options: ConversionOptions,
+    audio_track_choices: Vec<AudioTrackInfo>,
+    audio_track_error: Option<String>,
     search_filter: String,
     selected_category: Option<FormatCategory>,
     status: Option<(String, bool)>,
@@ -335,7 +341,8 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Flac
         | OutputFormat::Aiff
         | OutputFormat::Au
-        | OutputFormat::Opus => FormatCategory::Audio,
+        | OutputFormat::Opus
+        | OutputFormat::Mp3 => FormatCategory::Audio,
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip => {
             FormatCategory::Archive
         }
@@ -376,6 +383,7 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Aiff => "AIFF",
         OutputFormat::Au => "AU",
         OutputFormat::Opus => "OPUS",
+        OutputFormat::Mp3 => "MP3",
         OutputFormat::Zip => "ZIP",
         OutputFormat::Tar => "TAR",
         OutputFormat::TarGz => "TAR.GZ",
@@ -417,6 +425,7 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Aiff => "AIFF audio",
         OutputFormat::Au => "AU audio",
         OutputFormat::Opus => "Opus audio",
+        OutputFormat::Mp3 => "MP3 audio",
         OutputFormat::Zip => "ZIP archive",
         OutputFormat::Tar => "TAR archive",
         OutputFormat::TarGz => "Gzipped TAR archive",
@@ -506,18 +515,24 @@ fn primary_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response 
 }
 
 fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions) -> bool {
+    let image_changed = options.image_background != ConversionOptions::DEFAULT_IMAGE_BACKGROUND
+        || !options.image_apply_exif_orientation;
     match target {
-        OutputFormat::Jpeg => options.jpeg_quality.is_some(),
-        OutputFormat::Png => options.png_compression.is_some(),
+        OutputFormat::Jpeg => options.jpeg_quality.is_some() || image_changed,
+        OutputFormat::Png => options.png_compression.is_some() || image_changed,
         OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
             options.archive_compression.is_some()
         }
-        OutputFormat::Wav
-        | OutputFormat::Flac
-        | OutputFormat::Aiff
-        | OutputFormat::Au
-        | OutputFormat::Opus => {
-            options.audio_sample_rate.is_some() || options.audio_channels.is_some()
+        OutputFormat::Wav | OutputFormat::Flac => {
+            options.audio_sample_rate.is_some()
+                || options.audio_channels.is_some()
+                || options.audio_track.is_some()
+                || options.audio_bit_depth != AudioBitDepth::Bit16
+        }
+        OutputFormat::Aiff | OutputFormat::Au | OutputFormat::Opus | OutputFormat::Mp3 => {
+            options.audio_sample_rate.is_some()
+                || options.audio_channels.is_some()
+                || options.audio_track.is_some()
         }
         OutputFormat::Pdf => {
             options.pdf_page_size != ConversionOptions::DEFAULT_PDF_PAGE_SIZE
@@ -525,7 +540,9 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
                 || options.pdf_image_fit != ConversionOptions::DEFAULT_PDF_IMAGE_FIT
                 || options.pdf_font_size != ConversionOptions::DEFAULT_PDF_FONT_SIZE
                 || options.pdf_margin != ConversionOptions::DEFAULT_PDF_MARGIN
+                || image_changed
         }
+        target if format_category(target) == FormatCategory::Image => image_changed,
         _ => false,
     }
 }
@@ -653,6 +670,65 @@ fn optional_channels(ui: &mut egui::Ui, channels: &mut Option<AudioChannels>) {
                 });
         });
     });
+}
+
+fn audio_bit_depth_setting(ui: &mut egui::Ui, depth: &mut AudioBitDepth, target: OutputFormat) {
+    let choices: &[AudioBitDepth] = if target == OutputFormat::Flac {
+        &[AudioBitDepth::Bit16, AudioBitDepth::Bit24]
+    } else {
+        &AudioBitDepth::ALL
+    };
+    ui.vertical(|ui| {
+        ui.label(RichText::new("Bit depth").size(12.8).strong().color(TEXT));
+        settings_input_frame(ui, |ui| {
+            egui::ComboBox::from_id_salt("audio-bit-depth")
+                .selected_text(depth.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for option in choices {
+                        if ui
+                            .selectable_label(*depth == *option, option.label())
+                            .clicked()
+                        {
+                            *depth = *option;
+                        }
+                    }
+                });
+        });
+    });
+}
+
+fn image_settings(ui: &mut egui::Ui, options: &mut ConversionOptions) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new("Background").size(12.8).strong().color(TEXT));
+        ui.label(
+            RichText::new("Used when transparency is saved to a format without alpha.")
+                .size(11.5)
+                .color(MUTED),
+        );
+        settings_input_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                egui::color_picker::color_edit_button_srgb(ui, &mut options.image_background);
+                ui.label(
+                    RichText::new(format!(
+                        "#{:02X}{:02X}{:02X}",
+                        options.image_background[0],
+                        options.image_background[1],
+                        options.image_background[2]
+                    ))
+                    .size(12.0)
+                    .color(MUTED),
+                );
+            });
+        });
+    });
+    ui.add_space(14.0);
+    ui.checkbox(
+        &mut options.image_apply_exif_orientation,
+        RichText::new("Apply EXIF orientation")
+            .size(12.8)
+            .color(TEXT),
+    );
 }
 
 fn pdf_choice_setting<T: Copy + PartialEq>(
@@ -1156,6 +1232,10 @@ impl ConvertApp {
                     1..=100,
                     ConversionOptions::DEFAULT_JPEG_QUALITY,
                 );
+                ui.add_space(18.0);
+                settings_section_heading(ui, "Image", None);
+                ui.add_space(10.0);
+                image_settings(ui, &mut self.conversion_options);
             }
             OutputFormat::Png => {
                 settings_section_heading(ui, "Other", None);
@@ -1167,6 +1247,10 @@ impl ConvertApp {
                     1..=9,
                     ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
                 );
+                ui.add_space(18.0);
+                settings_section_heading(ui, "Image", None);
+                ui.add_space(10.0);
+                image_settings(ui, &mut self.conversion_options);
             }
             OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
                 settings_section_heading(ui, "Other", None);
@@ -1183,12 +1267,23 @@ impl ConvertApp {
             | OutputFormat::Flac
             | OutputFormat::Aiff
             | OutputFormat::Au
-            | OutputFormat::Opus => {
+            | OutputFormat::Opus
+            | OutputFormat::Mp3 => {
                 settings_section_heading(ui, "Audio", None);
                 ui.add_space(10.0);
+                self.audio_track_setting(ui);
+                ui.add_space(14.0);
                 optional_sample_rate(ui, &mut self.conversion_options.audio_sample_rate);
                 ui.add_space(14.0);
                 optional_channels(ui, &mut self.conversion_options.audio_channels);
+                if matches!(target, OutputFormat::Wav | OutputFormat::Flac) {
+                    ui.add_space(14.0);
+                    audio_bit_depth_setting(
+                        ui,
+                        &mut self.conversion_options.audio_bit_depth,
+                        target,
+                    );
+                }
             }
             OutputFormat::Pdf => {
                 settings_section_heading(ui, "Page", None);
@@ -1241,6 +1336,20 @@ impl ConvertApp {
                         "pt",
                     );
                 }
+                if self
+                    .effective_input_format()
+                    .is_some_and(InputFormat::is_image)
+                {
+                    ui.add_space(18.0);
+                    settings_section_heading(ui, "Image", None);
+                    ui.add_space(10.0);
+                    image_settings(ui, &mut self.conversion_options);
+                }
+            }
+            _ if format_category(target) == FormatCategory::Image => {
+                settings_section_heading(ui, "Image", None);
+                ui.add_space(10.0);
+                image_settings(ui, &mut self.conversion_options);
             }
             _ => {
                 ui.add_space(24.0);
@@ -1255,6 +1364,88 @@ impl ConvertApp {
                     );
                 });
             }
+        }
+    }
+
+    fn audio_track_setting(&mut self, ui: &mut egui::Ui) {
+        let choices = self.audio_track_choices.clone();
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Audio track").size(12.8).strong().color(TEXT));
+            if choices.is_empty() {
+                ui.label(
+                    RichText::new("Track information is unavailable for this file.")
+                        .size(11.5)
+                        .color(MUTED),
+                );
+                return;
+            }
+            ui.label(
+                RichText::new("Read from the first selected file.")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+            settings_input_frame(ui, |ui| {
+                let selected = self
+                    .conversion_options
+                    .audio_track
+                    .and_then(|index| choices.get(index))
+                    .map(AudioTrackInfo::label)
+                    .unwrap_or_else(|| "Auto (first track)".to_owned());
+                egui::ComboBox::from_id_salt("audio-track")
+                    .selected_text(selected)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                self.conversion_options.audio_track.is_none(),
+                                "Auto (first track)",
+                            )
+                            .clicked()
+                        {
+                            self.conversion_options.audio_track = None;
+                        }
+                        for (index, track) in choices.iter().enumerate() {
+                            if ui
+                                .selectable_label(
+                                    self.conversion_options.audio_track == Some(index),
+                                    track.label(),
+                                )
+                                .clicked()
+                            {
+                                self.conversion_options.audio_track = Some(index);
+                            }
+                        }
+                    });
+            });
+        });
+        if let Some(error) = &self.audio_track_error {
+            ui.label(RichText::new(error).size(11.0).color(MUTED));
+        }
+    }
+
+    fn refresh_audio_tracks(&mut self) {
+        self.audio_track_choices.clear();
+        self.audio_track_error = None;
+        let Some(path) = self.inputs.first() else {
+            return;
+        };
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match fs::read(path) {
+            Ok(bytes) => match audio_tracks(&bytes, &extension) {
+                Ok(tracks) => self.audio_track_choices = tracks,
+                Err(error) => self.audio_track_error = Some(error.to_string()),
+            },
+            Err(error) => self.audio_track_error = Some(error.to_string()),
+        }
+        if self
+            .conversion_options
+            .audio_track
+            .is_some_and(|index| index >= self.audio_track_choices.len())
+        {
+            self.conversion_options.audio_track = None;
         }
     }
 
@@ -1318,7 +1509,7 @@ impl ConvertApp {
         let detected_label = self.detected_input_label();
         let effective = self.effective_input_format();
         let current_override = self.input_format_override;
-        let using = current_override.or_else(|| match effective {
+        let using = current_override.or(match effective {
             Some(InputFormat::Any | InputFormat::Mixed) => effective,
             _ => None,
         });
@@ -2211,6 +2402,8 @@ impl ConvertApp {
             self.target = None;
             if self.inputs.is_empty() {
                 self.return_to_upload();
+            } else {
+                self.refresh_audio_tracks();
             }
         }
     }
@@ -2219,6 +2412,8 @@ impl ConvertApp {
         self.page = AppPage::Upload;
         self.inputs.clear();
         self.input_formats.clear();
+        self.audio_track_choices.clear();
+        self.audio_track_error = None;
         self.input_format_override = None;
         self.input_format_search.clear();
         self.input_format_show_all = false;
@@ -2319,6 +2514,7 @@ impl ConvertApp {
             }
         }
         if added {
+            self.refresh_audio_tracks();
             self.page = AppPage::Conversion;
             self.target = None;
             self.input_format_override = None;
@@ -3022,28 +3218,27 @@ fn convert_to_directory(
     mut report: impl FnMut(usize, String),
 ) -> Result<String, ConversionFailure> {
     let mut completed = 0;
-    let mut files = Vec::with_capacity(inputs.len());
-
-    for path in inputs {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(ConversionFailure::Cancelled);
-        }
-        report(completed, format!("Reading {}...", file_name(path)));
-        let bytes = fs::read(path)
-            .map_err(|error| ConversionFailure::Message(format!("{}: {error}", path.display())))?;
-        files.push((path.clone(), bytes));
-        completed += 1;
-        report(
-            completed,
-            format!("Read {} of {} files", completed, inputs.len()),
-        );
-    }
-
     let mut written = Vec::new();
     if matches!(
         target,
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
     ) {
+        let mut files = Vec::with_capacity(inputs.len());
+        for path in inputs {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ConversionFailure::Cancelled);
+            }
+            report(completed, format!("Reading {}...", file_name(path)));
+            let bytes = fs::read(path).map_err(|error| {
+                ConversionFailure::Message(format!("{}: {error}", path.display()))
+            })?;
+            files.push((path.clone(), bytes));
+            completed += 1;
+            report(
+                completed,
+                format!("Read {} of {} files", completed, inputs.len()),
+            );
+        }
         if cancel.load(Ordering::Relaxed) {
             return Err(ConversionFailure::Cancelled);
         }
@@ -3070,42 +3265,75 @@ fn convert_to_directory(
         return Ok(conversion_summary(&written));
     }
 
-    let mut converted = Vec::new();
-    for (index, (path, bytes)) in files.iter().enumerate() {
+    // Convert and write one file at a time. A batch no longer keeps every
+    // input and every output in memory at once, which matters for long videos
+    // and high-resolution images.
+    for (index, path) in inputs.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
+            remove_written(&written);
             return Err(ConversionFailure::Cancelled);
         }
+        report(completed, format!("Reading {}...", file_name(path)));
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                remove_written(&written);
+                return Err(ConversionFailure::Message(format!(
+                    "{}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        completed += 1;
+
         report(
             completed,
             format!(
                 "Converting {} ({}/{})...",
                 file_name(path),
                 index + 1,
-                files.len()
+                inputs.len()
             ),
         );
-        let mut outputs = convert_bytes_with_options(file_name(path), bytes, target, options)
-            .map_err(|error| ConversionFailure::Message(error.to_string()))?;
-        converted.append(&mut outputs);
-        completed += 1;
-        report(
-            completed,
-            format!("Converted {} of {} files", index + 1, files.len()),
-        );
-    }
-
-    for file in converted {
-        if cancel.load(Ordering::Relaxed) {
-            remove_written(&written);
-            return Err(ConversionFailure::Cancelled);
+        if target == OutputFormat::Wav {
+            let output_name = wav_output_name(file_name(path));
+            let output = write_unique_with(output_directory, &output_name, |file| {
+                convert_audio_to_wav_writer(file_name(path), &bytes, options, file)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            })
+            .map_err(|error| {
+                ConversionFailure::Message(format!("{}: {error}", output_name.display()))
+            })?;
+            drop(bytes);
+            completed += 2;
+            written.push(output);
+            report(completed, format!("Saved {}", output_name.display()));
+            continue;
         }
-        report(completed, format!("Saving {}...", file.name.display()));
-        let output = write_unique(output_directory, &file.name, &file.bytes).map_err(|error| {
-            ConversionFailure::Message(format!("{}: {error}", file.name.display()))
-        })?;
-        written.push(output);
+        let outputs = match convert_bytes_with_options(file_name(path), &bytes, target, options) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                remove_written(&written);
+                return Err(ConversionFailure::Message(error.to_string()));
+            }
+        };
+        drop(bytes);
         completed += 1;
-        report(completed, format!("Saved {}", file.name.display()));
+
+        for file in outputs {
+            if cancel.load(Ordering::Relaxed) {
+                remove_written(&written);
+                return Err(ConversionFailure::Cancelled);
+            }
+            report(completed, format!("Saving {}...", file.name.display()));
+            let output =
+                write_unique(output_directory, &file.name, &file.bytes).map_err(|error| {
+                    ConversionFailure::Message(format!("{}: {error}", file.name.display()))
+                })?;
+            written.push(output);
+            completed += 1;
+            report(completed, format!("Saved {}", file.name.display()));
+        }
     }
 
     Ok(conversion_summary(&written))
@@ -3137,6 +3365,17 @@ fn remove_written(written: &[PathBuf]) {
 }
 
 fn write_unique(directory: &Path, relative_path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    write_unique_with(directory, relative_path, |file| file.write_all(bytes))
+}
+
+fn write_unique_with<F>(
+    directory: &Path,
+    relative_path: &Path,
+    write: F,
+) -> std::io::Result<PathBuf>
+where
+    F: FnOnce(&mut File) -> std::io::Result<()>,
+{
     let relative_path = validate_relative_path(relative_path)?;
     let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
     let output_directory = directory.join(parent);
@@ -3168,7 +3407,7 @@ fn write_unique(directory: &Path, relative_path: &Path, bytes: &[u8]) -> std::io
             .open(&output)
         {
             Ok(mut file) => {
-                if let Err(error) = file.write_all(bytes) {
+                if let Err(error) = write(&mut file) {
                     drop(file);
                     return match fs::remove_file(&output) {
                         Ok(()) => Err(error),
@@ -3385,6 +3624,7 @@ mod tests {
             OutputFormat::Aiff,
             OutputFormat::Au,
             OutputFormat::Opus,
+            OutputFormat::Mp3,
             OutputFormat::Zip,
             OutputFormat::Tar,
             OutputFormat::TarGz,
@@ -3440,6 +3680,7 @@ mod tests {
                 OutputFormat::Aiff,
                 OutputFormat::Au,
                 OutputFormat::Opus,
+                OutputFormat::Mp3,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
@@ -3605,6 +3846,59 @@ mod tests {
             ..Default::default()
         };
         assert!(target_has_applied_setting(OutputFormat::Pdf, &cover));
+    }
+
+    fn tiny_wav() -> Vec<u8> {
+        let frames = 800_u32;
+        let data_size = frames * 4;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        wav.extend_from_slice(&32_000_u32.to_le_bytes());
+        wav.extend_from_slice(&4_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.resize(wav.len() + data_size as usize, 0);
+        wav
+    }
+
+    #[test]
+    fn wav_conversion_streams_to_the_output_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-wav-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("tone.wav");
+        fs::write(&input, tiny_wav()).unwrap();
+        let output_directory = directory.join("out");
+        let mut last_step = 0;
+        let summary = convert_to_directory(
+            std::slice::from_ref(&input),
+            OutputFormat::Wav,
+            ConversionOptions::default(),
+            &output_directory,
+            &AtomicBool::new(false),
+            |completed, _| last_step = completed,
+        )
+        .unwrap();
+
+        assert!(summary.contains("tone.wav"));
+        let output = fs::read(output_directory.join("tone.wav")).unwrap();
+        assert_eq!(&output[..4], b"RIFF");
+        assert!(output.len() > 44);
+        assert_eq!(last_step, 3);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
