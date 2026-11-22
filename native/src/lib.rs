@@ -3171,6 +3171,31 @@ mod tests {
     }
 
     #[test]
+    fn converts_vp9_opus_webm_directly_to_opus_and_back() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-vp9-opus.webm");
+        let input = std::fs::read(path).unwrap();
+
+        let opus = convert_bytes("sample-vp9-opus.webm", &input, OutputFormat::Opus).unwrap();
+        assert_eq!(opus[0].name, PathBuf::from("sample-vp9-opus.opus"));
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+
+        let back =
+            convert_bytes("sample-vp9-opus.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+        // The fixture holds 2 s of audio; allow the one 20 ms Opus frame of
+        // final-packet padding the WebM decoder leaves in.
+        assert!(
+            (decoded.samples.len() as i64 - 96_000).abs() <= 960,
+            "decoded {} samples",
+            decoded.samples.len()
+        );
+        assert_audible(&decoded.samples);
+    }
+
+    #[test]
     fn decodes_ogg_opus_audio() {
         use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
 
