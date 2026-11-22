@@ -104,6 +104,8 @@ impl AudioBitDepth {
 /// One audio track that can be decoded from an input file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioTrackInfo {
+    /// Zero-based position in the selectable audio-track list.
+    pub index: usize,
     /// Container track ID.
     pub id: u32,
     /// Human-readable codec name, such as `AAC` or `AC-3`.
@@ -118,8 +120,14 @@ pub struct AudioTrackInfo {
 
 impl AudioTrackInfo {
     /// A compact label for pickers: `#2 · eng · AC-3 · 5.1 · 48 kHz`.
+    /// The leading number is the selectable index; the container stream ID is
+    /// included when it differs, so an unsupported stream cannot silently
+    /// shift the displayed numbering.
     pub fn label(&self) -> String {
-        let mut parts = vec![format!("#{}", self.id)];
+        let mut parts = vec![format!("#{}", self.index + 1)];
+        if self.index + 1 != self.id as usize {
+            parts.push(format!("stream {}", self.id));
+        }
         if let Some(language) = self.language.as_deref().filter(|value| *value != "und") {
             parts.push(language.to_owned());
         }
@@ -1513,6 +1521,7 @@ fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, Co
         let info = reader.streaminfo();
         return Ok(vec![AudioTrackEntry {
             info: AudioTrackInfo {
+                index: 0,
                 id: 1,
                 codec: "FLAC".to_owned(),
                 language: None,
@@ -1533,6 +1542,7 @@ fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, Co
         let head = reader.head();
         return Ok(vec![AudioTrackEntry {
             info: AudioTrackInfo {
+                index: 0,
                 id: 1,
                 codec: "Opus".to_owned(),
                 language: None,
@@ -1551,6 +1561,7 @@ fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, Co
         })?;
         return Ok(vec![AudioTrackEntry {
             info: AudioTrackInfo {
+                index: 0,
                 id: 1,
                 codec: ac3_codec_label(&header).to_owned(),
                 language: None,
@@ -1606,6 +1617,7 @@ fn audio_track_entries(
         let info = reader.streaminfo();
         return Ok(vec![AudioTrackEntry {
             info: AudioTrackInfo {
+                index: 0,
                 id: 1,
                 codec: "FLAC".to_owned(),
                 language: None,
@@ -1626,6 +1638,7 @@ fn audio_track_entries(
         let head = reader.head();
         return Ok(vec![AudioTrackEntry {
             info: AudioTrackInfo {
+                index: 0,
                 id: 1,
                 codec: "Opus".to_owned(),
                 language: None,
@@ -1644,6 +1657,7 @@ fn audio_track_entries(
         })?;
         return Ok(vec![AudioTrackEntry {
             info: AudioTrackInfo {
+                index: 0,
                 id: 1,
                 codec: ac3_codec_label(&header).to_owned(),
                 language: None,
@@ -1785,6 +1799,7 @@ fn audio_track_entries_from_format(
 
         entries.push(AudioTrackEntry {
             info: AudioTrackInfo {
+                index: entries.len(),
                 id,
                 codec,
                 language,
@@ -5676,6 +5691,120 @@ mod tests {
         assert_ne!(default_stream, second_stream);
         assert_eq!(parse_wav(&default_stream).samples.len(), 48_000);
         assert_eq!(parse_wav(&second_stream).samples.len(), 48_480);
+    }
+
+    #[test]
+    fn selects_audio_tracks_after_non_audio_and_unsupported_streams() {
+        let name = "sample-interleaved-tracks.mkv";
+        let path = fixture_path(name);
+        let input = fixture(name);
+
+        let tracks = super::audio_tracks_from_path(&path).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].index, 0);
+        assert_eq!(tracks[0].id, 3);
+        assert_eq!(tracks[0].language.as_deref(), Some("eng"));
+        assert_eq!(tracks[0].codec, "AC-3");
+        assert_eq!(tracks[0].channels, 6);
+        assert_eq!(tracks[0].sample_rate, 48_000);
+        assert!(tracks[0].label().starts_with("#1 · stream 3 · eng · AC-3"));
+        assert_eq!(tracks[1].index, 1);
+        assert_eq!(tracks[1].id, 4);
+        assert_eq!(tracks[1].language.as_deref(), Some("fra"));
+        assert_eq!(tracks[1].codec, "AC-3");
+        assert_eq!(tracks[1].channels, 6);
+        assert_eq!(tracks[1].sample_rate, 48_000);
+        assert!(tracks[1].label().starts_with("#2 · stream 4 · fra · AC-3"));
+
+        let default = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+        let first = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(default[0].bytes, first[0].bytes);
+        assert_ne!(default[0].bytes, second[0].bytes);
+        let first_wav = parse_wav(&default[0].bytes);
+        let second_wav = parse_wav(&second[0].bytes);
+        assert_eq!(first_wav.channels, 6);
+        assert_eq!(first_wav.sample_rate, 48_000);
+        assert_eq!(first_wav.samples.len(), 96_768 * 6);
+        assert_eq!(second_wav.channels, 6);
+        assert_eq!(second_wav.sample_rate, 48_000);
+        assert_eq!(second_wav.samples.len(), 153_600 * 6);
+
+        let default_stream = stream_wav(&path, ConversionOptions::default());
+        let first_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        );
+        let second_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(default_stream, default[0].bytes);
+        assert_eq!(first_stream, first[0].bytes);
+        assert_eq!(second_stream, second[0].bytes);
+        assert_eq!(parse_wav(&second_stream).samples.len(), 153_600 * 6);
+
+        let error = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+
+        let mut output = Cursor::new(Vec::new());
+        let error = super::convert_audio_file_to_writer(
+            &path,
+            name,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
     }
 
     #[test]

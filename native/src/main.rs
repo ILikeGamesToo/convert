@@ -785,6 +785,14 @@ fn number_setting(
     });
 }
 
+fn audio_track_selection_label(options: &ConversionOptions, choices: &[AudioTrackInfo]) -> String {
+    options
+        .audio_track
+        .and_then(|index| choices.get(index))
+        .map(AudioTrackInfo::label)
+        .unwrap_or_else(|| "Auto (first track)".to_owned())
+}
+
 impl eframe::App for ConvertApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_conversion();
@@ -1392,12 +1400,7 @@ impl ConvertApp {
                     .color(MUTED),
             );
             settings_input_frame(ui, |ui| {
-                let selected = self
-                    .conversion_options
-                    .audio_track
-                    .and_then(|index| choices.get(index))
-                    .map(AudioTrackInfo::label)
-                    .unwrap_or_else(|| "Auto (first track)".to_owned());
+                let selected = audio_track_selection_label(&self.conversion_options, &choices);
                 egui::ComboBox::from_id_salt("audio-track")
                     .selected_text(selected)
                     .width(ui.available_width())
@@ -3696,6 +3699,40 @@ mod tests {
                 OutputFormat::Gzip
             ]
         );
+    }
+
+    #[test]
+    fn audio_track_picker_defaults_to_auto_and_uses_probed_metadata() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-interleaved-tracks.mkv");
+        let choices = audio_tracks_from_path(&path).unwrap();
+
+        assert_eq!(
+            audio_track_selection_label(&ConversionOptions::default(), &choices),
+            "Auto (first track)"
+        );
+        let first = audio_track_selection_label(
+            &ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+            &choices,
+        );
+        assert_eq!(first, "#1 · stream 3 · eng · AC-3 · 5.1 · 48.0 kHz");
+        let second = audio_track_selection_label(
+            &ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+            &choices,
+        );
+        assert_eq!(second, "#2 · stream 4 · fra · AC-3 · 5.1 · 48.0 kHz");
+
+        let mut no_language = choices[0].clone();
+        no_language.language = None;
+        no_language.index = 0;
+        no_language.id = 1;
+        assert_eq!(no_language.label(), "#1 · AC-3 · 5.1 · 48.0 kHz");
     }
 
     #[test]
