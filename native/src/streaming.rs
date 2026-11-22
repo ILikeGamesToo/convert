@@ -318,7 +318,7 @@ impl AudioChunkReader for SymphoniaChunkReader {
 struct OpusTrackChunkReader {
     format: Box<dyn symphonia::core::formats::FormatReader>,
     track_id: u32,
-    decoder: opus_pure::OpusDecoder,
+    decoder: OpusPcmDecoder,
     block: Vec<f32>,
     channels: usize,
     pre_skip_remaining: usize,
@@ -330,17 +330,16 @@ impl OpusTrackChunkReader {
         track_id: u32,
         codec_params: &symphonia::core::codecs::CodecParameters,
     ) -> Result<Self, ConvertError> {
-        let (channels, pre_skip) = opus_stream_info(codec_params)?;
-        let decoder = opus_pure::OpusDecoder::new(48_000, channels).map_err(|error| {
-            ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
-        })?;
+        let info = opus_stream_info(codec_params)?;
+        let channels = info.channels;
+        let decoder = OpusPcmDecoder::new(channels, info.mapping_family)?;
         Ok(Self {
             format,
             track_id,
             decoder,
             block: vec![0.0; opus_pure::MAX_PACKET_SAMPLES * channels],
             channels,
-            pre_skip_remaining: pre_skip as usize,
+            pre_skip_remaining: info.pre_skip as usize,
         })
     }
 }
@@ -369,6 +368,7 @@ impl AudioChunkReader for OpusTrackChunkReader {
                 .map_err(|error| {
                     ConvertError::Audio(format!("could not decode Opus audio: {error}"))
                 })?;
+            reorder_opus_channels(&mut self.block[..decoded * self.channels], self.channels);
             let skip = self.pre_skip_remaining.min(decoded);
             self.pre_skip_remaining -= skip;
             let start = skip * self.channels;
@@ -388,7 +388,7 @@ impl AudioChunkReader for OpusTrackChunkReader {
 
 struct OggOpusChunkReader {
     reader: opus_pure::OggOpusReader<File>,
-    decoder: opus_pure::OpusDecoder,
+    decoder: OpusPcmDecoder,
     trim: opus_pure::Trim,
     block: Vec<f32>,
     channels: usize,
@@ -403,10 +403,8 @@ impl OggOpusChunkReader {
             ConvertError::Audio(format!("could not open the Opus stream: {error}"))
         })?;
         let head = reader.head().clone();
-        let channels = opus_channels(head.channel_count as usize)?;
-        let decoder = head.decoder(48_000).map_err(|error| {
-            ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
-        })?;
+        let channels = opus_channels(head.channel_count as usize, head.mapping_family)?;
+        let decoder = OpusPcmDecoder::new(channels, head.mapping_family)?;
         let trim = opus_pure::Trim::new(&head, 48_000, channels).map_err(|error| {
             ConvertError::Audio(format!("could not read the Opus stream: {error}"))
         })?;
@@ -443,6 +441,7 @@ impl AudioChunkReader for OggOpusChunkReader {
                 .map_err(|error| {
                     ConvertError::Audio(format!("could not decode Opus audio: {error}"))
                 })?;
+            reorder_opus_channels(&mut self.block[..decoded * self.channels], self.channels);
             let kept = self
                 .trim
                 .keep(&self.packet, &self.block[..decoded * self.channels]);
@@ -803,11 +802,7 @@ impl AudioProcessor {
         target_rate: u32,
         trim: AudioTrim,
     ) -> Self {
-        let gain = if source_channels > 2 && target_channels <= 2 {
-            0.5
-        } else {
-            1.0
-        };
+        let gain = downmix_gain(source_channels, target_channels);
         let resampler = (source_rate != target_rate)
             .then(|| StreamingResampler::new(source_rate, target_rate, target_channels));
         Self {

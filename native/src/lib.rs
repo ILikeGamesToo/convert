@@ -557,6 +557,11 @@ pub enum ConvertError {
     NoAudioTrack,
     #[error("audio track {requested} does not exist; the file has {available} audio track(s)")]
     AudioTrackNotFound { requested: usize, available: usize },
+    #[error("{codec} audio with {channels} channels is not supported")]
+    UnsupportedChannelLayout {
+        codec: &'static str,
+        channels: usize,
+    },
     #[error("the audio file is too large to convert in memory")]
     AudioTooLarge,
     #[error("conversion cancelled")]
@@ -1796,7 +1801,9 @@ fn audio_track_entries_from_format(
 
         let (kind, codec, channels, sample_rate, pre_skip) =
             if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
-                let (channels, pre_skip) = opus_stream_info(&codec_params).unwrap_or((0, 0));
+                let (channels, pre_skip) = opus_stream_info(&codec_params)
+                    .map(|info| (info.channels, info.pre_skip))
+                    .unwrap_or((0, 0));
                 (
                     AudioCodecKind::Opus,
                     "Opus".to_owned(),
@@ -2039,7 +2046,7 @@ fn decode_audio(
         .ok_or(ConvertError::NoAudioTrack)?;
     let pre_skip = if kind == AudioCodecKind::Opus {
         opus_stream_info(&codec_params)
-            .map(|(_, pre_skip)| pre_skip)
+            .map(|info| info.pre_skip)
             .unwrap_or(0)
     } else {
         0
@@ -2255,13 +2262,104 @@ fn is_ogg_opus(input: &[u8]) -> bool {
     input.starts_with(b"OggS") && input.get(28..36).is_some_and(|magic| magic == b"OpusHead")
 }
 
-fn opus_channels(channels: usize) -> Result<usize, ConvertError> {
-    if channels > 2 {
-        return Err(ConvertError::Audio(
-            "multichannel Opus audio is not supported".to_owned(),
-        ));
+struct OpusStreamInfo {
+    channels: usize,
+    pre_skip: u32,
+    mapping_family: u8,
+}
+
+/// Opus mapping family 0 only defines mono and stereo. Family 1 defines the
+/// Vorbis surround layouts up to 7.1, which the multistream decoder supports.
+fn opus_channels(channels: usize, mapping_family: u8) -> Result<usize, ConvertError> {
+    let supported = match mapping_family {
+        0 => (1..=2).contains(&channels),
+        1 => (1..=8).contains(&channels),
+        _ => false,
+    };
+    if !supported {
+        return Err(ConvertError::UnsupportedChannelLayout {
+            codec: "Opus",
+            channels,
+        });
     }
     Ok(channels)
+}
+
+/// Decodes either an ordinary mono/stereo Opus stream or a multistream
+/// surround packet. Keeping both variants here means the file and streaming
+/// paths share the same channel handling.
+enum OpusPcmDecoder {
+    Single(Box<opus_pure::OpusDecoder>),
+    Multi(Box<opus_pure::OpusMSDecoder>),
+}
+
+impl OpusPcmDecoder {
+    fn new(channels: usize, mapping_family: u8) -> Result<Self, ConvertError> {
+        if mapping_family == 0 {
+            opus_pure::OpusDecoder::new(48_000, channels)
+                .map(|decoder| Self::Single(Box::new(decoder)))
+                .map_err(|error| {
+                    ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
+                })
+        } else {
+            opus_pure::OpusMSDecoder::new(48_000, channels, mapping_family)
+                .map(|decoder| Self::Multi(Box::new(decoder)))
+                .map_err(|error| {
+                    ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
+                })
+        }
+    }
+
+    fn decode(
+        &mut self,
+        packet: &[u8],
+        frame_size: usize,
+        block: &mut [f32],
+    ) -> Result<usize, opus_pure::Error> {
+        match self {
+            Self::Single(decoder) => decoder.decode(packet, frame_size, block),
+            Self::Multi(decoder) => decoder.decode(packet, frame_size, block),
+        }
+    }
+}
+
+/// Opus mapping family 1 uses the Vorbis channel order, which differs from the
+/// WAV/film order the downmixer expects. Reorder to L, R, C, LFE, surrounds.
+fn reorder_opus_channels(samples: &mut [f32], channels: usize) {
+    let order: &[usize] = match channels {
+        3 => &[0, 2, 1],
+        5 => &[0, 2, 1, 3, 4],
+        6 => &[0, 2, 1, 5, 3, 4],
+        7 => &[0, 2, 1, 6, 5, 3, 4],
+        8 => &[0, 2, 1, 7, 5, 6, 3, 4],
+        _ => return,
+    };
+    let mut frame = [0.0_f32; 8];
+    for chunk in samples.chunks_exact_mut(channels) {
+        for (output, &source) in order.iter().enumerate() {
+            frame[output] = chunk[source];
+        }
+        chunk.copy_from_slice(&frame[..channels]);
+    }
+}
+
+/// The inverse of [`reorder_opus_channels`], used before multistream encoding.
+fn reorder_film_to_opus_channels(samples: &mut [f32], channels: usize) {
+    let order: &[usize] = match channels {
+        3 => &[0, 2, 1],
+        5 => &[0, 2, 1, 3, 4],
+        6 => &[0, 2, 1, 4, 5, 3],
+        7 => &[0, 2, 1, 5, 6, 4, 3],
+        8 => &[0, 2, 1, 6, 7, 4, 5, 3],
+        _ => return,
+    };
+    let mut frame = [0.0_f32; 8];
+    for chunk in samples.chunks_exact_mut(channels) {
+        for (output, &source) in order.iter().enumerate() {
+            frame[output] = chunk[source];
+        }
+        chunk.copy_from_slice(&frame[..channels]);
+    }
 }
 
 fn append_audio_samples(samples: &mut Vec<f32>, decoded: &[f32]) -> Result<(), ConvertError> {
@@ -2278,10 +2376,8 @@ fn decode_ogg_opus(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
     let mut reader = OggOpusReader::new(Cursor::new(input))
         .map_err(|error| ConvertError::Audio(format!("could not open the Opus stream: {error}")))?;
     let head = reader.head().clone();
-    let channels = opus_channels(head.channel_count as usize)?;
-    let mut decoder = head.decoder(48_000).map_err(|error| {
-        ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
-    })?;
+    let channels = opus_channels(head.channel_count as usize, head.mapping_family)?;
+    let mut decoder = OpusPcmDecoder::new(channels, head.mapping_family)?;
     let mut trim = Trim::new(&head, 48_000, channels)
         .map_err(|error| ConvertError::Audio(format!("could not read the Opus stream: {error}")))?;
     let mut block = vec![0.0f32; MAX_PACKET_SAMPLES * channels];
@@ -2296,6 +2392,7 @@ fn decode_ogg_opus(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
             .map_err(|error| {
                 ConvertError::Audio(format!("could not decode Opus audio: {error}"))
             })?;
+        reorder_opus_channels(&mut block[..decoded * channels], channels);
         append_audio_samples(
             &mut samples,
             trim.keep(&packet, &block[..decoded * channels]),
@@ -2318,12 +2415,11 @@ fn decode_opus_track(
     track_id: u32,
     codec_params: &symphonia::core::codecs::CodecParameters,
 ) -> Result<DecodedAudio, ConvertError> {
-    use opus_pure::{OpusDecoder, MAX_PACKET_SAMPLES};
+    use opus_pure::MAX_PACKET_SAMPLES;
 
-    let (channels, pre_skip) = opus_stream_info(codec_params)?;
-    let mut decoder = OpusDecoder::new(48_000, channels).map_err(|error| {
-        ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
-    })?;
+    let info = opus_stream_info(codec_params)?;
+    let channels = info.channels;
+    let mut decoder = OpusPcmDecoder::new(channels, info.mapping_family)?;
     let mut block = vec![0.0f32; MAX_PACKET_SAMPLES * channels];
     let mut samples = Vec::new();
 
@@ -2347,10 +2443,11 @@ fn decode_opus_track(
             .map_err(|error| {
                 ConvertError::Audio(format!("could not decode Opus audio: {error}"))
             })?;
+        reorder_opus_channels(&mut block[..decoded * channels], channels);
         append_audio_samples(&mut samples, &block[..decoded * channels])?;
     }
 
-    let skip = (pre_skip as usize * channels).min(samples.len());
+    let skip = (info.pre_skip as usize * channels).min(samples.len());
     samples.drain(..skip);
 
     if samples.is_empty() {
@@ -3140,7 +3237,7 @@ fn mp4_media_duration(mdhd: &[u8]) -> Option<usize> {
 
 fn opus_stream_info(
     codec_params: &symphonia::core::codecs::CodecParameters,
-) -> Result<(usize, u32), ConvertError> {
+) -> Result<OpusStreamInfo, ConvertError> {
     let head = codec_params
         .extra_data
         .as_deref()
@@ -3153,7 +3250,8 @@ fn opus_stream_info(
         .ok_or_else(|| {
             ConvertError::Audio("the Opus track does not declare a channel count".to_owned())
         })?;
-    let channels = opus_channels(channels)?;
+    let mapping_family = head.map(|data| data[18]).unwrap_or(0);
+    let channels = opus_channels(channels, mapping_family)?;
     // The OpusHead pre-skip is the decoder delay. Container delay metadata is
     // not the same number: in MP4 it is expressed in the track timescale and
     // can be much larger, so only fall back to it when there is no header.
@@ -3171,7 +3269,11 @@ fn opus_stream_info(
         })
         .or(codec_params.delay)
         .unwrap_or(0);
-    Ok((channels, pre_skip))
+    Ok(OpusStreamInfo {
+        channels,
+        pre_skip,
+        mapping_family,
+    })
 }
 
 fn decode_flac(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
@@ -3295,6 +3397,35 @@ fn downmix_mono(frame: &[f32]) -> f32 {
         }
         channels => frame.iter().sum::<f32>() / channels as f32,
     }
+}
+
+/// Worst-case gain sum of [`downmix_mono`] or [`downmix_stereo`] for a layout.
+/// Streaming cannot inspect the whole file before writing, so it attenuates by
+/// this amount up front; that guarantees a full-scale source cannot clip.
+fn downmix_gain(source_channels: usize, target_channels: usize) -> f32 {
+    if source_channels <= 2 || target_channels > 2 {
+        return 1.0;
+    }
+    let sum = match target_channels {
+        1 => match source_channels {
+            3 => 1.707,
+            4 => 2.0,
+            5 => 2.707,
+            6 => 3.207,
+            7 => 3.707,
+            8 => 4.207,
+            _ => 4.207,
+        },
+        _ => match source_channels {
+            3 | 4 => 1.707,
+            5 => 2.414,
+            6 => 2.914,
+            7 => 3.414,
+            8 => 3.621,
+            _ => 3.621,
+        },
+    };
+    1.0 / sum
 }
 
 /// Standard film-layout channel order: L, R, C, LFE, back L/R, side L/R.
@@ -3687,29 +3818,77 @@ fn opus_sample_rate(sample_rate: u32) -> u32 {
     }
 }
 
-fn encode_opus(audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
-    use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
+enum OpusPcmEncoder {
+    Single(Box<opus_pure::OpusEncoder>),
+    Multi(Box<opus_pure::OpusMSEncoder>),
+}
+
+impl OpusPcmEncoder {
+    fn new(sample_rate: u32, channels: usize) -> Result<Self, ConvertError> {
+        use opus_pure::{Application, OpusEncoder, OpusMSEncoder};
+
+        if channels <= 2 {
+            let mut encoder = OpusEncoder::new(sample_rate as i32, channels, Application::Audio)
+                .map_err(|error| {
+                    ConvertError::Audio(format!("could not start the Opus encoder: {error}"))
+                })?;
+            encoder.bitrate_bps = if channels == 1 { 64_000 } else { 96_000 };
+            Ok(Self::Single(Box::new(encoder)))
+        } else if channels <= 8 {
+            let mut encoder =
+                OpusMSEncoder::new(sample_rate as i32, channels, 1, Application::Audio).map_err(
+                    |error| {
+                        ConvertError::Audio(format!("could not start the Opus encoder: {error}"))
+                    },
+                )?;
+            encoder.set_bitrate(64_000 * channels as i32);
+            Ok(Self::Multi(Box::new(encoder)))
+        } else {
+            Err(ConvertError::UnsupportedChannelLayout {
+                codec: "Opus",
+                channels,
+            })
+        }
+    }
+
+    fn head(&self, sample_rate: u32) -> opus_pure::OpusHead {
+        use opus_pure::OpusHead;
+        match self {
+            Self::Single(encoder) => OpusHead::for_encoder(encoder, sample_rate),
+            Self::Multi(encoder) => OpusHead::for_ms_encoder(encoder, sample_rate),
+        }
+    }
+
+    fn encode(
+        &mut self,
+        block: &[f32],
+        frame_size: usize,
+        packet: &mut [u8],
+    ) -> Result<usize, opus_pure::Error> {
+        match self {
+            Self::Single(encoder) => encoder.encode(block, frame_size, packet),
+            Self::Multi(encoder) => encoder.encode(block, frame_size, packet),
+        }
+    }
+}
+
+fn encode_opus(mut audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+    use opus_pure::{OggOpusWriter, MAX_PACKET_BYTES};
 
     if audio.channels == 0 || audio.sample_rate == 0 || audio.samples.is_empty() {
         return Err(ConvertError::NoAudioTrack);
     }
-    let mut audio = if audio.channels > 2 {
-        remix_channels(audio, AudioChannels::Stereo)
-    } else {
-        audio
-    };
     let sample_rate = opus_sample_rate(audio.sample_rate);
     if audio.sample_rate != sample_rate {
         audio = resample_audio(audio, sample_rate)?;
     }
 
     let channels = audio.channels;
-    let mut encoder =
-        OpusEncoder::new(sample_rate as i32, channels, Application::Audio).map_err(|error| {
-            ConvertError::Audio(format!("could not start the Opus encoder: {error}"))
-        })?;
-    encoder.bitrate_bps = if channels == 1 { 64_000 } else { 96_000 };
-    let head = OpusHead::for_encoder(&encoder, sample_rate);
+    let mut encoder = OpusPcmEncoder::new(sample_rate, channels)?;
+    if channels > 2 {
+        reorder_film_to_opus_channels(&mut audio.samples, channels);
+    }
+    let head = encoder.head(sample_rate);
     let pre_skip = u64::from(head.pre_skip);
     let mut writer = OggOpusWriter::new(Vec::new(), head).map_err(|error| {
         ConvertError::Audio(format!("could not start the Opus stream: {error}"))
@@ -4776,6 +4955,59 @@ mod tests {
             wav.extend_from_slice(&sample.to_le_bytes());
         }
         wav
+    }
+
+    /// Builds a WAV whose channels carry constant, independently chosen levels.
+    /// Constant samples make the downmix coefficients observable directly in
+    /// the converted output.
+    fn wav_channels_at(sample_rate: u32, frames: usize, channels: &[f32]) -> Vec<u8> {
+        let channel_count = u16::try_from(channels.len()).unwrap();
+        let mut samples = Vec::with_capacity(frames * channels.len());
+        for _ in 0..frames {
+            for &value in channels {
+                samples.push((value.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
+            }
+        }
+
+        let data_size = u32::try_from(samples.len() * 2).unwrap();
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&channel_count.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * u32::from(channel_count) * 2).to_le_bytes());
+        wav.extend_from_slice(&(channel_count * 2).to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    /// Encodes a 5.1 Ogg Opus stream with the Vorbis channel order the Opus
+    /// mapping family expects: FL, FC, FR, RL, RR, LFE.
+    fn opus_surround_fixture(channels: [f32; 6]) -> Vec<u8> {
+        use opus_pure::{Application, OggOpusWriter, OpusHead, OpusMSEncoder, MAX_PACKET_BYTES};
+
+        let frame_size = 960;
+        let mut encoder = OpusMSEncoder::new(48_000, 6, 1, Application::Audio).unwrap();
+        let head = OpusHead::for_ms_encoder(&encoder, 48_000);
+        let mut writer = OggOpusWriter::new(Vec::new(), head).unwrap();
+        let mut block = vec![0.0_f32; frame_size * 6];
+        let mut packet = vec![0_u8; MAX_PACKET_BYTES];
+        for _ in 0..12 {
+            for frame in 0..frame_size {
+                block[frame * 6..(frame + 1) * 6].copy_from_slice(&channels);
+            }
+            let len = encoder.encode(&block, frame_size, &mut packet).unwrap();
+            writer.write_packet(&packet[..len]).unwrap();
+        }
+        writer.finish().unwrap()
     }
 
     fn mp3_first_frame_bitrate(bytes: &[u8]) -> Option<u16> {
@@ -6139,6 +6371,36 @@ mod tests {
     }
 
     #[test]
+    fn streams_full_scale_multichannel_without_clipping() {
+        let directory = stream_temp_dir("loud-surround");
+        let input = directory.join("loud.wav");
+        std::fs::write(&input, wav_channels_at(48_000, 2_000, &[1.0; 6])).unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.samples.len(), 2_000 * 2);
+        assert!(
+            !parsed.samples.contains(&i16::MIN),
+            "a full-scale streaming sample wrapped"
+        );
+        let peak = parsed
+            .samples
+            .iter()
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(peak > 30_000, "the streaming downmix was too quiet");
+        assert_audible(&parsed.samples);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn lists_tracks_from_a_file_without_loading_it() {
         let tracks =
             super::audio_tracks_from_path(&fixture_path("sample-two-opus-tracks.webm")).unwrap();
@@ -6690,6 +6952,282 @@ mod tests {
             .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
         assert!(peak <= 1.0, "the downmix clipped at {peak}");
         assert!(peak > 0.9, "the downmix was attenuated more than needed");
+    }
+
+    #[test]
+    fn downmixes_51_wav_with_expected_centre_and_surround_gains() {
+        // Values are constant so the output is exactly the downmix coefficient
+        // applied to each channel. Channel order is L, R, C, LFE, BL, BR.
+        let cases: [(&str, [f32; 6], f32, f32); 7] = [
+            ("left only", [0.5, 0.0, 0.0, 0.0, 0.0, 0.0], 0.5, 0.0),
+            ("right only", [0.0, 0.5, 0.0, 0.0, 0.0, 0.0], 0.0, 0.5),
+            (
+                "centre only",
+                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                0.353_553,
+                0.353_553,
+            ),
+            (
+                "back left only",
+                [0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+                0.353_553,
+                0.0,
+            ),
+            (
+                "back right only",
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                0.0,
+                0.353_553,
+            ),
+            ("LFE only", [0.0, 0.0, 0.0, 0.5, 0.0, 0.0], 0.25, 0.25),
+            (
+                "stereo passthrough",
+                [0.25, 0.5, 0.0, 0.0, 0.0, 0.0],
+                0.25,
+                0.5,
+            ),
+        ];
+
+        for (name, channels, expected_left, expected_right) in cases {
+            let input = wav_channels_at(48_000, 128, &channels);
+            let converted = convert_bytes_with_options(
+                "surround.wav",
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_channels: Some(AudioChannels::Stereo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let parsed = parse_wav(&converted[0].bytes);
+            assert_eq!(parsed.channels, 2, "{name}");
+            assert_eq!(parsed.samples.len(), 128 * 2, "{name}");
+            let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
+            let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
+            assert!(
+                (left - expected_left).abs() < 0.002,
+                "{name}: left was {left}, expected {expected_left}"
+            );
+            assert!(
+                (right - expected_right).abs() < 0.002,
+                "{name}: right was {right}, expected {expected_right}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_scale_multichannel_downmix_does_not_wrap_or_clip() {
+        for value in [1.0_f32, -1.0_f32] {
+            let input = wav_channels_at(48_000, 256, &[value; 6]);
+            let converted = convert_bytes_with_options(
+                "loud.wav",
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_channels: Some(AudioChannels::Stereo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let parsed = parse_wav(&converted[0].bytes);
+            assert_eq!(parsed.channels, 2);
+            assert_eq!(parsed.samples.len(), 256 * 2);
+            assert!(
+                !parsed.samples.contains(&i16::MIN),
+                "a full-scale sample wrapped to i16::MIN"
+            );
+            let peak = parsed
+                .samples
+                .iter()
+                .map(|sample| sample.unsigned_abs())
+                .max()
+                .unwrap();
+            assert!(peak > 30_000, "the downmix was unexpectedly quiet");
+
+            let direct = super::remix_channels(
+                super::DecodedAudio {
+                    samples: vec![value; 6 * 256],
+                    channels: 6,
+                    sample_rate: 48_000,
+                    source_bits: None,
+                },
+                AudioChannels::Stereo,
+            );
+            assert!(
+                direct.samples.iter().all(|sample| sample.is_finite()),
+                "the downmix produced NaN or infinity"
+            );
+            let direct_peak = direct
+                .samples
+                .iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            assert!(
+                direct_peak <= 1.0 + 1e-6,
+                "the downmix exceeded full scale at {direct_peak}"
+            );
+            assert!(direct_peak > 0.99, "the downmix was over-attenuated");
+        }
+    }
+
+    #[test]
+    fn multichannel_opus_decodes_and_downmixes_centre_and_surround() {
+        let centre = opus_surround_fixture([0.0, 0.5, 0.0, 0.0, 0.0, 0.0]);
+        let decoded = convert_bytes("centre.opus", &centre, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 6);
+        assert!(decoded.samples.len() > 10_000 * 6);
+        assert_audible(&decoded.samples);
+        let centre_peak = decoded
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(centre_peak > 1_000, "the centre channel is silent");
+
+        let stereo = convert_bytes_with_options(
+            "centre.opus",
+            &centre,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stereo = parse_wav(&stereo[0].bytes);
+        assert_eq!(stereo.channels, 2);
+        let left_peak = stereo
+            .samples
+            .iter()
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        let right_peak = stereo
+            .samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(left_peak > 1_000, "centre audio was lost from the left");
+        assert!(right_peak > 1_000, "centre audio was lost from the right");
+        assert!(
+            left_peak.abs_diff(right_peak) < left_peak / 10,
+            "centre audio was not balanced: {left_peak} vs {right_peak}"
+        );
+
+        let directory = stream_temp_dir("multichannel-opus");
+        let path = directory.join("centre.opus");
+        std::fs::write(&path, &centre).unwrap();
+        let streamed = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let streamed = parse_wav(&streamed);
+        assert_eq!(streamed.channels, 2);
+        assert_audible(&streamed.samples);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let surround = opus_surround_fixture([0.0, 0.0, 0.0, 0.5, 0.0, 0.0]);
+        let stereo = convert_bytes_with_options(
+            "surround.opus",
+            &surround,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stereo = parse_wav(&stereo[0].bytes);
+        let left_peak = stereo
+            .samples
+            .iter()
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        let right_peak = stereo
+            .samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(left_peak > 1_000, "surround audio was lost from the left");
+        assert!(
+            left_peak > right_peak * 2,
+            "a back-left signal leaked into the right channel: {left_peak} vs {right_peak}"
+        );
+    }
+
+    #[test]
+    fn multichannel_opus_output_preserves_51_channels() {
+        let input = wav_channels_at(48_000, 960, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        let opus = convert_bytes("centre.wav", &input, OutputFormat::Opus).unwrap();
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+        let decoded = convert_bytes("centre.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 6);
+        assert_audible(&decoded.samples);
+        let centre_peak = decoded
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(centre_peak > 1_000, "the centre channel was not preserved");
+    }
+
+    #[test]
+    fn multichannel_opus_output_can_be_downmixed_to_stereo() {
+        let input = wav_channels_at(48_000, 960, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        let opus = convert_bytes_with_options(
+            "centre.wav",
+            &input,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+        let decoded = convert_bytes("centre.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 2);
+        assert_audible(&decoded.samples);
+    }
+
+    #[test]
+    fn rejects_invalid_opus_layouts_with_a_typed_error() {
+        assert!(matches!(
+            super::opus_channels(3, 0),
+            Err(ConvertError::UnsupportedChannelLayout {
+                codec: "Opus",
+                channels: 3
+            })
+        ));
+        assert!(matches!(
+            super::opus_channels(9, 1),
+            Err(ConvertError::UnsupportedChannelLayout {
+                codec: "Opus",
+                channels: 9
+            })
+        ));
+        assert_eq!(super::opus_channels(6, 1).unwrap(), 6);
     }
 
     #[test]
@@ -7248,31 +7786,33 @@ mod tests {
 
     #[test]
     fn converts_movie_audio_to_mp3() {
-        let input = fixture("sample-ac3.mkv");
-        let mp3 = convert_bytes_with_options(
-            "sample-ac3.mkv",
-            &input,
-            OutputFormat::Mp3,
-            ConversionOptions {
-                mp3_bitrate: Mp3Bitrate::Kbps256,
-                ..Default::default()
-            },
-        )
-        .unwrap()
-        .remove(0)
-        .bytes;
-        assert_eq!(mp3_first_frame_bitrate(&mp3), Some(256));
+        for name in ["sample-ac3.mkv", "sample-eac3.mkv"] {
+            let input = fixture(name);
+            let mp3 = convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: Mp3Bitrate::Kbps256,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes;
+            assert_eq!(mp3_first_frame_bitrate(&mp3), Some(256), "{name}");
 
-        let decoded = convert_bytes("sample-ac3.mp3", &mp3, OutputFormat::Wav).unwrap();
-        let parsed = parse_wav(&decoded[0].bytes);
-        assert_eq!(parsed.sample_rate, 48_000);
-        assert_eq!(parsed.channels, 2);
-        assert!(
-            parsed.samples.len() / 2 >= 90_000,
-            "the movie audio was truncated to {} frames",
-            parsed.samples.len() / 2
-        );
-        assert_audible(&parsed.samples);
+            let decoded = convert_bytes("movie.mp3", &mp3, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&decoded[0].bytes);
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.channels, 2, "{name}");
+            assert!(
+                parsed.samples.len() / 2 >= 90_000,
+                "{name} was truncated to {} frames",
+                parsed.samples.len() / 2
+            );
+            assert_audible(&parsed.samples);
+        }
     }
 
     #[test]
