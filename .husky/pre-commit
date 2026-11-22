@@ -1,3 +1,9 @@
+# Skip the web checks when every staged path is under native/.
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+if [ -n "$staged" ] && ! printf '%s\n' "$staged" | grep -qv '^native/'; then
+  exit 0
+fi
+
 bunx lint-staged
 
 # hide unstaged and untracked changes so the checks below only see what's being committed
