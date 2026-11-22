@@ -5558,6 +5558,23 @@ mod tests {
     }
 
     #[test]
+    fn lists_tracks_from_a_padded_mp4() {
+        let directory = stream_temp_dir("padded-probe");
+        let input = directory.join("padded.mp4");
+        let mut padded = std::fs::read(fixture_path("sample-ac3.mp4")).unwrap();
+        padded.resize(padded.len() + 16 * 1024 * 1024, 0);
+        std::fs::write(&input, padded).unwrap();
+
+        let tracks = super::audio_tracks_from_path(&input).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AC-3");
+        assert_eq!(tracks[0].channels, 6);
+        assert_eq!(tracks[0].sample_rate, 48_000);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn lists_and_selects_audio_tracks() {
         let input = fixture("sample-two-opus-tracks.webm");
         let tracks = super::audio_tracks(&input, "webm").unwrap();
