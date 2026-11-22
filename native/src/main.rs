@@ -421,6 +421,102 @@ fn available_targets(input_format: Option<InputFormat>) -> Vec<OutputFormat> {
         .collect()
 }
 
+fn close_icon_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(7),
+        if response.hovered() { SOFT } else { CARD },
+    );
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(7),
+        Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let color = if response.hovered() { TEXT } else { MUTED };
+    let center = rect.center();
+    let arm = 5.5;
+    let stroke = Stroke::new(1.5_f32, color);
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x - arm, center.y - arm),
+            egui::pos2(center.x + arm, center.y + arm),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x + arm, center.y - arm),
+            egui::pos2(center.x - arm, center.y + arm),
+        ],
+        stroke,
+    );
+    response
+}
+
+fn secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).size(12.8).color(TEXT))
+            .fill(CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(egui::CornerRadius::same(8))
+            .min_size(Vec2::new(0.0, 34.0)),
+    )
+}
+
+fn primary_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    ui.add_sized(
+        Vec2::new(width, 36.0),
+        egui::Button::new(
+            RichText::new(label)
+                .size(13.0)
+                .strong()
+                .color(Color32::WHITE),
+        )
+        .fill(PRIMARY)
+        .stroke(Stroke::NONE)
+        .corner_radius(egui::CornerRadius::same(8)),
+    )
+}
+
+fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions) -> bool {
+    match target {
+        OutputFormat::Jpeg => options.jpeg_quality.is_some(),
+        OutputFormat::Png => options.png_compression.is_some(),
+        OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
+            options.archive_compression.is_some()
+        }
+        OutputFormat::Wav | OutputFormat::Flac => {
+            options.audio_sample_rate.is_some() || options.audio_channels.is_some()
+        }
+        _ => false,
+    }
+}
+
+fn settings_section_heading(ui: &mut egui::Ui, title: &str, note: Option<&str>) {
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .size(11.2)
+            .strong()
+            .color(MUTED),
+    );
+    if let Some(note) = note {
+        ui.label(RichText::new(note).size(12.0).color(MUTED));
+    }
+}
+
+fn settings_input_frame(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(SOFT)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+}
+
 fn optional_setting(
     ui: &mut egui::Ui,
     label: &str,
@@ -428,72 +524,98 @@ fn optional_setting(
     range: std::ops::RangeInclusive<u8>,
     default: u8,
 ) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let mut automatic = value.is_none();
-        if ui.checkbox(&mut automatic, "Auto").changed() {
-            *value = if automatic { None } else { Some(default) };
-        }
-        if let Some(value) = value {
-            ui.add(egui::Slider::new(value, range).show_value(true));
-        } else {
-            ui.label(RichText::new("encoder default").color(MUTED));
-        }
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).size(12.8).strong().color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut automatic = value.is_none();
+                if ui
+                    .checkbox(
+                        &mut automatic,
+                        RichText::new("Auto").size(11.5).color(MUTED),
+                    )
+                    .changed()
+                {
+                    *value = if automatic { None } else { Some(default) };
+                }
+            });
+        });
+        settings_input_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(value) = value.as_mut() {
+                    ui.add(egui::DragValue::new(value).range(range).speed(1.0));
+                } else {
+                    ui.label(RichText::new("Auto").size(13.0).color(MUTED));
+                }
+            });
+        });
     });
 }
 
-fn optional_audio_setting(
-    ui: &mut egui::Ui,
-    sample_rate: &mut Option<u32>,
-    channels: &mut Option<AudioChannels>,
-) {
-    ui.horizontal(|ui| {
-        ui.label("Sample rate");
-        let mut automatic = sample_rate.is_none();
-        if ui.checkbox(&mut automatic, "Auto").changed() {
-            *sample_rate = if automatic {
-                None
-            } else {
-                Some(ConversionOptions::DEFAULT_AUDIO_SAMPLE_RATE)
-            };
-        }
-        if let Some(rate) = sample_rate {
-            ui.add(
-                egui::DragValue::new(rate)
-                    .range(
-                        ConversionOptions::MIN_AUDIO_SAMPLE_RATE
-                            ..=ConversionOptions::MAX_AUDIO_SAMPLE_RATE,
-                    )
-                    .speed(100.0)
-                    .suffix(" Hz"),
-            );
-        } else {
-            ui.label(RichText::new("encoder default").color(MUTED));
-        }
-    });
-
-    ui.horizontal(|ui| {
-        ui.label("Channels");
-        let mut automatic = channels.is_none();
-        if ui.checkbox(&mut automatic, "Auto").changed() {
-            *channels = if automatic {
-                None
-            } else {
-                Some(AudioChannels::Stereo)
-            };
-        }
-        if let Some(channels) = channels {
-            for option in [AudioChannels::Mono, AudioChannels::Stereo] {
+fn optional_sample_rate(ui: &mut egui::Ui, sample_rate: &mut Option<u32>) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Sample rate").size(12.8).strong().color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut automatic = sample_rate.is_none();
                 if ui
-                    .selectable_label(*channels == option, option.label())
-                    .clicked()
+                    .checkbox(
+                        &mut automatic,
+                        RichText::new("Auto").size(11.5).color(MUTED),
+                    )
+                    .changed()
                 {
-                    *channels = option;
+                    *sample_rate = if automatic {
+                        None
+                    } else {
+                        Some(ConversionOptions::DEFAULT_AUDIO_SAMPLE_RATE)
+                    };
                 }
-            }
-        } else {
-            ui.label(RichText::new("encoder default").color(MUTED));
-        }
+            });
+        });
+        settings_input_frame(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(rate) = sample_rate.as_mut() {
+                    ui.add(
+                        egui::DragValue::new(rate)
+                            .range(
+                                ConversionOptions::MIN_AUDIO_SAMPLE_RATE
+                                    ..=ConversionOptions::MAX_AUDIO_SAMPLE_RATE,
+                            )
+                            .speed(100.0),
+                    );
+                } else {
+                    ui.label(RichText::new("Auto").size(13.0).color(MUTED));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Hz").size(11.0).color(MUTED));
+                });
+            });
+        });
+    });
+}
+
+fn optional_channels(ui: &mut egui::Ui, channels: &mut Option<AudioChannels>) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new("Channels").size(12.8).strong().color(TEXT));
+        settings_input_frame(ui, |ui| {
+            egui::ComboBox::from_id_salt("audio-channels")
+                .selected_text((*channels).map(AudioChannels::label).unwrap_or("Auto"))
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(channels.is_none(), "Auto").clicked() {
+                        *channels = None;
+                    }
+                    for option in [AudioChannels::Mono, AudioChannels::Stereo] {
+                        if ui
+                            .selectable_label(*channels == Some(option), option.label())
+                            .clicked()
+                        {
+                            *channels = Some(option);
+                        }
+                    }
+                });
+        });
     });
 }
 
@@ -737,93 +859,263 @@ impl ConvertApp {
     }
 
     fn show_home_dialogs(&mut self, context: &egui::Context) {
-        if self.show_settings {
-            egui::Window::new("App settings")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut self.show_settings)
-                .show(context, |ui| {
-                    ui.label("Default output folder");
-                    if ui.button("Choose output folder").clicked() {
-                        let mut dialog = FileDialog::new();
-                        if let Some(directory) = self.output_directory.as_deref() {
-                            dialog = dialog.set_directory(directory);
-                        }
-                        if let Some(directory) = dialog.pick_folder() {
-                            self.output_directory = Some(directory);
-                        }
-                    }
-                    ui.label(
-                        self.output_directory
-                            .as_deref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "No folder selected".to_owned()),
-                    );
-                });
-        }
-        if self.show_conversion_settings {
-            egui::Window::new("Conversion settings")
-                .collapsible(false)
-                .resizable(false)
-                .default_width(360.0)
-                .open(&mut self.show_conversion_settings)
-                .show(context, |ui| {
-                    let Some(target) = self.target else {
-                        ui.label("Pick an output format to see its settings.");
-                        return;
-                    };
-
-                    ui.label(
-                        RichText::new(format!(".{}", format_extension(target)))
-                            .strong()
-                            .color(PRIMARY),
-                    );
-                    ui.add_space(4.0);
-                    match target {
-                        OutputFormat::Jpeg => optional_setting(
-                            ui,
-                            "Quality",
-                            &mut self.conversion_options.jpeg_quality,
-                            1..=100,
-                            ConversionOptions::DEFAULT_JPEG_QUALITY,
-                        ),
-                        OutputFormat::Png => optional_setting(
-                            ui,
-                            "Compression level",
-                            &mut self.conversion_options.png_compression,
-                            1..=9,
-                            ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
-                        ),
-                        OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
-                            optional_setting(
-                                ui,
-                                "Compression level",
-                                &mut self.conversion_options.archive_compression,
-                                1..=9,
-                                ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
-                            );
-                        }
-                        OutputFormat::Wav | OutputFormat::Flac => {
-                            optional_audio_setting(
-                                ui,
-                                &mut self.conversion_options.audio_sample_rate,
-                                &mut self.conversion_options.audio_channels,
-                            );
-                        }
-                        _ => {
-                            ui.label(format!("{} doesn't have any settings.", target.label()));
-                        }
-                    }
-                    ui.add_space(8.0);
-                    if ui.button("Reset to defaults").clicked() {
-                        self.conversion_options = ConversionOptions::default();
-                    }
-                });
-        }
+        self.show_app_settings(context);
         self.show_input_format_dialog(context);
         self.show_help_modal(context);
         self.show_conversion_notice(context);
         self.show_conversion_progress(context);
+    }
+
+    fn show_app_settings(&mut self, context: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let screen = context.screen_rect();
+        let modal_width = (screen.width() - 96.0).clamp(320.0, 640.0);
+        let modal_height = (screen.height() - 96.0).clamp(360.0, 536.0);
+        let current_folder = self.output_directory.clone();
+        let mut choose_folder = false;
+        let mut dismiss = false;
+
+        let modal = egui::Modal::new(egui::Id::new("app-settings-modal"))
+            .frame(
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(egui::CornerRadius::same(14))
+                    .inner_margin(egui::Margin::same(28)),
+            )
+            .show(context, |ui| {
+                ui.set_width(modal_width);
+                ui.set_min_height(modal_height);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("App settings")
+                            .size(19.2)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if close_icon_button(ui).clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+                ui.add_space(16.0);
+                ui.label(RichText::new("GENERAL").size(11.2).strong().color(MUTED));
+                ui.add_space(6.0);
+
+                egui::Frame::new()
+                    .fill(SOFT)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("Output folder")
+                                        .size(14.4)
+                                        .strong()
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    RichText::new("Where converted files are saved.")
+                                        .size(12.8)
+                                        .color(MUTED),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        current_folder
+                                            .as_deref()
+                                            .map(|path| path.display().to_string())
+                                            .unwrap_or_else(|| "No folder selected".to_owned()),
+                                    )
+                                    .size(12.0)
+                                    .color(FOOTER_TEXT),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if secondary_button(ui, "Choose folder").clicked() {
+                                        choose_folder = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+
+                let used = ui.min_rect().height();
+                ui.add_space((modal_height - used - 44.0).max(0.0));
+                ui.vertical_centered(|ui| {
+                    if primary_button(ui, "Done", 180.0).clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if choose_folder {
+            let mut dialog = FileDialog::new();
+            if let Some(directory) = self.output_directory.as_deref() {
+                dialog = dialog.set_directory(directory);
+            }
+            if let Some(directory) = dialog.pick_folder() {
+                self.output_directory = Some(directory);
+            }
+        }
+
+        if dismiss || modal.should_close() {
+            self.show_settings = false;
+        }
+    }
+
+    fn show_conversion_settings_panel(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, CARD);
+        ui.painter().line_segment(
+            [rect.left_top(), rect.left_bottom()],
+            Stroke::new(1.0_f32, BORDER),
+        );
+
+        let mut panel = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        panel.set_clip_rect(rect);
+        panel.spacing_mut().item_spacing = Vec2::ZERO;
+
+        panel.add_space(12.0);
+        panel.horizontal(|ui| {
+            ui.add_space(20.0);
+            ui.label(
+                RichText::new("Conversion settings")
+                    .size(15.2)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(12.0);
+                if close_icon_button(ui).clicked() {
+                    self.show_conversion_settings = false;
+                }
+                if self.target.is_some_and(|target| {
+                    target_has_applied_setting(target, &self.conversion_options)
+                }) {
+                    ui.add_space(2.0);
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Reset").size(12.8).color(PRIMARY))
+                                .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.conversion_options = ConversionOptions::default();
+                    }
+                }
+            });
+        });
+        panel.add_space(10.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("conversion-settings-scroll")
+            .max_height((height - 56.0).max(0.0))
+            .auto_shrink([false, true])
+            .show(&mut panel, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.vertical(|ui| {
+                        ui.set_width((width - 40.0).max(0.0));
+                        self.conversion_settings_body(ui);
+                    });
+                });
+                ui.add_space(20.0);
+            });
+
+        if panel
+            .ctx()
+            .input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            self.show_conversion_settings = false;
+        }
+    }
+
+    fn conversion_settings_body(&mut self, ui: &mut egui::Ui) {
+        let Some(target) = self.target else {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Pick an output format to see its settings.")
+                        .size(12.8)
+                        .color(MUTED),
+                );
+            });
+            return;
+        };
+
+        match target {
+            OutputFormat::Jpeg => {
+                settings_section_heading(
+                    ui,
+                    "Quality",
+                    Some("1 is the smallest file, 100 the best quality."),
+                );
+                ui.add_space(10.0);
+                optional_setting(
+                    ui,
+                    "Quality",
+                    &mut self.conversion_options.jpeg_quality,
+                    1..=100,
+                    ConversionOptions::DEFAULT_JPEG_QUALITY,
+                );
+            }
+            OutputFormat::Png => {
+                settings_section_heading(ui, "Other", None);
+                ui.add_space(10.0);
+                optional_setting(
+                    ui,
+                    "Compression level",
+                    &mut self.conversion_options.png_compression,
+                    1..=9,
+                    ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
+                );
+            }
+            OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
+                settings_section_heading(ui, "Other", None);
+                ui.add_space(10.0);
+                optional_setting(
+                    ui,
+                    "Compression level",
+                    &mut self.conversion_options.archive_compression,
+                    1..=9,
+                    ConversionOptions::DEFAULT_COMPRESSION_LEVEL,
+                );
+            }
+            OutputFormat::Wav | OutputFormat::Flac => {
+                settings_section_heading(ui, "Audio", None);
+                ui.add_space(10.0);
+                optional_sample_rate(ui, &mut self.conversion_options.audio_sample_rate);
+                ui.add_space(14.0);
+                optional_channels(ui, &mut self.conversion_options.audio_channels);
+            }
+            _ => {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} doesn't have any settings.",
+                            format_extension(target)
+                        ))
+                        .size(12.8)
+                        .color(MUTED),
+                    );
+                });
+            }
+        }
     }
 
     fn effective_input_format(&self) -> Option<InputFormat> {
@@ -1070,7 +1362,27 @@ impl ConvertApp {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         self.show_conversion_header(ui, width);
-        self.show_format_explorer(ui, width, main_height);
+        let panel_width = if self.show_conversion_settings {
+            if width <= 640.0 {
+                width
+            } else {
+                320.0
+            }
+        } else {
+            0.0
+        };
+        let content_width = (width - panel_width).max(0.0);
+        if self.show_conversion_settings {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if content_width > 0.0 {
+                    self.show_format_explorer(ui, content_width, main_height);
+                }
+                self.show_conversion_settings_panel(ui, panel_width, main_height);
+            });
+        } else {
+            self.show_format_explorer(ui, width, main_height);
+        }
         self.show_action_bar(ui, width);
         self.show_home_footer(ui, width);
         ui.spacing_mut().item_spacing = item_spacing;
@@ -1128,26 +1440,45 @@ impl ConvertApp {
                 ui.make_persistent_id(("conversion-action", id)),
                 egui::Sense::click(),
             );
+            let active = *id == "conversion-settings" && self.show_conversion_settings;
             painter.rect_filled(
                 button,
                 egui::CornerRadius::same(8),
-                if response.hovered() { SOFT } else { CARD },
+                if active {
+                    Color32::from_rgb(32, 42, 51)
+                } else if response.hovered() {
+                    SOFT
+                } else {
+                    CARD
+                },
             );
             painter.rect_stroke(
                 button,
                 egui::CornerRadius::same(8),
-                Stroke::new(1.0_f32, BORDER),
+                Stroke::new(
+                    1.0_f32,
+                    if active {
+                        Color32::from_rgb(33, 62, 90)
+                    } else {
+                        BORDER
+                    },
+                ),
                 egui::StrokeKind::Inside,
             );
+            let icon_color = if active { PRIMARY } else { MUTED };
             match *id {
-                "settings" => paint_settings_icon(painter, button.shrink(9.0), MUTED),
-                "conversion-settings" => paint_sliders_icon(painter, button.shrink(9.0), MUTED),
+                "settings" => paint_settings_icon(painter, button.shrink(9.0), icon_color),
+                "conversion-settings" => {
+                    paint_sliders_icon(painter, button.shrink(9.0), icon_color);
+                }
                 _ => {}
             }
             if response.clicked() {
                 match *id {
                     "settings" => self.show_settings = true,
-                    "conversion-settings" => self.show_conversion_settings = true,
+                    "conversion-settings" => {
+                        self.show_conversion_settings = !self.show_conversion_settings;
+                    }
                     _ => {}
                 }
             }
