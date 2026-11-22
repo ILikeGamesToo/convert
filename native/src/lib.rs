@@ -1229,7 +1229,12 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
     };
 
     if codec_params.codec == CODEC_TYPE_OPUS {
-        return decode_opus_track(format.as_mut(), track_id, &codec_params);
+        return decode_opus_track(
+            format.as_mut(),
+            track_id,
+            &codec_params,
+            matroska_discard_padding(input, track_id),
+        );
     }
 
     let mut decoder = symphonia::default::get_codecs()
@@ -1367,6 +1372,7 @@ fn decode_opus_track(
     format: &mut dyn symphonia::core::formats::FormatReader,
     track_id: u32,
     codec_params: &symphonia::core::codecs::CodecParameters,
+    end_padding_ns: Option<u64>,
 ) -> Result<DecodedAudio, ConvertError> {
     use opus_pure::{OpusDecoder, MAX_PACKET_SAMPLES};
 
@@ -1403,6 +1409,15 @@ fn decode_opus_track(
     let skip = (pre_skip as usize * channels).min(samples.len());
     samples.drain(..skip);
 
+    // Matroska's DiscardPadding trims the encoder's padding from the end of
+    // the last block. Symphonia does not expose it, so it comes from the
+    // container; round nanoseconds to the nearest 48 kHz sample.
+    if let Some(padding_ns) = end_padding_ns {
+        let padding = ((u128::from(padding_ns) * 48_000 + 500_000_000) / 1_000_000_000) as usize;
+        let padding = (padding * channels).min(samples.len());
+        samples.truncate(samples.len() - padding);
+    }
+
     if samples.is_empty() {
         return Err(ConvertError::NoAudioTrack);
     }
@@ -1411,6 +1426,146 @@ fn decode_opus_track(
         channels,
         sample_rate: 48_000,
     })
+}
+
+const EBML_SEGMENT_ID: u32 = 0x1853_8067;
+const EBML_CLUSTER_ID: u32 = 0x1F43_B675;
+const EBML_BLOCK_GROUP_ID: u32 = 0xA0;
+const EBML_BLOCK_ID: u32 = 0xA1;
+const EBML_DISCARD_PADDING_ID: u32 = 0x75A2;
+
+/// Reads an EBML variable-length integer, leaving `pos` after it. IDs keep
+/// their length marker; sizes and values do not.
+fn read_ebml_vint(
+    input: &[u8],
+    pos: &mut usize,
+    max_length: usize,
+    keep_marker: bool,
+) -> Option<(u64, usize)> {
+    let first = *input.get(*pos)?;
+    let length = first.leading_zeros() as usize + 1;
+    if length > max_length || *pos + length > input.len() {
+        return None;
+    }
+    let mut value = if keep_marker {
+        u64::from(first)
+    } else {
+        u64::from(first & ((0x80_u8 >> (length - 1)) - 1))
+    };
+    for byte in &input[*pos + 1..*pos + length] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    *pos += length;
+    Some((value, length))
+}
+
+/// Reads an EBML element header. `None` in the size slot means the element has
+/// an unknown size and extends to the end of its parent.
+fn read_ebml_element(input: &[u8], pos: &mut usize) -> Option<(u32, Option<u64>)> {
+    let (id, _) = read_ebml_vint(input, pos, 4, true)?;
+    let (size, length) = read_ebml_vint(input, pos, 8, false)?;
+    let unknown_size = size == (1_u64 << (7 * length)) - 1;
+    Some((id as u32, if unknown_size { None } else { Some(size) }))
+}
+
+fn skip_ebml_element(input: &[u8], pos: &mut usize, size: Option<u64>) -> Option<()> {
+    let end = (*pos as u64).checked_add(size?)?;
+    if end > input.len() as u64 {
+        return None;
+    }
+    *pos = end as usize;
+    Some(())
+}
+
+fn read_ebml_signed(input: &[u8], pos: usize, size: u64) -> Option<i64> {
+    if size > 8 {
+        return None;
+    }
+    let bytes = input.get(pos..pos + size as usize)?;
+    let mut value = 0_i64;
+    for byte in bytes {
+        value = value.wrapping_shl(8) | i64::from(*byte);
+    }
+    if size < 8 && bytes.first().is_some_and(|byte| *byte & 0x80 != 0) {
+        value -= 1_i64 << (size * 8);
+    }
+    Some(value)
+}
+
+/// Returns the Matroska `DiscardPadding` of the final block on `track_id`, in
+/// nanoseconds. Symphonia's Matroska reader ignores the element, but it is what
+/// trims the encoder's padding from the end of an Opus stream.
+fn matroska_discard_padding(input: &[u8], track_id: u32) -> Option<u64> {
+    if !input.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return None;
+    }
+
+    let mut pos = 0;
+    let (segment_size, segment_start) = loop {
+        let (id, size) = read_ebml_element(input, &mut pos)?;
+        if id == EBML_SEGMENT_ID {
+            break (size, pos);
+        }
+        skip_ebml_element(input, &mut pos, size)?;
+    };
+    let segment_end = match segment_size {
+        Some(size) => ((segment_start as u64).checked_add(size)?).min(input.len() as u64) as usize,
+        None => input.len(),
+    };
+
+    let mut padding = None;
+    while pos < segment_end {
+        let (id, size) = read_ebml_element(input, &mut pos)?;
+        if id != EBML_CLUSTER_ID {
+            skip_ebml_element(input, &mut pos, size)?;
+            continue;
+        }
+        // An unknown-size cluster runs to the end of the segment; scanning it
+        // as one block still finds the last BlockGroup.
+        let cluster_end = match size {
+            Some(size) => ((pos as u64).checked_add(size)?).min(segment_end as u64) as usize,
+            None => segment_end,
+        };
+        while pos < cluster_end {
+            let (id, size) = read_ebml_element(input, &mut pos)?;
+            if id != EBML_BLOCK_GROUP_ID {
+                skip_ebml_element(input, &mut pos, size)?;
+                continue;
+            }
+            let group_end = match size {
+                Some(size) => ((pos as u64).checked_add(size)?).min(cluster_end as u64) as usize,
+                None => cluster_end,
+            };
+            let mut block_track = None;
+            let mut group_padding = None;
+            while pos < group_end {
+                let (id, size) = read_ebml_element(input, &mut pos)?;
+                if id == EBML_BLOCK_ID {
+                    let mut block_pos = pos;
+                    if let Some((number, _)) = read_ebml_vint(input, &mut block_pos, 8, false) {
+                        block_track = Some(number);
+                    }
+                } else if id == EBML_DISCARD_PADDING_ID {
+                    if let Some(size) = size {
+                        if let Some(value) = read_ebml_signed(input, pos, size) {
+                            if value > 0 {
+                                group_padding = Some(value as u64);
+                            }
+                        }
+                    }
+                }
+                skip_ebml_element(input, &mut pos, size)?;
+            }
+            if block_track == Some(u64::from(track_id)) {
+                if let Some(value) = group_padding {
+                    padding = Some(value);
+                }
+            }
+            pos = group_end;
+        }
+        pos = cluster_end;
+    }
+    padding
 }
 
 fn opus_stream_info(
@@ -3185,13 +3340,9 @@ mod tests {
         let decoded = parse_wav(&back[0].bytes);
         assert_eq!(decoded.sample_rate, 48_000);
         assert_eq!(decoded.channels, 1);
-        // The fixture holds 2 s of audio; allow the one 20 ms Opus frame of
-        // final-packet padding the WebM decoder leaves in.
-        assert!(
-            (decoded.samples.len() as i64 - 96_000).abs() <= 960,
-            "decoded {} samples",
-            decoded.samples.len()
-        );
+        // The fixture holds exactly 2 s of audio, and the WebM end trim is
+        // applied, so the round trip must reproduce the exact sample count.
+        assert_eq!(decoded.samples.len(), 96_000);
         assert_audible(&decoded.samples);
     }
 
