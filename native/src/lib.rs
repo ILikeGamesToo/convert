@@ -564,6 +564,11 @@ pub enum ConvertError {
     },
     #[error("the audio file is too large to convert in memory")]
     AudioTooLarge,
+    #[error("{format} cannot store {depth} samples")]
+    UnsupportedBitDepth {
+        format: &'static str,
+        depth: &'static str,
+    },
     #[error("conversion cancelled")]
     Cancelled,
     #[error("the archive would contain {count} entries, more than the {max}-entry limit")]
@@ -3747,7 +3752,9 @@ fn write_wav<W: Write>(
                 let value = dither.quantize_i32(*sample, 24, audio.source_bits);
                 samples_buffer.extend_from_slice(&value.to_le_bytes()[..3]);
             }
-            AudioBitDepth::Float32 => samples_buffer.extend_from_slice(&sample.to_le_bytes()),
+            AudioBitDepth::Float32 => {
+                samples_buffer.extend_from_slice(&(*sample).clamp(-1.0, 1.0).to_le_bytes())
+            }
         }
         if samples_buffer.len() >= 32 * 1024 {
             writer.write_all(&samples_buffer)?;
@@ -3758,8 +3765,9 @@ fn write_wav<W: Write>(
     Ok(())
 }
 
-/// Triangular-PDF dither for reductions to a lower integer bit depth. The
-/// generator is deterministic so conversions are reproducible.
+/// Triangular-PDF dither for the reduction to 16-bit output. The generator is
+/// deterministic so conversions are reproducible. Higher depths are quantized
+/// without dither.
 struct Dither {
     state: u32,
 }
@@ -3784,6 +3792,10 @@ impl Dither {
     }
 
     fn quantize_i16(&mut self, sample: f32, source_bits: Option<u16>) -> i16 {
+        // A source known to be 16-bit needs no dither when it is written back
+        // at 16 bits. Deeper sources are reduced from the f32 pipeline and are
+        // dithered; unknown precision is left undithered for compatibility
+        // with decoders that do not report it.
         if source_bits.is_some_and(|bits| bits > 16) {
             let dither = self.next() / f32::from(i16::MAX);
             sample_to_i16((sample + dither).clamp(-1.0, 1.0))
@@ -3792,14 +3804,9 @@ impl Dither {
         }
     }
 
-    fn quantize_i32(&mut self, sample: f32, bits: u32, source_bits: Option<u16>) -> i32 {
+    fn quantize_i32(&mut self, sample: f32, bits: u32, _source_bits: Option<u16>) -> i32 {
         let scale = ((1_i64 << (bits - 1)) - 1) as f32;
-        let dither = if source_bits.is_some_and(|source| u32::from(source) > bits) {
-            self.next() / scale
-        } else {
-            0.0
-        };
-        ((sample + dither).clamp(-1.0, 1.0) * scale).round() as i32
+        (sample.clamp(-1.0, 1.0) * scale).round() as i32
     }
 }
 
@@ -4078,9 +4085,10 @@ fn encode_flac(audio: &DecodedAudio, bit_depth: AudioBitDepth) -> Result<Vec<u8>
         AudioBitDepth::Bit16 => 16,
         AudioBitDepth::Bit24 => 24,
         AudioBitDepth::Float32 => {
-            return Err(ConvertError::Audio(
-                "FLAC cannot store 32-bit float samples; choose 16-bit or 24-bit".to_owned(),
-            ))
+            return Err(ConvertError::UnsupportedBitDepth {
+                format: "FLAC",
+                depth: bit_depth.label(),
+            })
         }
     };
     let usable_samples = audio.samples.len() - audio.samples.len() % audio.channels;
@@ -5043,6 +5051,67 @@ mod tests {
             wav.extend_from_slice(&sample.to_le_bytes());
         }
         wav
+    }
+
+    /// Builds a 24-bit PCM WAV from interleaved signed 24-bit samples. This
+    /// lets the lossless-depth tests start from detail a 16-bit source cannot
+    /// carry.
+    fn wav_24_bit_at(sample_rate: u32, channels: u16, samples: &[i32]) -> Vec<u8> {
+        assert!(channels > 0, "a WAV needs at least one channel");
+        assert_eq!(
+            samples.len() % usize::from(channels),
+            0,
+            "the sample count is not a whole number of frames"
+        );
+        let data_size = u32::try_from(samples.len() * 3).unwrap();
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * u32::from(channels) * 3).to_le_bytes());
+        wav.extend_from_slice(&(channels * 3).to_le_bytes());
+        wav.extend_from_slice(&24_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes()[..3]);
+        }
+        wav
+    }
+
+    fn wav_24_bit_samples(bytes: &[u8]) -> Vec<i32> {
+        let (format, _, _, bits, offset, size) = wav_layout(bytes);
+        assert_eq!((format, bits), (1, 24));
+        bytes[offset..offset + size]
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|bytes| {
+                let sign = if bytes[2] & 0x80 == 0 { 0 } else { 0xFF };
+                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], sign])
+            })
+            .collect()
+    }
+
+    fn wav_float_samples(bytes: &[u8]) -> Vec<f32> {
+        let (format, _, _, bits, offset, size) = wav_layout(bytes);
+        assert_eq!((format, bits), (3, 32));
+        bytes[offset..offset + size]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect()
+    }
+
+    fn flac_24_bit_samples(bytes: &[u8]) -> Vec<i32> {
+        let mut reader = claxon::FlacReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 24);
+        reader.samples().map(Result::unwrap).collect()
     }
 
     /// Encodes a 5.1 Ogg Opus stream with the Vorbis channel order the Opus
@@ -6236,6 +6305,93 @@ mod tests {
         assert_eq!(reader.streaminfo().samples, Some(8_000));
         let samples: Vec<i32> = reader.samples().map(Result::unwrap).collect();
         assert_eq!(samples.len(), 16_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_wav_at_each_supported_depth_from_a_file() {
+        let directory = stream_temp_dir("wav-depth-stream");
+        let input = directory.join("quiet.wav");
+        let source = vec![1_i32; 512];
+        std::fs::write(&input, wav_24_bit_at(48_000, 1, &source)).unwrap();
+
+        for (depth, expected_format) in [
+            (AudioBitDepth::Bit16, 1),
+            (AudioBitDepth::Bit24, 1),
+            (AudioBitDepth::Float32, 3),
+        ] {
+            let mut output = std::io::Cursor::new(Vec::new());
+            super::convert_audio_file_to_writer(
+                &input,
+                "quiet.wav",
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_bit_depth: depth,
+                    ..Default::default()
+                },
+                &mut output,
+            )
+            .unwrap();
+            let bytes = output.into_inner();
+            let (format, channels, rate, bits, _, size) = wav_layout(&bytes);
+            assert_eq!(
+                (format, channels, rate, bits),
+                (expected_format, 1, 48_000, depth.bits()),
+                "unexpected streamed WAV header for {depth:?}"
+            );
+            assert_eq!(size, 512 * usize::from(depth.bits() / 8));
+            match depth {
+                AudioBitDepth::Bit16 => {
+                    let parsed = parse_wav(&bytes);
+                    let mut distinct = parsed.samples;
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    assert!(
+                        distinct.len() > 1,
+                        "streamed 16-bit output was not dithered"
+                    );
+                }
+                AudioBitDepth::Bit24 => {
+                    assert!(
+                        wav_24_bit_samples(&bytes).iter().all(|sample| *sample == 1),
+                        "streamed 24-bit output should be quantized without dither"
+                    );
+                }
+                AudioBitDepth::Float32 => {
+                    let decoded = wav_float_samples(&bytes);
+                    assert!(decoded
+                        .iter()
+                        .all(|sample| { (*sample - 1.0 / 8_388_608.0).abs() <= 1.0e-7 }));
+                }
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streaming_flac_rejects_float_depth_with_a_typed_error() {
+        let directory = stream_temp_dir("wav-flac-float");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        let error = super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedBitDepth {
+                format: "FLAC",
+                depth: "32-bit float"
+            }
+        ));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -7709,7 +7865,241 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("32-bit float"));
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedBitDepth {
+                format: "FLAC",
+                depth: "32-bit float"
+            }
+        ));
+    }
+
+    #[test]
+    fn writes_wav_at_each_supported_depth_with_decodable_samples() {
+        let sample_rate = 48_000;
+        let frames = 512;
+        let mut source = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let value = ((frame as f64 / f64::from(sample_rate) * 440.0 * std::f64::consts::TAU)
+                .sin()
+                * 0.5
+                * 8_388_607.0)
+                .round() as i32;
+            source.push(value);
+        }
+        // A very low-level sample, both signs at full scale, and a tone.
+        source[0] = 1;
+        source[1] = -1;
+        source[2] = 8_388_607;
+        source[3] = -8_388_608;
+        let wav = wav_24_bit_at(sample_rate, 1, &source);
+        let expected: Vec<f32> = source
+            .iter()
+            .map(|sample| *sample as f32 / 8_388_608.0)
+            .collect();
+
+        for (depth, expected_format, expected_bits) in [
+            (AudioBitDepth::Bit16, 1, 16),
+            (AudioBitDepth::Bit24, 1, 24),
+            (AudioBitDepth::Float32, 3, 32),
+        ] {
+            let converted = convert_bytes_with_options(
+                "source.wav",
+                &wav,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_bit_depth: depth,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (format, channels, rate, bits, _, size) = wav_layout(&converted[0].bytes);
+            assert_eq!(
+                (format, channels, rate, bits),
+                (expected_format, 1, sample_rate, expected_bits),
+                "unexpected WAV header for {depth:?}"
+            );
+            assert_eq!(size, frames * usize::from(depth.bits() / 8));
+
+            match depth {
+                AudioBitDepth::Bit16 => {
+                    let parsed = parse_wav(&converted[0].bytes);
+                    assert_eq!(parsed.samples.len(), frames);
+                    for (index, (&actual, &expected)) in
+                        parsed.samples.iter().zip(&expected).enumerate()
+                    {
+                        let actual = f32::from(actual) / f32::from(i16::MAX);
+                        assert!(
+                            (actual - expected).abs() <= 2.5 / f32::from(i16::MAX),
+                            "16-bit sample {index} was {actual} instead of {expected}"
+                        );
+                    }
+                }
+                AudioBitDepth::Bit24 => {
+                    let decoded = wav_24_bit_samples(&converted[0].bytes);
+                    assert_eq!(decoded.len(), frames);
+                    for (index, (&actual, &expected)) in decoded.iter().zip(&source).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= 2,
+                            "24-bit sample {index} was {actual} instead of {expected}"
+                        );
+                    }
+                }
+                AudioBitDepth::Float32 => {
+                    let decoded = wav_float_samples(&converted[0].bytes);
+                    assert_eq!(decoded.len(), frames);
+                    for (index, (&actual, &expected)) in decoded.iter().zip(&expected).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= 1.0e-6,
+                            "float sample {index} was {actual} instead of {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_detail_below_16_bit_in_24_bit_flac_and_float_wav() {
+        let frames = 8_000;
+        let mut source = vec![1_i32; frames];
+        source[0] = -1;
+        source[1] = 2;
+        source[2] = -2;
+        source[3] = 8_388_607;
+        source[4] = -8_388_608;
+        let wav = wav_24_bit_at(48_000, 1, &source);
+
+        let flac = convert_bytes_with_options(
+            "detail.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = flac_24_bit_samples(&flac[0].bytes);
+        assert_eq!(decoded.len(), frames);
+        for (index, (&actual, &expected)) in decoded.iter().zip(&source).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1,
+                "24-bit FLAC sample {index} was {actual} instead of {expected}"
+            );
+        }
+        assert_eq!(decoded[100], 1);
+
+        let float = convert_bytes_with_options(
+            "detail.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = wav_float_samples(&float[0].bytes);
+        assert_eq!(decoded.len(), frames);
+        for (index, (&actual, &expected)) in decoded.iter().zip(&source).enumerate() {
+            let expected = expected as f32 / 8_388_608.0;
+            assert!(
+                (actual - expected).abs() <= 1.0e-7,
+                "float sample {index} was {actual} instead of {expected}"
+            );
+        }
+        assert!(decoded[100] > 0.0);
+        assert!(
+            decoded[100] < 1.0 / 32_768.0,
+            "the float output lost detail below the 16-bit LSB"
+        );
+    }
+
+    #[test]
+    fn dithers_16_bit_output_deterministically_without_dithering_24_bit() {
+        let source = vec![1_i32; 512];
+        let wav = wav_24_bit_at(48_000, 1, &source);
+        let convert = || {
+            convert_bytes_with_options(
+                "quiet.wav",
+                &wav,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_bit_depth: AudioBitDepth::Bit16,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes
+        };
+        let first = convert();
+        let second = convert();
+        assert_eq!(first, second, "dither must be reproducible");
+
+        let parsed = parse_wav(&first);
+        let mut distinct = parsed.samples.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "a near-silent 16-bit signal was crushed to one value instead of dithered"
+        );
+
+        let pcm24 = convert_bytes_with_options(
+            "quiet.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = wav_24_bit_samples(&pcm24[0].bytes);
+        assert!(
+            decoded.iter().all(|sample| *sample == 1),
+            "24-bit output should be quantized without dither"
+        );
+
+        // The same rule applies when the source is a 32-bit f32 pipeline.
+        let deep = DecodedAudio {
+            samples: vec![1.0 / 8_388_608.0; 512],
+            channels: 1,
+            sample_rate: 48_000,
+            source_bits: Some(32),
+        };
+        let pcm24 = wav_24_bit_samples(&encode_wav(&deep, AudioBitDepth::Bit24).unwrap());
+        assert!(
+            pcm24.iter().all(|sample| *sample == 1),
+            "24-bit output from a 32-bit source should not be dithered"
+        );
+        let flac = flac_24_bit_samples(&encode_flac(&deep, AudioBitDepth::Bit24).unwrap());
+        assert!(
+            flac.iter().all(|sample| *sample == 1),
+            "24-bit FLAC from a 32-bit source should not be dithered"
+        );
+        let float = wav_float_samples(&encode_wav(&deep, AudioBitDepth::Float32).unwrap());
+        assert!(float
+            .iter()
+            .all(|sample| (*sample - 1.0 / 8_388_608.0).abs() <= 1.0e-7));
+    }
+
+    #[test]
+    fn clamps_out_of_range_samples_at_every_wav_depth() {
+        let audio = DecodedAudio {
+            samples: vec![2.0, -2.0],
+            channels: 1,
+            sample_rate: 48_000,
+            source_bits: Some(32),
+        };
+        let pcm16 = parse_wav(&encode_wav(&audio, AudioBitDepth::Bit16).unwrap());
+        assert_eq!(pcm16.samples, [i16::MAX, -i16::MAX]);
+        let pcm24 = wav_24_bit_samples(&encode_wav(&audio, AudioBitDepth::Bit24).unwrap());
+        assert_eq!(pcm24, [8_388_607, -8_388_607]);
+        let float = wav_float_samples(&encode_wav(&audio, AudioBitDepth::Float32).unwrap());
+        assert_eq!(float, [1.0, -1.0]);
     }
 
     #[test]

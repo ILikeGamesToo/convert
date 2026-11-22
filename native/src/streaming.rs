@@ -1114,7 +1114,9 @@ impl StreamingEncoder for WavStreamEncoder<'_> {
                     let value = self.dither.quantize_i32(*sample, 24, self.source_bits);
                     self.buffer.extend_from_slice(&value.to_le_bytes()[..3]);
                 }
-                AudioBitDepth::Float32 => self.buffer.extend_from_slice(&sample.to_le_bytes()),
+                AudioBitDepth::Float32 => self
+                    .buffer
+                    .extend_from_slice(&(*sample).clamp(-1.0, 1.0).to_le_bytes()),
             }
             if self.buffer.len() >= 32 * 1024 {
                 self.flush_buffer()?;
@@ -1184,9 +1186,10 @@ impl<'a> FlacStreamEncoder<'a> {
             AudioBitDepth::Bit16 => 16,
             AudioBitDepth::Bit24 => 24,
             AudioBitDepth::Float32 => {
-                return Err(ConvertError::Audio(
-                    "FLAC cannot store 32-bit float samples; choose 16-bit or 24-bit".to_owned(),
-                ))
+                return Err(ConvertError::UnsupportedBitDepth {
+                    format: "FLAC",
+                    depth: bit_depth.label(),
+                })
             }
         };
         let config = flacenc::config::Encoder::default()

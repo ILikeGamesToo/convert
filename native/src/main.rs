@@ -716,6 +716,12 @@ fn audio_bit_depth_setting(ui: &mut egui::Ui, depth: &mut AudioBitDepth, target:
     } else {
         &AudioBitDepth::ALL
     };
+    // A depth chosen for WAV may not be valid after switching the target to
+    // FLAC. Fall back to the default instead of leaving an unsupported value
+    // selected but hidden from the combo box.
+    if !choices.contains(&*depth) {
+        *depth = AudioBitDepth::Bit16;
+    }
     ui.vertical(|ui| {
         ui.label(RichText::new("Bit depth").size(12.8).strong().color(TEXT));
         settings_input_frame(ui, |ui| {
