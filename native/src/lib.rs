@@ -3347,6 +3347,25 @@ mod tests {
     }
 
     #[test]
+    fn trims_only_the_selected_audio_tracks_discard_padding() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/sample-two-opus-tracks.webm");
+        let input = std::fs::read(path).unwrap();
+
+        // The tracks hold 1 s and 1.01 s of audio and carry different end
+        // padding, so using the wrong track's value changes the decoded length.
+        assert_eq!(super::matroska_discard_padding(&input, 1), Some(13_500_000));
+        assert_eq!(super::matroska_discard_padding(&input, 2), Some(3_500_000));
+
+        let wav = convert_bytes("sample-two-opus-tracks.webm", &input, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&wav[0].bytes);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples.len(), 48_000);
+        assert_audible(&decoded.samples);
+    }
+
+    #[test]
     fn decodes_ogg_opus_audio() {
         use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
 

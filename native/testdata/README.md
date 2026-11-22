@@ -17,3 +17,11 @@ These files are used only by the `native` conversion tests to verify OGG, Opus, 
   ffmpeg -i sample-vp9-opus.webm -c copy sample-vp9-opus.mp4
   ffmpeg -i sample-vp9-opus.mp4 -c copy sample-vp9-opus-roundtrip.webm
   ```
+- `sample-two-opus-tracks.webm` — two 48 kHz mono Opus tracks (1 s and 1.01 s) whose final blocks carry different Matroska DiscardPadding values (13.5 ms and 3.5 ms). Generated with FFmpeg 9.1 (libopus) from its own `sine` source:
+
+  ```sh
+  ffmpeg -f lavfi -i sine=frequency=440:duration=1 \
+    -f lavfi -i sine=frequency=880:duration=1.01 \
+    -map 0:a -map 1:a -c:a libopus -b:a 96k -ar 48000 -ac 1 \
+    sample-two-opus-tracks.webm
+  ```
