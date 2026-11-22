@@ -7,6 +7,7 @@ use std::{
 };
 
 use image::ImageEncoder;
+use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str};
 use thiserror::Error;
 
 mod input_extensions;
@@ -30,6 +31,7 @@ pub enum OutputFormat {
     Qoi,
     Hdr,
     Farbfeld,
+    Pdf,
     Text,
     TextUtf8NoBom,
     TextUtf8Bom,
@@ -91,7 +93,7 @@ impl ConversionOptions {
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -104,6 +106,7 @@ impl OutputFormat {
         Self::Qoi,
         Self::Hdr,
         Self::Farbfeld,
+        Self::Pdf,
         Self::Text,
         Self::TextUtf8NoBom,
         Self::TextUtf8Bom,
@@ -137,6 +140,7 @@ impl OutputFormat {
             Self::Qoi => "QOI image",
             Self::Hdr => "Radiance HDR image",
             Self::Farbfeld => "Farbfeld image",
+            Self::Pdf => "PDF document",
             Self::Text => "Plain text",
             Self::TextUtf8NoBom => "UTF-8 without BOM",
             Self::TextUtf8Bom => "UTF-8 with BOM",
@@ -189,6 +193,7 @@ impl OutputFormat {
             Self::Qoi => "qoi",
             Self::Hdr => "hdr",
             Self::Farbfeld => "ff",
+            Self::Pdf => "pdf",
             Self::Text => "txt",
             Self::TextUtf8NoBom
             | Self::TextUtf8Bom
@@ -225,6 +230,7 @@ impl OutputFormat {
             | Self::Qoi
             | Self::Hdr
             | Self::Farbfeld => is_image_input_extension(&extension),
+            Self::Pdf => extension == "txt" || is_image_input_extension(&extension),
             Self::Text | Self::Csv | Self::Json | Self::Yaml | Self::Toml => {
                 is_data_extension(&extension)
             }
@@ -333,6 +339,19 @@ pub fn convert_bytes_with_options(
         return Ok(vec![ConvertedFile {
             name: PathBuf::from(format!("{}.gz", safe_file_name(input_name))),
             bytes: gzip_bytes(input, options.archive_compression)?,
+        }]);
+    }
+    if target == OutputFormat::Pdf {
+        let bytes = if extension == "txt" {
+            text_to_pdf(input)?
+        } else if is_image_input_extension(&extension) {
+            image_to_pdf(input, &extension)?
+        } else {
+            return Err(unsupported(&extension, target));
+        };
+        return Ok(vec![ConvertedFile {
+            name: output_name(input_name, target.extension()),
+            bytes,
         }]);
     }
 
@@ -1268,6 +1287,297 @@ fn encode_flac(audio: &DecodedAudio) -> Result<Vec<u8>, ConvertError> {
     Ok(sink.as_slice().to_vec())
 }
 
+const PDF_TEXT_PAGE_WIDTH: f32 = 595.28;
+const PDF_TEXT_PAGE_HEIGHT: f32 = 841.89;
+const PDF_TEXT_MARGIN: f32 = 72.0;
+const PDF_TEXT_FONT_SIZE: f32 = 11.0;
+const PDF_TEXT_LEADING: f32 = 13.2;
+/// Courier advances 0.6 em per character.
+const PDF_TEXT_MAX_CHARS: usize =
+    ((PDF_TEXT_PAGE_WIDTH - 2.0 * PDF_TEXT_MARGIN) / (PDF_TEXT_FONT_SIZE * 0.6)) as usize;
+const PDF_TEXT_LINES_PER_PAGE: usize =
+    ((PDF_TEXT_PAGE_HEIGHT - 2.0 * PDF_TEXT_MARGIN) / PDF_TEXT_LEADING) as usize;
+
+fn image_to_pdf(input: &[u8], extension: &str) -> Result<Vec<u8>, ConvertError> {
+    if let Some(components @ (1 | 3)) = jpeg_component_count(input) {
+        let (width, height) = image::ImageReader::new(Cursor::new(input))
+            .with_guessed_format()?
+            .into_dimensions()?;
+        return Ok(build_image_pdf(
+            input,
+            width,
+            height,
+            Filter::DctDecode,
+            components == 1,
+        ));
+    }
+
+    let image = if extension == "svg" {
+        rasterize_svg(input)?
+    } else {
+        image::load_from_memory(input)?
+    };
+    let width = image.width();
+    let height = image.height();
+    let compressed = deflate_bytes(&flatten_to_rgb(&image))?;
+    Ok(build_image_pdf(
+        &compressed,
+        width,
+        height,
+        Filter::FlateDecode,
+        false,
+    ))
+}
+
+fn build_image_pdf(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    filter: Filter,
+    grayscale: bool,
+) -> Vec<u8> {
+    let catalog_id = Ref::new(1);
+    let pages_id = Ref::new(2);
+    let page_id = Ref::new(3);
+    let content_id = Ref::new(4);
+    let image_id = Ref::new(5);
+
+    let mut content = Content::new();
+    content.save_state();
+    content.transform([width as f32, 0.0, 0.0, height as f32, 0.0, 0.0]);
+    content.x_object(Name(b"Im1"));
+    content.restore_state();
+    let content = content.finish();
+
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog_id).pages(pages_id);
+    pdf.pages(pages_id).kids([page_id]).count(1);
+    {
+        let mut page = pdf.page(page_id);
+        page.parent(pages_id)
+            .media_box(Rect::new(0.0, 0.0, width as f32, height as f32))
+            .contents(content_id);
+        page.resources().x_objects().pair(Name(b"Im1"), image_id);
+    }
+    pdf.stream(content_id, &content);
+    {
+        let mut x_object = pdf.image_xobject(image_id, data);
+        x_object.width(width as i32);
+        x_object.height(height as i32);
+        if grayscale {
+            x_object.color_space().device_gray();
+        } else {
+            x_object.color_space().device_rgb();
+        }
+        x_object.bits_per_component(8);
+        x_object.filter(filter);
+    }
+    pdf.finish()
+}
+
+/// Reads the component count from a JPEG's SOF marker so RGB and grayscale
+/// photos can be embedded without re-encoding.
+fn jpeg_component_count(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut index = 2;
+    while index + 4 <= bytes.len() {
+        if bytes[index] != 0xff {
+            return None;
+        }
+        let mut marker_index = index + 1;
+        while marker_index < bytes.len() && bytes[marker_index] == 0xff {
+            marker_index += 1;
+        }
+        let marker = *bytes.get(marker_index)?;
+        if marker == 0x01 || marker == 0xd8 || (0xd0..=0xd7).contains(&marker) {
+            index = marker_index + 1;
+            continue;
+        }
+        if marker == 0xda || marker == 0xd9 {
+            return None;
+        }
+        let length =
+            u16::from_be_bytes([*bytes.get(marker_index + 1)?, *bytes.get(marker_index + 2)?])
+                as usize;
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            return bytes.get(marker_index + 8).copied();
+        }
+        index = marker_index + 1 + length;
+    }
+    None
+}
+
+fn flatten_to_rgb(image: &image::DynamicImage) -> Vec<u8> {
+    if !image.color().has_alpha() {
+        return image.to_rgb8().into_raw();
+    }
+    let rgba = image.to_rgba8();
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.pixels() {
+        let alpha = u16::from(pixel[3]);
+        for channel in &pixel.0[..3] {
+            let value = (u16::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255;
+            rgb.push(value as u8);
+        }
+    }
+    rgb
+}
+
+fn deflate_bytes(data: &[u8]) -> Result<Vec<u8>, ConvertError> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
+}
+
+fn text_to_pdf(input: &[u8]) -> Result<Vec<u8>, ConvertError> {
+    let text = decode_text(input)?;
+    let lines = wrap_text_lines(&text);
+    let page_count = lines.len().div_ceil(PDF_TEXT_LINES_PER_PAGE);
+
+    let catalog_id = Ref::new(1);
+    let pages_id = Ref::new(2);
+    let font_id = Ref::new(3);
+
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog_id).pages(pages_id);
+    pdf.type1_font(font_id)
+        .base_font(Name(b"Courier"))
+        .encoding_predefined(Name(b"WinAnsiEncoding"));
+    pdf.pages(pages_id)
+        .kids((0..page_count).map(|index| Ref::new(4 + (index as i32) * 2)))
+        .count(page_count as i32);
+
+    for page_index in 0..page_count {
+        let page_id = Ref::new(4 + (page_index as i32) * 2);
+        let content_id = Ref::new(5 + (page_index as i32) * 2);
+        let start = page_index * PDF_TEXT_LINES_PER_PAGE;
+        let end = (start + PDF_TEXT_LINES_PER_PAGE).min(lines.len());
+
+        let mut content = Content::new();
+        content.begin_text();
+        content.set_font(Name(b"F1"), PDF_TEXT_FONT_SIZE);
+        content.set_text_matrix([
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            PDF_TEXT_MARGIN,
+            PDF_TEXT_PAGE_HEIGHT - PDF_TEXT_MARGIN - PDF_TEXT_FONT_SIZE,
+        ]);
+        for (line_index, line) in lines[start..end].iter().enumerate() {
+            if line_index > 0 {
+                content.next_line(0.0, -PDF_TEXT_LEADING);
+            }
+            content.show(Str(&win_ansi_bytes(line)));
+        }
+        content.end_text();
+        let content = content.finish();
+
+        {
+            let mut page = pdf.page(page_id);
+            page.parent(pages_id)
+                .media_box(Rect::new(
+                    0.0,
+                    0.0,
+                    PDF_TEXT_PAGE_WIDTH,
+                    PDF_TEXT_PAGE_HEIGHT,
+                ))
+                .contents(content_id);
+            page.resources().fonts().pair(Name(b"F1"), font_id);
+        }
+        pdf.stream(content_id, &content);
+    }
+    Ok(pdf.finish())
+}
+
+fn wrap_text_lines(text: &str) -> Vec<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = Vec::new();
+    for raw_line in normalized.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in raw_line.split(' ') {
+            if !current.is_empty()
+                && current.chars().count() + 1 + word.chars().count() > PDF_TEXT_MAX_CHARS
+            {
+                lines.push(std::mem::take(&mut current));
+            }
+            if current.is_empty() {
+                if word.chars().count() <= PDF_TEXT_MAX_CHARS {
+                    current.push_str(word);
+                } else {
+                    hard_wrap_word(word, &mut lines, &mut current);
+                }
+            } else {
+                current.push(' ');
+                current.push_str(word);
+            }
+        }
+        lines.push(current);
+    }
+    lines
+}
+
+fn hard_wrap_word(word: &str, lines: &mut Vec<String>, current: &mut String) {
+    let characters: Vec<char> = word.chars().collect();
+    let mut start = 0;
+    while start + PDF_TEXT_MAX_CHARS < characters.len() {
+        lines.push(
+            characters[start..start + PDF_TEXT_MAX_CHARS]
+                .iter()
+                .collect(),
+        );
+        start += PDF_TEXT_MAX_CHARS;
+    }
+    current.extend(characters[start..].iter());
+}
+
+fn win_ansi_bytes(text: &str) -> Vec<u8> {
+    text.chars()
+        .map(|character| win_ansi_byte(character).unwrap_or(b'?'))
+        .collect()
+}
+
+fn win_ansi_byte(character: char) -> Option<u8> {
+    match character {
+        '\u{20}'..='\u{7e}' | '\u{a0}'..='\u{ff}' => Some(character as u8),
+        '\u{20ac}' => Some(0x80),
+        '\u{201a}' => Some(0x82),
+        '\u{0192}' => Some(0x83),
+        '\u{201e}' => Some(0x84),
+        '\u{2026}' => Some(0x85),
+        '\u{2020}' => Some(0x86),
+        '\u{2021}' => Some(0x87),
+        '\u{02c6}' => Some(0x88),
+        '\u{2030}' => Some(0x89),
+        '\u{0160}' => Some(0x8a),
+        '\u{2039}' => Some(0x8b),
+        '\u{0152}' => Some(0x8c),
+        '\u{017d}' => Some(0x8e),
+        '\u{2018}' => Some(0x91),
+        '\u{2019}' => Some(0x92),
+        '\u{201c}' => Some(0x93),
+        '\u{201d}' => Some(0x94),
+        '\u{2022}' => Some(0x95),
+        '\u{2013}' => Some(0x96),
+        '\u{2014}' => Some(0x97),
+        '\u{02dc}' => Some(0x98),
+        '\u{2122}' => Some(0x99),
+        '\u{0161}' => Some(0x9a),
+        '\u{203a}' => Some(0x9b),
+        '\u{0153}' => Some(0x9c),
+        '\u{017e}' => Some(0x9e),
+        '\u{0178}' => Some(0x9f),
+        '\t' => Some(b' '),
+        _ => None,
+    }
+}
+
 fn create_tar(
     entries: &[(PathBuf, Vec<u8>)],
     gzip: bool,
@@ -2124,5 +2434,57 @@ mod tests {
                 "the file picker is missing .{extension}"
             );
         }
+    }
+
+    fn jpeg_fixture() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(4, 3, image::Rgb([180, 90, 40]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn converts_images_to_pdf() {
+        let converted = convert_bytes("sample.png", &png_fixture(), OutputFormat::Pdf).unwrap();
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].name, PathBuf::from("sample.pdf"));
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.starts_with("%PDF-"));
+        assert!(pdf.contains("/Subtype /Image"));
+        assert!(pdf.contains("/Filter /FlateDecode"));
+        assert!(pdf.contains("/MediaBox"));
+    }
+
+    #[test]
+    fn embeds_jpeg_input_without_reencoding() {
+        let jpeg = jpeg_fixture();
+        let converted = convert_bytes("photo.jpg", &jpeg, OutputFormat::Pdf).unwrap();
+        assert!(converted[0]
+            .bytes
+            .windows(jpeg.len())
+            .any(|window| window == jpeg));
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/Filter /DCTDecode"));
+    }
+
+    #[test]
+    fn converts_text_to_a_paginated_pdf() {
+        let text = "Hello, PDF!\n".repeat(120);
+        let converted = convert_bytes("notes.txt", text.as_bytes(), OutputFormat::Pdf).unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("(Hello, PDF!) Tj"));
+        let pages = pdf.matches("/Type /Page").count() - pdf.matches("/Type /Pages").count();
+        assert_eq!(pages, 120usize.div_ceil(super::PDF_TEXT_LINES_PER_PAGE));
+    }
+
+    #[test]
+    fn rejects_pdf_output_for_unstructured_data() {
+        let error = convert_bytes("data.csv", b"name\nvalue\n", OutputFormat::Pdf).unwrap_err();
+        assert!(matches!(error, ConvertError::Unsupported { .. }));
     }
 }

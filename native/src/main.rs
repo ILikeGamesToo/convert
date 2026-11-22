@@ -274,6 +274,7 @@ enum AppPage {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormatCategory {
     Image,
+    Document,
     Text,
     Data,
     Audio,
@@ -281,8 +282,9 @@ enum FormatCategory {
 }
 
 impl FormatCategory {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Image,
+        Self::Document,
         Self::Text,
         Self::Data,
         Self::Audio,
@@ -292,6 +294,7 @@ impl FormatCategory {
     fn label(self) -> &'static str {
         match self {
             Self::Image => "Image",
+            Self::Document => "Document",
             Self::Text => "Text",
             Self::Data => "Data",
             Self::Audio => "Audio",
@@ -314,6 +317,7 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Qoi
         | OutputFormat::Hdr
         | OutputFormat::Farbfeld => FormatCategory::Image,
+        OutputFormat::Pdf => FormatCategory::Document,
         OutputFormat::Text
         | OutputFormat::TextUtf8NoBom
         | OutputFormat::TextUtf8Bom
@@ -345,6 +349,7 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Qoi => "QOI",
         OutputFormat::Hdr => "HDR",
         OutputFormat::Farbfeld => "FF",
+        OutputFormat::Pdf => "PDF",
         OutputFormat::Text => "TXT",
         OutputFormat::TextUtf8NoBom => "UTF8",
         OutputFormat::TextUtf8Bom => "UTF8 BOM",
@@ -379,6 +384,7 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Qoi => "Quite OK Image",
         OutputFormat::Hdr => "Radiance HDR image",
         OutputFormat::Farbfeld => "Farbfeld image",
+        OutputFormat::Pdf => "Portable Document Format",
         OutputFormat::Text => "Plain text",
         OutputFormat::TextUtf8NoBom => "Plain text, UTF-8 without BOM",
         OutputFormat::TextUtf8Bom => "Plain text, UTF-8 with BOM",
@@ -1629,71 +1635,102 @@ impl ConvertApp {
                 });
 
                 ui.add_space(12.0);
-                let (filter_row, _) =
-                    ui.allocate_exact_size(Vec2::new(width, 24.0), egui::Sense::hover());
+                let chip_gap = 6.4;
+                let chip_height = 24.0;
+                let available = (width - 40.0).max(0.0);
                 let painter = ui.painter().clone();
-                let mut chip_x = filter_row.left() + 20.0;
+                let mut chip_rows: Vec<Vec<(usize, FormatCategory, f32)>> = Vec::new();
+                let mut row: Vec<(usize, FormatCategory, f32)> = Vec::new();
+                let mut row_width = 0.0;
                 for (index, category) in FormatCategory::ALL.into_iter().enumerate() {
-                    let selected = self.selected_category == Some(category);
-                    let label = category.label();
-                    let text_color = if selected { Color32::WHITE } else { MUTED };
                     let text_width = painter
-                        .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), text_color)
+                        .layout_no_wrap(
+                            category.label().to_owned(),
+                            FontId::proportional(12.0),
+                            MUTED,
+                        )
                         .size()
                         .x;
                     let chip_width = 2.0 * 9.6 + 14.0 + 5.6 + text_width + 2.0;
-                    let chip = egui::Rect::from_min_size(
-                        egui::pos2(chip_x, filter_row.top()),
-                        Vec2::new(chip_width, 24.0),
-                    );
-                    let response = ui.interact(
-                        chip,
-                        ui.make_persistent_id(("format-category-chip", index)),
-                        egui::Sense::click(),
-                    );
-                    painter.rect_filled(
-                        chip,
-                        egui::CornerRadius::same(6),
-                        if selected {
-                            PRIMARY
-                        } else if response.hovered() {
-                            Color32::from_rgb(45, 45, 45)
-                        } else {
-                            SOFT
-                        },
-                    );
-                    if selected {
-                        painter.rect_stroke(
+                    if !row.is_empty() && row_width + chip_gap + chip_width > available {
+                        chip_rows.push(std::mem::take(&mut row));
+                        row_width = 0.0;
+                    }
+                    row_width += if row.is_empty() {
+                        chip_width
+                    } else {
+                        chip_gap + chip_width
+                    };
+                    row.push((index, category, chip_width));
+                }
+                if !row.is_empty() {
+                    chip_rows.push(row);
+                }
+                let row_gap = 6.0;
+                let filter_height = chip_rows.len() as f32 * chip_height
+                    + chip_rows.len().saturating_sub(1) as f32 * row_gap;
+                let (filter_area, _) =
+                    ui.allocate_exact_size(Vec2::new(width, filter_height), egui::Sense::hover());
+                for (row_index, row) in chip_rows.iter().enumerate() {
+                    let top = filter_area.top() + row_index as f32 * (chip_height + row_gap);
+                    let mut chip_x = filter_area.left() + 20.0;
+                    for (index, category, chip_width) in row {
+                        let selected = self.selected_category == Some(*category);
+                        let label = category.label();
+                        let text_color = if selected { Color32::WHITE } else { MUTED };
+                        let chip = egui::Rect::from_min_size(
+                            egui::pos2(chip_x, top),
+                            Vec2::new(*chip_width, chip_height),
+                        );
+                        let response = ui.interact(
+                            chip,
+                            ui.make_persistent_id(("format-category-chip", *index)),
+                            egui::Sense::click(),
+                        );
+                        painter.rect_filled(
                             chip,
                             egui::CornerRadius::same(6),
-                            Stroke::new(1.0_f32, PRIMARY),
-                            egui::StrokeKind::Inside,
+                            if selected {
+                                PRIMARY
+                            } else if response.hovered() {
+                                Color32::from_rgb(45, 45, 45)
+                            } else {
+                                SOFT
+                            },
                         );
-                    }
-                    paint_category_icon(
-                        &painter,
-                        egui::Rect::from_center_size(
-                            egui::pos2(chip.left() + 16.6, chip.center().y),
-                            Vec2::splat(14.0),
-                        ),
-                        category,
                         if selected {
-                            Color32::WHITE
-                        } else {
-                            FOOTER_TEXT
-                        },
-                    );
-                    painter.text(
-                        egui::pos2(chip.left() + 29.2, chip.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        FontId::proportional(12.0),
-                        text_color,
-                    );
-                    if response.clicked() {
-                        self.selected_category = if selected { None } else { Some(category) };
+                            painter.rect_stroke(
+                                chip,
+                                egui::CornerRadius::same(6),
+                                Stroke::new(1.0_f32, PRIMARY),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        paint_category_icon(
+                            &painter,
+                            egui::Rect::from_center_size(
+                                egui::pos2(chip.left() + 16.6, chip.center().y),
+                                Vec2::splat(14.0),
+                            ),
+                            *category,
+                            if selected {
+                                Color32::WHITE
+                            } else {
+                                FOOTER_TEXT
+                            },
+                        );
+                        painter.text(
+                            egui::pos2(chip.left() + 29.2, chip.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            FontId::proportional(12.0),
+                            text_color,
+                        );
+                        if response.clicked() {
+                            self.selected_category = if selected { None } else { Some(*category) };
+                        }
+                        chip_x = chip.right() + chip_gap;
                     }
-                    chip_x = chip.right() + 6.4;
                 }
                 ui.add_space(20.0);
 
@@ -2729,6 +2766,7 @@ fn paint_category_icon(
 ) {
     match category {
         FormatCategory::Image => paint_image_icon(painter, rect, color),
+        FormatCategory::Document => paint_file_icon(painter, rect, color),
         FormatCategory::Text => paint_text_category_icon(painter, rect, color),
         FormatCategory::Data => paint_braces_icon(painter, rect, color),
         FormatCategory::Audio => paint_audio_icon(painter, rect, color),
@@ -2754,7 +2792,7 @@ fn paint_audio_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 fn paint_format_icon(painter: &egui::Painter, rect: egui::Rect, format: OutputFormat) {
     match format_category(format) {
         FormatCategory::Image => paint_image_icon(painter, rect, GREEN),
-        FormatCategory::Text => paint_file_icon(painter, rect, GREEN),
+        FormatCategory::Document | FormatCategory::Text => paint_file_icon(painter, rect, GREEN),
         FormatCategory::Data => {
             painter.text(
                 rect.center(),
@@ -3082,6 +3120,7 @@ mod tests {
                 OutputFormat::Qoi,
                 OutputFormat::Hdr,
                 OutputFormat::Farbfeld,
+                OutputFormat::Pdf,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
@@ -3095,6 +3134,7 @@ mod tests {
         assert_eq!(
             available_targets(Some(InputFormat::Text)),
             [
+                OutputFormat::Pdf,
                 OutputFormat::Text,
                 OutputFormat::TextUtf8NoBom,
                 OutputFormat::TextUtf8Bom,
@@ -3129,6 +3169,7 @@ mod tests {
             OutputFormat::Qoi,
             OutputFormat::Hdr,
             OutputFormat::Farbfeld,
+            OutputFormat::Pdf,
             OutputFormat::Zip,
             OutputFormat::Tar,
             OutputFormat::TarGz,
