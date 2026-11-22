@@ -2629,9 +2629,11 @@ mod tests {
     }
 
     fn wav_fixture() -> Vec<u8> {
-        let sample_rate = 8_000_u32;
+        wav_fixture_at(8_000, 8_000)
+    }
+
+    fn wav_fixture_at(sample_rate: u32, frames: u32) -> Vec<u8> {
         let channels = 2_u16;
-        let frames = 8_000_u32;
         let mut samples = Vec::new();
         for frame in 0..frames {
             let value = ((frame as f32 / sample_rate as f32 * 440.0 * std::f32::consts::TAU).sin()
@@ -2903,6 +2905,22 @@ mod tests {
         assert_eq!(default_rate_decoded.channels, 2);
         assert_eq!(default_rate_decoded.samples.len(), 96_000);
         assert_audible(&default_rate_decoded.samples);
+
+        // Default options keep the source rate, so this exercises the Opus
+        // encoder's own 44.1 kHz -> 48 kHz fallback instead of the shared
+        // resampler.
+        let wav_44_1 = wav_fixture_at(44_100, 44_100);
+        let source_44_1 = parse_wav(&wav_44_1);
+        assert_eq!(source_44_1.sample_rate, 44_100);
+        assert_eq!(source_44_1.samples.len(), 88_200);
+        let fallback = convert_bytes("tone-44.1k.wav", &wav_44_1, OutputFormat::Opus).unwrap();
+        let fallback_back =
+            convert_bytes("tone.opus", &fallback[0].bytes, OutputFormat::Wav).unwrap();
+        let fallback_decoded = parse_wav(&fallback_back[0].bytes);
+        assert_eq!(fallback_decoded.sample_rate, 48_000);
+        assert_eq!(fallback_decoded.channels, 2);
+        assert_eq!(fallback_decoded.samples.len(), 96_000);
+        assert_audible(&fallback_decoded.samples);
     }
 
     #[test]
