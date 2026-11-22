@@ -518,7 +518,18 @@ pub fn convert_bytes_with_options(
         if !is_audio_extension(&extension) {
             return Err(unsupported(&extension, target));
         }
-        let audio = apply_audio_options(decode_audio(input, &extension)?, options)?;
+        // Opus only accepts 8/12/16/24/48 kHz. Map the requested rate before
+        // the shared audio options resample so it goes straight to the rate the
+        // encoder uses instead of resampling twice.
+        let audio_options = if target == OutputFormat::Opus {
+            ConversionOptions {
+                audio_sample_rate: options.audio_sample_rate.map(opus_sample_rate),
+                ..options
+            }
+        } else {
+            options
+        };
+        let audio = apply_audio_options(decode_audio(input, &extension)?, audio_options)?;
         let bytes = match target {
             OutputFormat::Wav => encode_wav(&audio)?,
             OutputFormat::Flac => encode_flac(&audio)?,
