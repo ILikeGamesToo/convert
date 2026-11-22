@@ -17,10 +17,10 @@ use std::{
 mod input_format;
 
 use convert_to_it_native::{
-    audio_tracks, convert_audio_to_wav_writer, convert_batch_with_options,
-    convert_bytes_with_options, supported_input_extensions, wav_output_name, AudioBitDepth,
-    AudioChannels, AudioTrackInfo, ConversionOptions, OutputFormat, PdfImageFit, PdfOrientation,
-    PdfPageSize,
+    audio_output_name, audio_tracks_from_path, convert_audio_file_to_writer_with_cancel,
+    convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
+    AudioBitDepth, AudioChannels, AudioTrackInfo, ConversionOptions, ConvertError, OutputFormat,
+    PdfImageFit, PdfOrientation, PdfPageSize,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect, InputFormat};
@@ -229,6 +229,8 @@ fn rounded_rect_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
     points
 }
 
+type AudioTrackResponse = (u64, Result<Vec<AudioTrackInfo>, String>);
+
 #[derive(Default)]
 struct ConvertApp {
     inputs: Vec<PathBuf>,
@@ -244,6 +246,10 @@ struct ConvertApp {
     conversion_options: ConversionOptions,
     audio_track_choices: Vec<AudioTrackInfo>,
     audio_track_error: Option<String>,
+    audio_track_source: Option<PathBuf>,
+    audio_track_request: Option<Receiver<AudioTrackResponse>>,
+    audio_track_generation: u64,
+    audio_tracks_loading: bool,
     search_filter: String,
     selected_category: Option<FormatCategory>,
     status: Option<(String, bool)>,
@@ -782,6 +788,7 @@ fn number_setting(
 impl eframe::App for ConvertApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_conversion();
+        self.poll_audio_tracks();
         if !self.is_converting() {
             self.collect_dropped_files(context);
         }
@@ -1418,34 +1425,72 @@ impl ConvertApp {
                     });
             });
         });
-        if let Some(error) = &self.audio_track_error {
+        if self.audio_tracks_loading {
+            ui.label(
+                RichText::new("Reading audio tracks...")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        } else if let Some(error) = &self.audio_track_error {
             ui.label(RichText::new(error).size(11.0).color(MUTED));
         }
     }
 
     fn refresh_audio_tracks(&mut self) {
+        self.audio_track_generation = self.audio_track_generation.wrapping_add(1);
+        let generation = self.audio_track_generation;
         self.audio_track_choices.clear();
         self.audio_track_error = None;
-        let Some(path) = self.inputs.first() else {
+        self.audio_track_request = None;
+        let first = self.inputs.first().cloned();
+        if first != self.audio_track_source {
+            self.audio_track_source = first.clone();
+            self.conversion_options.audio_track = None;
+        }
+        let Some(path) = first else {
+            self.audio_tracks_loading = false;
             return;
         };
-        let extension = path
-            .extension()
-            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        match fs::read(path) {
-            Ok(bytes) => match audio_tracks(&bytes, &extension) {
-                Ok(tracks) => self.audio_track_choices = tracks,
-                Err(error) => self.audio_track_error = Some(error.to_string()),
-            },
-            Err(error) => self.audio_track_error = Some(error.to_string()),
-        }
-        if self
-            .conversion_options
-            .audio_track
-            .is_some_and(|index| index >= self.audio_track_choices.len())
-        {
-            self.conversion_options.audio_track = None;
+        self.audio_tracks_loading = true;
+        let (sender, receiver) = mpsc::channel();
+        self.audio_track_request = Some(receiver);
+        thread::spawn(move || {
+            let result = audio_tracks_from_path(&path).map_err(|error| error.to_string());
+            let _ = sender.send((generation, result));
+        });
+    }
+
+    fn poll_audio_tracks(&mut self) {
+        let received = match self.audio_track_request.as_ref() {
+            Some(receiver) => receiver.try_recv(),
+            None => return,
+        };
+        match received {
+            Ok((generation, result)) => {
+                if generation != self.audio_track_generation {
+                    return;
+                }
+                self.audio_track_request = None;
+                self.audio_tracks_loading = false;
+                match result {
+                    Ok(tracks) => {
+                        self.audio_track_choices = tracks;
+                        if self
+                            .conversion_options
+                            .audio_track
+                            .is_some_and(|index| index >= self.audio_track_choices.len())
+                        {
+                            self.conversion_options.audio_track = None;
+                        }
+                    }
+                    Err(error) => self.audio_track_error = Some(error),
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.audio_track_request = None;
+                self.audio_tracks_loading = false;
+            }
         }
     }
 
@@ -2414,6 +2459,11 @@ impl ConvertApp {
         self.input_formats.clear();
         self.audio_track_choices.clear();
         self.audio_track_error = None;
+        self.audio_track_source = None;
+        self.conversion_options.audio_track = None;
+        self.audio_track_generation = self.audio_track_generation.wrapping_add(1);
+        self.audio_track_request = None;
+        self.audio_tracks_loading = false;
         self.input_format_override = None;
         self.input_format_search.clear();
         self.input_format_show_all = false;
@@ -3204,6 +3254,8 @@ fn conversion_step_total(input_count: usize, target: OutputFormat) -> usize {
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
     ) {
         input_count.saturating_add(2)
+    } else if format_category(target) == FormatCategory::Audio {
+        input_count.saturating_mul(2)
     } else {
         input_count.saturating_mul(3)
     }
@@ -3273,6 +3325,51 @@ fn convert_to_directory(
             remove_written(&written);
             return Err(ConversionFailure::Cancelled);
         }
+        if format_category(target) == FormatCategory::Audio {
+            report(
+                completed,
+                format!(
+                    "Converting {} ({}/{})...",
+                    file_name(path),
+                    index + 1,
+                    inputs.len()
+                ),
+            );
+            let output_name = audio_output_name(file_name(path), target);
+            let output = match write_unique_with(output_directory, &output_name, |file| {
+                convert_audio_file_to_writer_with_cancel(
+                    path,
+                    file_name(path),
+                    target,
+                    options,
+                    file,
+                    cancel,
+                )
+                .map_err(|error| match error {
+                    ConvertError::Cancelled => {
+                        std::io::Error::new(std::io::ErrorKind::Interrupted, "conversion cancelled")
+                    }
+                    error => std::io::Error::other(error.to_string()),
+                })
+            }) {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    remove_written(&written);
+                    return Err(ConversionFailure::Cancelled);
+                }
+                Err(error) => {
+                    return Err(ConversionFailure::Message(format!(
+                        "{}: {error}",
+                        output_name.display()
+                    )))
+                }
+            };
+            completed += 2;
+            written.push(output);
+            report(completed, format!("Saved {}", output_name.display()));
+            continue;
+        }
+
         report(completed, format!("Reading {}...", file_name(path)));
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -3295,21 +3392,6 @@ fn convert_to_directory(
                 inputs.len()
             ),
         );
-        if target == OutputFormat::Wav {
-            let output_name = wav_output_name(file_name(path));
-            let output = write_unique_with(output_directory, &output_name, |file| {
-                convert_audio_to_wav_writer(file_name(path), &bytes, options, file)
-                    .map_err(|error| std::io::Error::other(error.to_string()))
-            })
-            .map_err(|error| {
-                ConversionFailure::Message(format!("{}: {error}", output_name.display()))
-            })?;
-            drop(bytes);
-            completed += 2;
-            written.push(output);
-            report(completed, format!("Saved {}", output_name.display()));
-            continue;
-        }
         let outputs = match convert_bytes_with_options(file_name(path), &bytes, target, options) {
             Ok(outputs) => outputs,
             Err(error) => {
@@ -3897,7 +3979,7 @@ mod tests {
         let output = fs::read(output_directory.join("tone.wav")).unwrap();
         assert_eq!(&output[..4], b"RIFF");
         assert!(output.len() > 44);
-        assert_eq!(last_step, 3);
+        assert_eq!(last_step, 2);
         fs::remove_dir_all(&directory).unwrap();
     }
 

@@ -2,7 +2,8 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    io::{Cursor, Write},
+    fs::File,
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -11,7 +12,9 @@ use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str};
 use thiserror::Error;
 
 mod input_extensions;
+mod streaming;
 pub use input_extensions::supported_input_extensions;
+pub use streaming::{convert_audio_file_to_writer, convert_audio_file_to_writer_with_cancel};
 
 const MAX_AUDIO_SAMPLES: usize = 120_000_000;
 const MAX_SVG_DIMENSION: u32 = 8_192;
@@ -512,6 +515,8 @@ pub enum ConvertError {
     AudioTrackNotFound { requested: usize, available: usize },
     #[error("the audio file is too large to convert in memory")]
     AudioTooLarge,
+    #[error("conversion cancelled")]
+    Cancelled,
     #[error("the archive would contain {count} entries, more than the {max}-entry limit")]
     ArchiveTooManyEntries { count: usize, max: usize },
     #[error("could not decode audio: {0}")]
@@ -1469,6 +1474,9 @@ enum AudioCodecKind {
 struct AudioTrackEntry {
     info: AudioTrackInfo,
     kind: AudioCodecKind,
+    /// Position of the track in the container's track list. MP4 metadata
+    /// boxes are indexed by this value, not by the audio-only ordinal.
+    track_index: usize,
 }
 
 /// Lists the audio tracks in a file so callers can choose one before
@@ -1478,6 +1486,112 @@ pub fn audio_tracks(input: &[u8], extension: &str) -> Result<Vec<AudioTrackInfo>
         .into_iter()
         .map(|entry| entry.info)
         .collect())
+}
+
+/// Lists tracks from a file without loading the whole file. Only container
+/// headers and the first packets needed to identify the codec are read.
+pub fn audio_tracks_from_path(path: &Path) -> Result<Vec<AudioTrackInfo>, ConvertError> {
+    Ok(audio_track_entries_from_path(path)?
+        .into_iter()
+        .map(|entry| entry.info)
+        .collect())
+}
+
+fn audio_track_entries_from_path(path: &Path) -> Result<Vec<AudioTrackEntry>, ConvertError> {
+    let extension = file_extension(&path.to_string_lossy());
+    let mut file = File::open(path)?;
+    let mut head = [0_u8; 64 * 1024];
+    let read = file.read(&mut head)?;
+    let head = &head[..read];
+
+    if extension == "flac" || head.starts_with(b"fLaC") {
+        let mut file = File::open(path)?;
+        skip_id3v2_file(&mut file)?;
+        let reader = claxon::FlacReader::new(file).map_err(|error| {
+            ConvertError::Audio(format!("could not open the FLAC stream: {error}"))
+        })?;
+        let info = reader.streaminfo();
+        return Ok(vec![AudioTrackEntry {
+            info: AudioTrackInfo {
+                id: 1,
+                codec: "FLAC".to_owned(),
+                language: None,
+                title: None,
+                channels: info.channels as usize,
+                sample_rate: info.sample_rate,
+                default: true,
+            },
+            kind: AudioCodecKind::Symphonia,
+            track_index: 0,
+        }]);
+    }
+    if is_ogg_opus(head) {
+        use opus_pure::OggOpusReader;
+        let reader = OggOpusReader::new(File::open(path)?).map_err(|error| {
+            ConvertError::Audio(format!("could not open the Opus stream: {error}"))
+        })?;
+        let head = reader.head();
+        return Ok(vec![AudioTrackEntry {
+            info: AudioTrackInfo {
+                id: 1,
+                codec: "Opus".to_owned(),
+                language: None,
+                title: None,
+                channels: head.channel_count as usize,
+                sample_rate: 48_000,
+                default: true,
+            },
+            kind: AudioCodecKind::Opus,
+            track_index: 0,
+        }]);
+    }
+    if is_raw_ac3(head, &extension) {
+        let header = filmcraft_ac3::parse_header(head).map_err(|error| {
+            ConvertError::Audio(format!("could not read the AC-3 stream: {error}"))
+        })?;
+        return Ok(vec![AudioTrackEntry {
+            info: AudioTrackInfo {
+                id: 1,
+                codec: ac3_codec_label(&header).to_owned(),
+                language: None,
+                title: None,
+                channels: header.channels(),
+                sample_rate: header.sample_rate,
+                default: true,
+            },
+            kind: AudioCodecKind::Ac3,
+            track_index: 0,
+        }]);
+    }
+
+    let format = probe_symphonia_file(File::open(path)?, &extension)?;
+    let moov = if is_mp4_extension(&extension) {
+        read_mp4_moov(path)
+    } else {
+        None
+    };
+    audio_track_entries_from_format(format, moov.as_deref())
+}
+
+/// Skips an ID3v2 tag at the start of a file, leaving the reader positioned at
+/// the first audio byte. Non-ID3 files are left at the start.
+fn skip_id3v2_file(file: &mut File) -> Result<(), ConvertError> {
+    let mut header = [0_u8; 10];
+    if file.read_exact(&mut header).is_err() {
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(());
+    }
+    if &header[..3] != b"ID3" {
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(());
+    }
+    let size = ((header[6] as u64 & 0x7f) << 21)
+        | ((header[7] as u64 & 0x7f) << 14)
+        | ((header[8] as u64 & 0x7f) << 7)
+        | (header[9] as u64 & 0x7f);
+    let footer = if header[5] & 0x10 != 0 { 10 } else { 0 };
+    file.seek(SeekFrom::Start(10 + size + footer))?;
+    Ok(())
 }
 
 fn audio_track_entries(
@@ -1501,6 +1615,7 @@ fn audio_track_entries(
                 default: true,
             },
             kind: AudioCodecKind::Symphonia,
+            track_index: 0,
         }]);
     }
     if is_ogg_opus(input) {
@@ -1520,6 +1635,7 @@ fn audio_track_entries(
                 default: true,
             },
             kind: AudioCodecKind::Opus,
+            track_index: 0,
         }]);
     }
     if is_raw_ac3(input, extension) {
@@ -1537,6 +1653,7 @@ fn audio_track_entries(
                 default: true,
             },
             kind: AudioCodecKind::Ac3,
+            track_index: 0,
         }]);
     }
     symphonia_audio_track_entries(input, extension)
@@ -1546,9 +1663,20 @@ fn symphonia_audio_track_entries(
     input: &[u8],
     extension: &str,
 ) -> Result<Vec<AudioTrackEntry>, ConvertError> {
-    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    let format = probe_symphonia(input, extension)?;
+    let moov = if is_mp4_container(input) {
+        mp4_find(input, b"moov")
+    } else {
+        None
+    };
+    audio_track_entries_from_format(format, moov)
+}
 
-    let mut format = probe_symphonia(input, extension)?;
+fn audio_track_entries_from_format(
+    mut format: Box<dyn symphonia::core::formats::FormatReader>,
+    moov: Option<&[u8]>,
+) -> Result<Vec<AudioTrackEntry>, ConvertError> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
     let tracks: Vec<(
         u32,
         symphonia::core::codecs::CodecParameters,
@@ -1582,8 +1710,10 @@ fn symphonia_audio_track_entries(
 
     let mut entries = Vec::new();
     for (track_index, (id, codec_params, mut language)) in tracks.into_iter().enumerate() {
-        if language.is_none() && is_mp4_container(input) {
-            language = mp4_track_language(input, track_index);
+        if language.is_none() {
+            if let Some(moov) = moov {
+                language = mp4_track_language(moov, track_index);
+            }
         }
         let first_packet = first_packets
             .iter()
@@ -1594,63 +1724,64 @@ fn symphonia_audio_track_entries(
             .filter(|data| data.starts_with(&[0x0B, 0x77]))
             .and_then(|data| filmcraft_ac3::parse_header(data).ok());
 
-        let (kind, codec, channels, sample_rate) = if codec_params.codec
-            == symphonia::core::codecs::CODEC_TYPE_OPUS
-        {
-            let (channels, _) = opus_stream_info(&codec_params).unwrap_or((0, 0));
-            (
-                AudioCodecKind::Opus,
-                "Opus".to_owned(),
-                channels,
-                codec_params.sample_rate.unwrap_or(48_000),
-            )
-        } else if let Some(header) = ac3_header {
-            (
-                AudioCodecKind::Ac3,
-                ac3_codec_label(&header).to_owned(),
-                header.channels(),
-                header.sample_rate,
-            )
-        } else if known_audio {
-            let mut channels = codec_params
-                .channels
-                .map(|channels| channels.count())
-                .unwrap_or(0);
-            let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
-            if (channels == 0 || sample_rate == 0) && is_mp4_container(input) {
-                if let Some((mp4_channels, mp4_rate)) = mp4_track_audio_layout(input, track_index) {
-                    if channels == 0 {
-                        channels = mp4_channels;
-                    }
-                    if sample_rate == 0 {
-                        sample_rate = mp4_rate;
-                    }
-                }
-            }
-            (
-                AudioCodecKind::Symphonia,
-                symphonia_codec_label(codec_params.codec).to_owned(),
-                channels,
-                sample_rate,
-            )
-        } else if codec_params.codec == CODEC_TYPE_NULL
-            && (codec_params.sample_rate.is_some() || codec_params.channels.is_some())
-        {
-            // A container that declares audio metadata but uses a codec
-            // Symphonia does not know still gets listed; decoding reports a
-            // clear error if it cannot handle the packets.
-            (
-                AudioCodecKind::Symphonia,
-                "Unknown".to_owned(),
-                codec_params
+        let (kind, codec, channels, sample_rate) =
+            if codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+                let (channels, _) = opus_stream_info(&codec_params).unwrap_or((0, 0));
+                (
+                    AudioCodecKind::Opus,
+                    "Opus".to_owned(),
+                    channels,
+                    codec_params.sample_rate.unwrap_or(48_000),
+                )
+            } else if let Some(header) = ac3_header {
+                (
+                    AudioCodecKind::Ac3,
+                    ac3_codec_label(&header).to_owned(),
+                    header.channels(),
+                    header.sample_rate,
+                )
+            } else if known_audio {
+                let mut channels = codec_params
                     .channels
                     .map(|channels| channels.count())
-                    .unwrap_or(0),
-                codec_params.sample_rate.unwrap_or(0),
-            )
-        } else {
-            continue;
-        };
+                    .unwrap_or(0);
+                let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+                if channels == 0 || sample_rate == 0 {
+                    if let Some((mp4_channels, mp4_rate)) =
+                        moov.and_then(|moov| mp4_track_audio_layout(moov, track_index))
+                    {
+                        if channels == 0 {
+                            channels = mp4_channels;
+                        }
+                        if sample_rate == 0 {
+                            sample_rate = mp4_rate;
+                        }
+                    }
+                }
+                (
+                    AudioCodecKind::Symphonia,
+                    symphonia_codec_label(codec_params.codec).to_owned(),
+                    channels,
+                    sample_rate,
+                )
+            } else if codec_params.codec == CODEC_TYPE_NULL
+                && (codec_params.sample_rate.is_some() || codec_params.channels.is_some())
+            {
+                // A container that declares audio metadata but uses a codec
+                // Symphonia does not know still gets listed; decoding reports a
+                // clear error if it cannot handle the packets.
+                (
+                    AudioCodecKind::Symphonia,
+                    "Unknown".to_owned(),
+                    codec_params
+                        .channels
+                        .map(|channels| channels.count())
+                        .unwrap_or(0),
+                    codec_params.sample_rate.unwrap_or(0),
+                )
+            } else {
+                continue;
+            };
 
         entries.push(AudioTrackEntry {
             info: AudioTrackInfo {
@@ -1663,6 +1794,7 @@ fn symphonia_audio_track_entries(
                 default: entries.is_empty(),
             },
             kind,
+            track_index,
         });
     }
 
@@ -1762,12 +1894,27 @@ fn probe_symphonia(
     input: &[u8],
     extension: &str,
 ) -> Result<Box<dyn symphonia::core::formats::FormatReader>, ConvertError> {
+    probe_symphonia_source(Box::new(Cursor::new(input.to_vec())), extension)
+}
+
+fn probe_symphonia_file(
+    mut file: File,
+    extension: &str,
+) -> Result<Box<dyn symphonia::core::formats::FormatReader>, ConvertError> {
+    skip_id3v2_file(&mut file)?;
+    probe_symphonia_source(Box::new(file), extension)
+}
+
+fn probe_symphonia_source(
+    source: Box<dyn symphonia::core::io::MediaSource>,
+    extension: &str,
+) -> Result<Box<dyn symphonia::core::formats::FormatReader>, ConvertError> {
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let source = MediaSourceStream::new(Box::new(Cursor::new(input.to_vec())), Default::default());
+    let source = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     hint.with_extension(extension);
     symphonia::default::get_probe()
@@ -1793,6 +1940,7 @@ fn decode_audio(
         available: entries.len(),
     })?;
     let track_id = entry.info.id;
+    let track_index = entry.track_index;
     let track_channels = entry.info.channels;
     let kind = entry.kind;
 
@@ -1905,13 +2053,8 @@ fn decode_audio(
 
     // MP4 edit lists carry the AAC encoder delay and the intended duration.
     // Symphonia exposes neither, so apply them here for non-Opus tracks.
-    if is_mp4_container(input) {
-        let track_index = format
-            .tracks()
-            .iter()
-            .position(|candidate| candidate.id == track_id)
-            .unwrap_or(0);
-        if let Some((skip, total)) = mp4_gapless_info(input, track_index) {
+    if let Some(moov) = mp4_find(input, b"moov") {
+        if let Some((skip, total)) = mp4_gapless_info(moov, track_index) {
             let frames = samples.len() / channels;
             let skip = skip.min(frames);
             samples.drain(..skip * channels);
@@ -1940,6 +2083,48 @@ fn decode_audio(
 
 fn is_mp4_container(input: &[u8]) -> bool {
     input.get(4..8).is_some_and(|kind| kind == b"ftyp")
+}
+
+fn is_mp4_extension(extension: &str) -> bool {
+    matches!(extension, "mp4" | "m4a" | "m4v" | "mov")
+}
+
+/// Reads just the `moov` box from an MP4 file, seeking over the media data.
+/// Metadata such as edit lists and track languages lives in this box.
+fn read_mp4_moov(path: &Path) -> Option<Vec<u8>> {
+    const MAX_MOOV_BYTES: u64 = 64 * 1024 * 1024;
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut position = 0_u64;
+    while position.checked_add(8)? <= length {
+        file.seek(SeekFrom::Start(position)).ok()?;
+        let mut header = [0_u8; 8];
+        file.read_exact(&mut header).ok()?;
+        let size32 = u32::from_be_bytes(header[..4].try_into().ok()?) as u64;
+        let (header_size, size) = if size32 == 1 {
+            let mut large = [0_u8; 8];
+            file.read_exact(&mut large).ok()?;
+            (16, u64::from_be_bytes(large))
+        } else if size32 == 0 {
+            (8, length - position)
+        } else {
+            (8, size32)
+        };
+        if size < header_size || position.checked_add(size)? > length {
+            return None;
+        }
+        if &header[4..8] == b"moov" {
+            if size > MAX_MOOV_BYTES {
+                return None;
+            }
+            let mut moov = vec![0_u8; size as usize];
+            file.seek(SeekFrom::Start(position)).ok()?;
+            file.read_exact(&mut moov).ok()?;
+            return Some(moov[header_size as usize..].to_vec());
+        }
+        position += size;
+    }
+    None
 }
 
 fn is_ogg_opus(input: &[u8]) -> bool {
@@ -2382,8 +2567,7 @@ fn mp4_find<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
 }
 
 /// Reads the ISO 639-2 language code from an MP4 track's media header.
-fn mp4_track_language(input: &[u8], track_index: usize) -> Option<String> {
-    let moov = mp4_find(input, b"moov")?;
+fn mp4_track_language(moov: &[u8], track_index: usize) -> Option<String> {
     let traks: Vec<&[u8]> = mp4_child_boxes(moov)
         .into_iter()
         .filter(|(kind, _)| kind == b"trak")
@@ -2409,8 +2593,7 @@ fn mp4_track_language(input: &[u8], track_index: usize) -> Option<String> {
 
 /// Reads the channel count and sample rate from an MP4 audio sample entry.
 /// Symphonia leaves these unset for some AAC tracks until the first frame.
-fn mp4_track_audio_layout(input: &[u8], track_index: usize) -> Option<(usize, u32)> {
-    let moov = mp4_find(input, b"moov")?;
+fn mp4_track_audio_layout(moov: &[u8], track_index: usize) -> Option<(usize, u32)> {
     let traks: Vec<&[u8]> = mp4_child_boxes(moov)
         .into_iter()
         .filter(|(kind, _)| kind == b"trak")
@@ -2439,8 +2622,7 @@ fn mp4_timescale(mvhd_or_mdhd: &[u8]) -> Option<u32> {
 
 /// Returns the AAC priming skip and intended duration from an MP4 edit list
 /// (or iTunes' `iTunSMPB` tag), both in media samples.
-fn mp4_gapless_info(input: &[u8], track_index: usize) -> Option<(usize, Option<usize>)> {
-    let moov = mp4_find(input, b"moov")?;
+fn mp4_gapless_info(moov: &[u8], track_index: usize) -> Option<(usize, Option<usize>)> {
     let movie_timescale = mp4_timescale(mp4_find(moov, b"mvhd")?)?;
     let traks: Vec<&[u8]> = mp4_child_boxes(moov)
         .into_iter()
@@ -2847,6 +3029,11 @@ pub fn wav_output_name(input_name: &str) -> PathBuf {
     output_name(input_name, "wav")
 }
 
+/// The output name for a streaming audio conversion.
+pub fn audio_output_name(input_name: &str, target: OutputFormat) -> PathBuf {
+    output_name(input_name, target.extension())
+}
+
 fn encode_wav(audio: &DecodedAudio, bit_depth: AudioBitDepth) -> Result<Vec<u8>, ConvertError> {
     let mut output = Vec::new();
     write_wav(&mut output, audio, bit_depth)?;
@@ -3230,7 +3417,15 @@ fn encode_flac(audio: &DecodedAudio, bit_depth: AudioBitDepth) -> Result<Vec<u8>
         bits as usize,
         audio.sample_rate as usize,
     );
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+    let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|error| ConvertError::Audio(error.to_string()))?;
+    // The encoder reports the shortest block (the final partial block) as the
+    // minimum, but writes fixed-block frame numbers. Readers such as Symphonia
+    // treat that as a variable-block stream and reject the frames, so describe
+    // the stream as fixed-size. A shorter final block is still valid FLAC.
+    stream
+        .stream_info_mut()
+        .set_block_sizes(config.block_size, config.block_size)
         .map_err(|error| ConvertError::Audio(error.to_string()))?;
     let mut sink = flacenc::bitsink::ByteSink::new();
     stream
@@ -4926,13 +5121,14 @@ mod tests {
         assert!(matches!(error, ConvertError::Unsupported { .. }));
     }
 
+    fn fixture_path(name: &str) -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
+    }
+
     fn fixture(name: &str) -> Vec<u8> {
-        std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata")
-                .join(name),
-        )
-        .unwrap()
+        std::fs::read(fixture_path(name)).unwrap()
     }
 
     /// Returns (format tag, channels, sample rate, bits, data offset, data size).
@@ -4980,6 +5176,385 @@ mod tests {
             wav_output_name("tone.wav"),
             std::path::PathBuf::from("tone.wav")
         );
+    }
+
+    fn stream_temp_dir(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-stream-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn stream_wav(input: &Path, options: ConversionOptions) -> Vec<u8> {
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            input,
+            &input.file_name().unwrap().to_string_lossy(),
+            OutputFormat::Wav,
+            options,
+            &mut output,
+        )
+        .unwrap();
+        output.into_inner()
+    }
+
+    #[test]
+    fn streaming_cancellation_stops_the_conversion() {
+        let directory = stream_temp_dir("cancel");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut output = std::io::Cursor::new(Vec::new());
+        let error = super::convert_audio_file_to_writer_with_cancel(
+            &input,
+            "tone.wav",
+            OutputFormat::Wav,
+            ConversionOptions::default(),
+            &mut output,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::Cancelled));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_wav_to_wav_from_a_file() {
+        let directory = stream_temp_dir("wav-wav");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let output = stream_wav(&input, ConversionOptions::default());
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_wav_to_flac_from_a_file() {
+        let directory = stream_temp_dir("wav-flac");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Flac,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let mut reader =
+            claxon::FlacReader::new(std::io::Cursor::new(output.into_inner())).unwrap();
+        let samples: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), 16_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_wav_to_opus_from_a_file() {
+        let directory = stream_temp_dir("wav-opus");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Opus,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let bytes = output.into_inner();
+        assert!(bytes.starts_with(b"OggS"));
+
+        let mut reader = opus_pure::OggOpusReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let head = reader.head().clone();
+        let channels = head.channel_count as usize;
+        let mut decoder = head.decoder(48_000).unwrap();
+        let mut trim = opus_pure::Trim::new(&head, 48_000, channels).unwrap();
+        let mut block = vec![0.0; opus_pure::MAX_PACKET_SAMPLES * channels];
+        let mut frames = 0;
+        for packet in reader.packets() {
+            let packet = packet.unwrap();
+            let decoded = decoder
+                .decode(&packet.data, opus_pure::MAX_PACKET_SAMPLES, &mut block)
+                .unwrap();
+            frames += trim.keep(&packet, &block[..decoded * channels]).len() / channels;
+        }
+        assert_eq!(frames, 48_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_wav_to_aiff_and_au_from_a_file() {
+        let directory = stream_temp_dir("wav-aiff-au");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        for target in [OutputFormat::Aiff, OutputFormat::Au] {
+            let mut output = std::io::Cursor::new(Vec::new());
+            super::convert_audio_file_to_writer(
+                &input,
+                "tone.wav",
+                target,
+                ConversionOptions::default(),
+                &mut output,
+            )
+            .unwrap();
+            let bytes = output.into_inner();
+            if target == OutputFormat::Aiff {
+                assert_eq!(&bytes[..4], b"FORM");
+                assert_eq!(
+                    u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize + 8,
+                    bytes.len()
+                );
+                assert_eq!(u32::from_be_bytes(bytes[22..26].try_into().unwrap()), 8_000);
+                assert_eq!(
+                    u32::from_be_bytes(bytes[42..46].try_into().unwrap()) as usize + 46,
+                    bytes.len()
+                );
+            } else {
+                assert_eq!(&bytes[..4], b".snd");
+                assert_eq!(
+                    u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize + 24,
+                    bytes.len()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_24_bit_flac_from_a_file() {
+        let directory = stream_temp_dir("wav-flac-24");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap();
+        let mut reader =
+            claxon::FlacReader::new(std::io::Cursor::new(output.into_inner())).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 24);
+        assert_eq!(reader.streaminfo().samples, Some(8_000));
+        let samples: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), 16_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_wav_to_mp3_from_a_file() {
+        let directory = stream_temp_dir("wav-mp3");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Mp3,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let bytes = output.into_inner();
+        assert!(bytes.len() > 100);
+        assert!(bytes.starts_with(b"ID3") || bytes[0] == 0xFF);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_resampled_wav_from_a_file() {
+        let directory = stream_temp_dir("wav-resample");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.samples.len(), 88_200);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_flac_and_mp3_input_files() {
+        let directory = stream_temp_dir("encoded-input");
+        let source = wav_fixture();
+        for (name, format) in [
+            ("tone.flac", OutputFormat::Flac),
+            ("tone.mp3", OutputFormat::Mp3),
+        ] {
+            let encoded = super::convert_bytes_with_options(
+                "tone.wav",
+                &source,
+                format,
+                ConversionOptions::default(),
+            )
+            .unwrap()
+            .remove(0)
+            .bytes;
+            let input = directory.join(name);
+            std::fs::write(&input, encoded).unwrap();
+            let output = stream_wav(&input, ConversionOptions::default());
+            let parsed = parse_wav(&output);
+            assert_eq!(parsed.sample_rate, 8_000);
+            if name == "tone.flac" {
+                assert_eq!(parsed.samples.len(), 16_000);
+                assert_eq!(parsed.samples, parse_wav(&source).samples);
+            } else {
+                assert!(parsed.samples.len() >= 15_000);
+                assert!(parsed.samples.len() <= 17_000);
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_raw_and_matroska_ac3_tracks() {
+        for (name, expected_channels) in [("sample-ac3.ac3", 6), ("sample-eac3.mkv", 6)] {
+            let input = std::path::Path::new("testdata").join(name);
+            let output = stream_wav(&input, ConversionOptions::default());
+            let parsed = parse_wav(&output);
+            assert_eq!(parsed.channels, expected_channels);
+            assert_eq!(
+                parsed.samples.len(),
+                96_768 * usize::from(expected_channels)
+            );
+            assert_audible(&parsed.samples);
+        }
+    }
+
+    #[test]
+    fn streams_short_and_downsampled_audio() {
+        let directory = stream_temp_dir("resample-edges");
+        for (source_rate, frames, target_rate, expected_frames) in [
+            (44_100, 44_100, 8_000, 8_000),
+            (48_000, 48_000, 44_100, 44_100),
+            (8_000, 1, 44_100, 6),
+            (8_000, 2, 48_000, 12),
+        ] {
+            let input = directory.join(format!("tone-{source_rate}-{frames}.wav"));
+            std::fs::write(&input, wav_fixture_at(source_rate, frames)).unwrap();
+            let output = stream_wav(
+                &input,
+                ConversionOptions {
+                    audio_sample_rate: Some(target_rate),
+                    ..Default::default()
+                },
+            );
+            let parsed = parse_wav(&output);
+            assert_eq!(parsed.sample_rate, target_rate);
+            assert_eq!(parsed.samples.len(), expected_frames * 2);
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn streams_a_selected_opus_track_from_a_file() {
+        let output = stream_wav(
+            &fixture_path("sample-two-opus-tracks.webm"),
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 48_480);
+        assert_audible(&parsed.samples);
+
+        let resampled = stream_wav(
+            &fixture_path("sample-two-opus-tracks.webm"),
+            ConversionOptions {
+                audio_track: Some(1),
+                audio_sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&resampled);
+        let expected_frames = (48_480.0_f64 * 44_100.0 / 48_000.0).round() as usize;
+        assert_eq!(parsed.samples.len(), expected_frames);
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
+    fn streams_mp4_gapless_audio_from_a_file() {
+        let output = stream_wav(
+            &fixture_path("sample-aac.m4a"),
+            ConversionOptions::default(),
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 88_200);
+        assert_audible(&parsed.samples);
+
+        let resampled = stream_wav(
+            &fixture_path("sample-aac.m4a"),
+            ConversionOptions {
+                audio_sample_rate: Some(48_000),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&resampled);
+        let expected_frames = (88_200.0_f64 * 48_000.0 / 44_100.0).round() as usize;
+        assert_eq!(
+            parsed.samples.len(),
+            expected_frames * usize::from(parsed.channels)
+        );
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
+    fn streams_ac3_to_stereo_without_clipping() {
+        let output = stream_wav(
+            &fixture_path("sample-ac3.mkv"),
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 96_768 * 2);
+        assert_audible(&parsed.samples);
+        let saturated = parsed
+            .samples
+            .iter()
+            .filter(|sample| **sample == i16::MAX || **sample == i16::MIN)
+            .count();
+        assert!(
+            saturated < parsed.samples.len() / 100,
+            "the downmix hard-clipped too many samples"
+        );
+    }
+
+    #[test]
+    fn lists_tracks_from_a_file_without_loading_it() {
+        let tracks =
+            super::audio_tracks_from_path(&fixture_path("sample-two-opus-tracks.webm")).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].codec, "Opus");
+        assert_eq!(tracks[1].id, 2);
+
+        let tracks = super::audio_tracks_from_path(&fixture_path("sample-video.mp4")).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AAC");
+        assert_eq!(tracks[0].channels, 1);
+
+        let tracks = super::audio_tracks_from_path(&fixture_path("sample-ac3.mkv")).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AC-3");
+        assert_eq!(tracks[0].channels, 6);
     }
 
     #[test]
