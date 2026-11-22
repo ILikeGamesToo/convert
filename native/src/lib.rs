@@ -2836,11 +2836,7 @@ mod tests {
         let decoded = parse_wav(&back[0].bytes);
         assert_eq!(decoded.sample_rate, 48_000);
         assert_eq!(decoded.channels, 2);
-        assert!(
-            (decoded.samples.len() as i64 - 96_000).abs() <= 1_000,
-            "decoded {} samples",
-            decoded.samples.len()
-        );
+        assert_eq!(decoded.samples.len(), 96_000);
         assert_audible(&decoded.samples);
 
         let mono = convert_bytes_with_options(
@@ -2855,15 +2851,12 @@ mod tests {
         .unwrap();
         let mono_back = convert_bytes("tone.opus", &mono[0].bytes, OutputFormat::Wav).unwrap();
         let mono_decoded = parse_wav(&mono_back[0].bytes);
+        assert_eq!(mono_decoded.sample_rate, 48_000);
         assert_eq!(mono_decoded.channels, 1);
-        assert!(
-            (mono_decoded.samples.len() as i64 - 48_000).abs() <= 1_000,
-            "decoded {} samples",
-            mono_decoded.samples.len()
-        );
+        assert_eq!(mono_decoded.samples.len(), 48_000);
         assert_audible(&mono_decoded.samples);
 
-        let resampled = convert_bytes_with_options(
+        let sixteen_k = convert_bytes_with_options(
             "tone.wav",
             &wav,
             OutputFormat::Opus,
@@ -2873,16 +2866,32 @@ mod tests {
             },
         )
         .unwrap();
-        let resampled_back =
-            convert_bytes("tone.opus", &resampled[0].bytes, OutputFormat::Wav).unwrap();
-        let resampled_decoded = parse_wav(&resampled_back[0].bytes);
-        assert_eq!(resampled_decoded.sample_rate, 48_000);
-        assert!(
-            (resampled_decoded.samples.len() as i64 - 96_000).abs() <= 1_000,
-            "decoded {} samples",
-            resampled_decoded.samples.len()
-        );
-        assert_audible(&resampled_decoded.samples);
+        let sixteen_k_back =
+            convert_bytes("tone.opus", &sixteen_k[0].bytes, OutputFormat::Wav).unwrap();
+        let sixteen_k_decoded = parse_wav(&sixteen_k_back[0].bytes);
+        assert_eq!(sixteen_k_decoded.sample_rate, 48_000);
+        assert_eq!(sixteen_k_decoded.samples.len(), 96_000);
+        assert_audible(&sixteen_k_decoded.samples);
+
+        // 44.1 kHz is the app's default sample-rate setting, but Opus encodes
+        // at 48 kHz, so this covers the default-rate resampling path.
+        let default_rate = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let default_rate_back =
+            convert_bytes("tone.opus", &default_rate[0].bytes, OutputFormat::Wav).unwrap();
+        let default_rate_decoded = parse_wav(&default_rate_back[0].bytes);
+        assert_eq!(default_rate_decoded.sample_rate, 48_000);
+        assert_eq!(default_rate_decoded.channels, 2);
+        assert_eq!(default_rate_decoded.samples.len(), 96_000);
+        assert_audible(&default_rate_decoded.samples);
     }
 
     #[test]
