@@ -26,6 +26,7 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+opus-pure = "0.2.3"
 pdf-writer = "0.15"
 rfd = "0.15"
 resvg = "0.50"

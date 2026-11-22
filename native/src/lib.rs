@@ -1162,9 +1162,12 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
     if extension == "flac" || input.starts_with(b"fLaC") {
         return decode_flac(input);
     }
+    if is_ogg_opus(input) {
+        return decode_ogg_opus(input);
+    }
 
     use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_OPUS};
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
@@ -1186,19 +1189,27 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
         })?;
     let mut format = probed.format;
 
-    let track = format
-        .tracks()
-        .iter()
-        .find(|track| track.codec_params.channels.is_some())
-        .or_else(|| {
-            format
-                .tracks()
-                .iter()
-                .find(|track| track.codec_params.sample_rate.is_some())
-        })
-        .ok_or(ConvertError::NoAudioTrack)?;
-    let track_id = track.id;
-    let codec_params = track.codec_params.clone();
+    let (track_id, codec_params) = {
+        let track = format
+            .tracks()
+            .iter()
+            .find(|track| {
+                track.codec_params.channels.is_some() || track.codec_params.codec == CODEC_TYPE_OPUS
+            })
+            .or_else(|| {
+                format
+                    .tracks()
+                    .iter()
+                    .find(|track| track.codec_params.sample_rate.is_some())
+            })
+            .ok_or(ConvertError::NoAudioTrack)?;
+        (track.id, track.codec_params.clone())
+    };
+
+    if codec_params.codec == CODEC_TYPE_OPUS {
+        return decode_opus_track(format.as_mut(), track_id, &codec_params);
+    }
+
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
         .map_err(|error| {
@@ -1267,6 +1278,140 @@ fn decode_audio(input: &[u8], extension: &str) -> Result<DecodedAudio, ConvertEr
         channels,
         sample_rate,
     })
+}
+
+fn is_ogg_opus(input: &[u8]) -> bool {
+    input.starts_with(b"OggS") && input.get(28..36).is_some_and(|magic| magic == b"OpusHead")
+}
+
+fn opus_channels(channels: usize) -> Result<usize, ConvertError> {
+    if channels > 2 {
+        return Err(ConvertError::Audio(
+            "multichannel Opus audio is not supported".to_owned(),
+        ));
+    }
+    Ok(channels)
+}
+
+fn append_audio_samples(samples: &mut Vec<f32>, decoded: &[f32]) -> Result<(), ConvertError> {
+    samples.extend_from_slice(decoded);
+    if samples.len() > MAX_AUDIO_SAMPLES {
+        return Err(ConvertError::AudioTooLarge);
+    }
+    Ok(())
+}
+
+fn decode_ogg_opus(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
+    use opus_pure::{OggOpusReader, Trim, MAX_PACKET_SAMPLES};
+
+    let mut reader = OggOpusReader::new(Cursor::new(input))
+        .map_err(|error| ConvertError::Audio(format!("could not open the Opus stream: {error}")))?;
+    let head = reader.head().clone();
+    let channels = opus_channels(head.channel_count as usize)?;
+    let mut decoder = head.decoder(48_000).map_err(|error| {
+        ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
+    })?;
+    let mut trim = Trim::new(&head, 48_000, channels)
+        .map_err(|error| ConvertError::Audio(format!("could not read the Opus stream: {error}")))?;
+    let mut block = vec![0.0f32; MAX_PACKET_SAMPLES * channels];
+    let mut samples = Vec::new();
+
+    for packet in reader.packets() {
+        let packet = packet.map_err(|error| {
+            ConvertError::Audio(format!("could not read Opus packets: {error}"))
+        })?;
+        let decoded = decoder
+            .decode(&packet.data, MAX_PACKET_SAMPLES, &mut block)
+            .map_err(|error| {
+                ConvertError::Audio(format!("could not decode Opus audio: {error}"))
+            })?;
+        append_audio_samples(
+            &mut samples,
+            trim.keep(&packet, &block[..decoded * channels]),
+        )?;
+    }
+
+    if samples.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate: 48_000,
+    })
+}
+
+fn decode_opus_track(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track_id: u32,
+    codec_params: &symphonia::core::codecs::CodecParameters,
+) -> Result<DecodedAudio, ConvertError> {
+    use opus_pure::{OpusDecoder, MAX_PACKET_SAMPLES};
+
+    let (channels, pre_skip) = opus_stream_info(codec_params)?;
+    let mut decoder = OpusDecoder::new(48_000, channels).map_err(|error| {
+        ConvertError::Audio(format!("could not start the Opus decoder: {error}"))
+    })?;
+    let mut block = vec![0.0f32; MAX_PACKET_SAMPLES * channels];
+    let mut samples = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(error) if is_end_of_stream(&error) => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(error) => {
+                return Err(ConvertError::Audio(format!(
+                    "could not read audio packets: {error}"
+                )))
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = decoder
+            .decode(&packet.data, MAX_PACKET_SAMPLES, &mut block)
+            .map_err(|error| {
+                ConvertError::Audio(format!("could not decode Opus audio: {error}"))
+            })?;
+        append_audio_samples(&mut samples, &block[..decoded * channels])?;
+    }
+
+    let skip = (pre_skip as usize * channels).min(samples.len());
+    samples.drain(..skip);
+
+    if samples.is_empty() {
+        return Err(ConvertError::NoAudioTrack);
+    }
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate: 48_000,
+    })
+}
+
+fn opus_stream_info(
+    codec_params: &symphonia::core::codecs::CodecParameters,
+) -> Result<(usize, u32), ConvertError> {
+    let head = codec_params
+        .extra_data
+        .as_deref()
+        .filter(|data| data.len() >= 19 && data.starts_with(b"OpusHead"));
+    let channels = codec_params
+        .channels
+        .map(|channels| channels.count())
+        .or_else(|| head.map(|data| usize::from(data[9])))
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| {
+            ConvertError::Audio("the Opus track does not declare a channel count".to_owned())
+        })?;
+    let channels = opus_channels(channels)?;
+    let pre_skip = codec_params
+        .delay
+        .or_else(|| head.map(|data| u32::from(u16::from_le_bytes([data[10], data[11]]))))
+        .unwrap_or(0);
+    Ok((channels, pre_skip))
 }
 
 fn decode_flac(input: &[u8]) -> Result<DecodedAudio, ConvertError> {
@@ -2755,6 +2900,76 @@ mod tests {
         assert_eq!(parsed.channels, 1);
         assert!(
             parsed.samples.len() >= 100_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
+    fn extracts_audio_from_a_video_with_opus() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-opus.webm");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("sample-opus.webm", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            parsed.samples.len() >= 200_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
+    fn extracts_audio_from_an_mp4_with_opus() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-opus.mp4");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("sample-opus.mp4", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            parsed.samples.len() >= 200_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+
+    #[test]
+    fn decodes_ogg_opus_audio() {
+        use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
+
+        let sample_rate = 48_000;
+        let frame_size = 960;
+        let mut encoder = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
+        let head = OpusHead::for_encoder(&encoder, sample_rate as u32);
+        let mut writer = OggOpusWriter::new(Vec::new(), head).unwrap();
+        let mut packet = vec![0_u8; MAX_PACKET_BYTES];
+        for frame in 0..50 {
+            let pcm: Vec<f32> = (0..frame_size)
+                .map(|index| {
+                    let time = (frame * frame_size + index) as f32 / sample_rate as f32;
+                    (time * 440.0 * std::f32::consts::TAU).sin() * 0.5
+                })
+                .collect();
+            let len = encoder.encode(&pcm, frame_size, &mut packet).unwrap();
+            writer.write_packet(&packet[..len]).unwrap();
+        }
+        let bytes = writer.finish().unwrap();
+
+        let wav = convert_bytes("tone.opus", &bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 1);
+        assert!(
+            parsed.samples.len() >= 40_000,
             "decoded only {} samples",
             parsed.samples.len()
         );

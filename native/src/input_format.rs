@@ -29,6 +29,7 @@ pub enum InputFormat {
     Mp3,
     Flac,
     Ogg,
+    Opus,
     M4a,
     Aac,
     Aiff,
@@ -39,7 +40,7 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 29] = [
+    pub const SELECTABLE: [Self; 30] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -64,6 +65,7 @@ impl InputFormat {
         Self::Mp3,
         Self::Flac,
         Self::Ogg,
+        Self::Opus,
         Self::M4a,
         Self::Aac,
         Self::Aiff,
@@ -96,6 +98,7 @@ impl InputFormat {
             Self::Mp3 => "MP3 audio",
             Self::Flac => "FLAC audio",
             Self::Ogg => "OGG audio",
+            Self::Opus => "Opus audio",
             Self::M4a => "M4A audio",
             Self::Aac => "AAC audio",
             Self::Aiff => "AIFF audio",
@@ -131,6 +134,7 @@ impl InputFormat {
             Self::Mp3 => "MPEG audio",
             Self::Flac => "Free Lossless Audio Codec",
             Self::Ogg => "Ogg audio",
+            Self::Opus => "Opus audio",
             Self::M4a => "M4A or ALAC audio",
             Self::Aac => "Advanced Audio Coding",
             Self::Aiff => "Audio Interchange File Format",
@@ -165,6 +169,7 @@ impl InputFormat {
             Self::Mp3 => "MP3",
             Self::Flac => "FLAC",
             Self::Ogg => "OGG",
+            Self::Opus => "OPUS",
             Self::M4a => "M4A",
             Self::Aac => "AAC",
             Self::Aiff => "AIFF",
@@ -200,6 +205,7 @@ impl InputFormat {
             Self::Mp3 => "mp3",
             Self::Flac => "flac",
             Self::Ogg => "ogg",
+            Self::Opus => "opus",
             Self::M4a => "m4a",
             Self::Aac => "aac",
             Self::Aiff => "aiff",
@@ -306,6 +312,7 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "mp3" => InputFormat::Mp3,
         "flac" => InputFormat::Flac,
         "ogg" | "oga" => InputFormat::Ogg,
+        "opus" => InputFormat::Opus,
         "m4a" | "alac" => InputFormat::M4a,
         "aac" => InputFormat::Aac,
         "aiff" | "aif" => InputFormat::Aiff,
@@ -313,6 +320,10 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "zip" | "tar" | "gz" | "tgz" => InputFormat::Archive,
         _ => return None,
     })
+}
+
+fn is_ogg_opus(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"OggS") && bytes.get(28..36).is_some_and(|magic| magic == b"OpusHead")
 }
 
 fn sniff(bytes: &[u8]) -> Option<InputFormat> {
@@ -362,6 +373,9 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
     }
     if bytes.starts_with(b"fLaC") {
         return Some(InputFormat::Flac);
+    }
+    if is_ogg_opus(bytes) {
+        return Some(InputFormat::Opus);
     }
     if bytes.starts_with(b"OggS") {
         return Some(InputFormat::Ogg);
@@ -455,6 +469,7 @@ mod tests {
             ("song.flac", InputFormat::Flac),
             ("song.ogg", InputFormat::Ogg),
             ("song.oga", InputFormat::Ogg),
+            ("song.opus", InputFormat::Opus),
             ("song.m4a", InputFormat::M4a),
             ("song.aac", InputFormat::Aac),
             ("song.aiff", InputFormat::Aiff),
@@ -510,6 +525,14 @@ mod tests {
 
         let aiff = b"FORM\0\0\0\0AIFFCOMM";
         assert_eq!(detect_from_bytes("mystery.bin", aiff), InputFormat::Aiff);
+
+        let mut ogg_opus = vec![0_u8; 256];
+        ogg_opus[..4].copy_from_slice(b"OggS");
+        ogg_opus[28..36].copy_from_slice(b"OpusHead");
+        assert_eq!(
+            detect_from_bytes("mystery.ogg", &ogg_opus),
+            InputFormat::Opus
+        );
     }
 
     #[test]

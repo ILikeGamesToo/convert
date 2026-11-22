@@ -3381,6 +3381,7 @@ mod tests {
             InputFormat::Mp3,
             InputFormat::Flac,
             InputFormat::Ogg,
+            InputFormat::Opus,
             InputFormat::M4a,
             InputFormat::Aiff,
             InputFormat::Video,
