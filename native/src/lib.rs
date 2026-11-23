@@ -5,13 +5,18 @@ use std::{
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
 };
 
 use image::ImageEncoder;
 use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-mod input_extensions;
+pub mod input_extensions;
+pub mod input_format;
 mod streaming;
 pub use input_extensions::supported_input_extensions;
 pub use streaming::{convert_audio_file_to_writer, convert_audio_file_to_writer_with_cancel};
@@ -23,8 +28,10 @@ const MAX_IMAGE_DIMENSION: u32 = 32_768;
 const MAX_IMAGE_ALLOC: u64 = 512 * 1024 * 1024;
 const MAX_PDF_PAGES: usize = 5_000;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OutputFormat {
     Png,
     Jpeg,
@@ -59,20 +66,27 @@ pub enum OutputFormat {
     Au,
     Opus,
     Mp3,
+    /// Remux a compatible video into an MP4 container without re-encoding.
+    Mp4,
+    /// Remux a compatible video into WebM without re-encoding. Incompatible
+    /// codec/container pairs are rejected.
+    Webm,
     Zip,
     Tar,
     TarGz,
     Gzip,
+    /// Extract an archive into separate files instead of creating one.
+    Files,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AudioChannels {
     Mono,
     Stereo,
 }
 
 /// Sample format for WAV and FLAC output.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AudioBitDepth {
     #[default]
     Bit16,
@@ -102,7 +116,7 @@ impl AudioBitDepth {
 }
 
 /// Bitrate for MP3 output. MP3 is lossy, so sample bit depth does not apply.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mp3Bitrate {
     Kbps128,
     #[default]
@@ -199,7 +213,7 @@ impl AudioChannels {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PdfPageSize {
     A3,
     A4,
@@ -241,7 +255,7 @@ impl PdfPageSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PdfOrientation {
     Portrait,
     Landscape,
@@ -258,7 +272,7 @@ impl PdfOrientation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PdfImageFit {
     Contain,
     Cover,
@@ -276,7 +290,7 @@ impl PdfImageFit {
 }
 
 /// User-selected encoding options. `None` keeps the encoder's default.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConversionOptions {
     pub jpeg_quality: Option<u8>,
     pub png_compression: Option<u8>,
@@ -298,6 +312,10 @@ pub struct ConversionOptions {
     pub pdf_image_fit: PdfImageFit,
     pub pdf_font_size: u32,
     pub pdf_margin: u32,
+    /// Frame timestamp for video thumbnails. `0` starts at the beginning.
+    pub video_frame_time_ms: u32,
+    /// Optional width for video thumbnails. `0` keeps the source width.
+    pub video_thumbnail_width: u32,
 }
 
 impl Default for ConversionOptions {
@@ -318,6 +336,8 @@ impl Default for ConversionOptions {
             pdf_image_fit: Self::DEFAULT_PDF_IMAGE_FIT,
             pdf_font_size: Self::DEFAULT_PDF_FONT_SIZE,
             pdf_margin: Self::DEFAULT_PDF_MARGIN,
+            video_frame_time_ms: 0,
+            video_thumbnail_width: 0,
         }
     }
 }
@@ -328,6 +348,7 @@ impl ConversionOptions {
     pub const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 44_100;
     pub const DEFAULT_MP3_BITRATE: Mp3Bitrate = Mp3Bitrate::Kbps192;
     pub const MIN_AUDIO_SAMPLE_RATE: u32 = 1_000;
+    /// Opaque white, so transparent areas remain visible on common backgrounds.
     pub const DEFAULT_IMAGE_BACKGROUND: [u8; 3] = [255, 255, 255];
     /// FLAC's encoder accepts at most 96 kHz, so the shared audio control stays within that range.
     pub const MAX_AUDIO_SAMPLE_RATE: u32 = 96_000;
@@ -340,10 +361,12 @@ impl ConversionOptions {
     pub const DEFAULT_PDF_MARGIN: u32 = 72;
     pub const MIN_PDF_MARGIN: u32 = 0;
     pub const MAX_PDF_MARGIN: u32 = 144;
+    pub const MAX_VIDEO_FRAME_TIME_MS: u32 = 86_400_000;
+    pub const MAX_VIDEO_THUMBNAIL_WIDTH: u32 = 4_096;
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 40] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -377,10 +400,13 @@ impl OutputFormat {
         Self::Au,
         Self::Opus,
         Self::Mp3,
+        Self::Mp4,
+        Self::Webm,
         Self::Zip,
         Self::Tar,
         Self::TarGz,
         Self::Gzip,
+        Self::Files,
     ];
 
     pub fn label(self) -> &'static str {
@@ -418,10 +444,13 @@ impl OutputFormat {
             Self::Au => "AU audio",
             Self::Opus => "Opus audio",
             Self::Mp3 => "MP3 audio",
+            Self::Mp4 => "MP4 video (stream copy)",
+            Self::Webm => "WebM video (stream copy)",
             Self::Zip => "ZIP archive",
             Self::Tar => "TAR archive",
             Self::TarGz => "TAR.GZ archive",
             Self::Gzip => "GZIP compressed file",
+            Self::Files => "Extracted files",
         }
     }
 
@@ -443,7 +472,22 @@ impl OutputFormat {
         }
     }
 
-    fn extension(self) -> &'static str {
+    /// Whether this target is a video container handled by the external
+    /// ffmpeg stream-copy remux path.
+    pub fn is_video_target(self) -> bool {
+        matches!(self, Self::Mp4 | Self::Webm)
+    }
+
+    /// Whether this target needs transparency composited onto
+    /// `ConversionOptions::image_background` instead of preserving alpha.
+    pub fn uses_image_background(self) -> bool {
+        matches!(
+            self,
+            Self::Jpeg | Self::Bmp | Self::Hdr | Self::Ppm | Self::Pbm | Self::Pgm | Self::Pdf
+        )
+    }
+
+    pub fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpg",
@@ -478,21 +522,48 @@ impl OutputFormat {
             Self::Au => "au",
             Self::Opus => "opus",
             Self::Mp3 => "mp3",
+            Self::Mp4 => "mp4",
+            Self::Webm => "webm",
             Self::Zip => "zip",
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
             Self::Gzip => "gz",
+            Self::Files => "files",
         }
+    }
+
+    /// Resolves a user-facing extension such as `png`, `.jpg`, `tar.gz` or
+    /// `tgz` to an output format. Common aliases are accepted so the CLI and
+    /// GUI agree on names.
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        let extension = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let normalized = match extension.as_str() {
+            "jpeg" => "jpg",
+            "tif" => "tiff",
+            "aif" => "aiff",
+            "yml" => "yaml",
+            "tgz" => "tar.gz",
+            "gzip" => "gz",
+            "text" => "txt",
+            _ => extension.as_str(),
+        };
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.extension() == normalized)
     }
 
     /// Whether files with this name can be used as input for the format.
     pub fn supports_input(self, file_name: &str) -> bool {
         let extension = file_extension(file_name);
         match self {
-            Self::Png
-            | Self::Jpeg
-            | Self::Webp
-            | Self::Gif
+            Self::Png | Self::Jpeg | Self::Webp => {
+                is_image_input_extension(&extension) || is_video_input_extension(&extension)
+            }
+            Self::Gif
             | Self::Bmp
             | Self::Tiff
             | Self::Ico
@@ -505,19 +576,20 @@ impl OutputFormat {
             | Self::Hdr
             | Self::Farbfeld => is_image_input_extension(&extension),
             Self::Pdf => extension == "txt" || is_image_input_extension(&extension),
-            Self::Text | Self::Csv | Self::Json | Self::Yaml | Self::Toml => {
-                is_data_extension(&extension)
-            }
+            Self::Text => is_data_extension(&extension) || extension == "pdf",
+            Self::Csv | Self::Json | Self::Yaml | Self::Toml => is_data_extension(&extension),
             Self::TextUtf8NoBom
             | Self::TextUtf8Bom
             | Self::TextUtf16Le
             | Self::TextUtf16Be
             | Self::TextUtf32Le
-            | Self::TextUtf32Be => extension == "txt",
+            | Self::TextUtf32Be => extension == "txt" || extension == "pdf",
             Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus | Self::Mp3 => {
                 is_audio_extension(&extension)
             }
+            Self::Mp4 | Self::Webm => is_video_input_extension(&extension),
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
+            Self::Files => is_archive_name(file_name),
         }
     }
 }
@@ -526,6 +598,192 @@ impl OutputFormat {
 pub struct ConvertedFile {
     pub name: PathBuf,
     pub bytes: Vec<u8>,
+}
+
+/// One progress update from a future video transcode path. `total` is `None`
+/// when ffmpeg cannot determine the input duration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VideoProgress {
+    pub out_time: Duration,
+    pub total: Option<Duration>,
+}
+
+impl VideoProgress {
+    pub fn fraction(self) -> Option<f32> {
+        let total = self.total?.as_secs_f64();
+        if total <= 0.0 {
+            return None;
+        }
+        Some((self.out_time.as_secs_f64() / total).clamp(0.0, 1.0) as f32)
+    }
+}
+
+/// Cancellation and progress hooks reserved for a future ffmpeg transcode
+/// path. This slice only performs stream-copy remuxes and thumbnails, which
+/// are synchronous and ignore these hooks.
+pub struct VideoControl<'a> {
+    pub cancel: &'a AtomicBool,
+    pub on_progress: &'a mut dyn FnMut(VideoProgress),
+}
+
+/// Location of the external ffmpeg binary. An explicit path wins, then the
+/// `CONVERT2IT_FFMPEG` / `FFMPEG` environment variables, then PATH.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VideoToolConfig {
+    pub ffmpeg: Option<PathBuf>,
+}
+
+impl VideoToolConfig {
+    pub fn with_ffmpeg(path: impl Into<PathBuf>) -> Self {
+        Self {
+            ffmpeg: Some(path.into()),
+        }
+    }
+
+    /// Resolves the ffmpeg executable using the override chain above.
+    pub fn resolve(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.ffmpeg {
+            return Some(path.clone());
+        }
+        for variable in ["CONVERT2IT_FFMPEG", "FFMPEG"] {
+            if let Some(path) = std::env::var_os(variable) {
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
+            }
+        }
+        find_on_path("ffmpeg")
+    }
+}
+
+/// The automatic route selected for a video conversion.
+///
+/// This is deliberately not a user-facing mode. The current video slice only
+/// advertises stream-copy remuxes; the transcode variant is reserved for a
+/// future slice and is never selected by the conversion entry points.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoRoute {
+    Remux,
+    Transcode,
+}
+
+impl VideoRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Remux => "remux",
+            Self::Transcode => "transcode",
+        }
+    }
+}
+
+/// One advertised video route. The same [`VideoRoute`] enum is used by the
+/// registry and the CLI listing so they cannot disagree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoRouteInfo {
+    pub source_extension: &'static str,
+    pub target: OutputFormat,
+    pub route: VideoRoute,
+    pub video_codecs: &'static [&'static str],
+    pub audio_codecs: &'static [&'static str],
+}
+
+/// One native input handler as exposed to the CLI, the GUI and parity tooling.
+///
+/// The web app has a much wider handler set; this registry is the native
+/// source of truth so gaps can be reported without scraping UI code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormatHandler {
+    pub input: input_format::InputFormat,
+    pub canonical_extension: Option<&'static str>,
+    pub outputs: Vec<OutputFormat>,
+    pub video_routes: Vec<VideoRouteInfo>,
+}
+
+/// Returns every selectable native input format and the outputs it accepts.
+///
+/// `Any` and `Mixed` are bulk-archive modes, so they report the archive targets
+/// directly instead of pretending to have one canonical extension.
+pub fn native_format_registry() -> Vec<FormatHandler> {
+    input_format::InputFormat::SELECTABLE
+        .iter()
+        .copied()
+        .map(|input| {
+            let canonical_extension = input.canonical_extension();
+            let outputs = if matches!(
+                input,
+                input_format::InputFormat::Any | input_format::InputFormat::Mixed
+            ) {
+                vec![
+                    OutputFormat::Files,
+                    OutputFormat::Zip,
+                    OutputFormat::Tar,
+                    OutputFormat::TarGz,
+                    OutputFormat::Gzip,
+                ]
+            } else {
+                let sample = canonical_extension
+                    .map(|extension| format!("sample.{extension}"))
+                    .unwrap_or_else(|| "sample.bin".to_owned());
+                OutputFormat::ALL
+                    .iter()
+                    .copied()
+                    .filter(|target| target.supports_input(&sample))
+                    .collect()
+            };
+            let video_routes = if input == input_format::InputFormat::Video {
+                native_video_routes()
+            } else {
+                Vec::new()
+            };
+            FormatHandler {
+                input,
+                canonical_extension,
+                outputs,
+                video_routes,
+            }
+        })
+        .collect()
+}
+
+const REMUX_VIDEO_TO_MP4: &[&str] = &["h264", "hevc", "vp9", "av1"];
+const REMUX_AUDIO_TO_MP4: &[&str] = &["aac", "opus", "mp3", "ac3", "eac3"];
+const REMUX_VIDEO_TO_WEBM: &[&str] = &["vp8", "vp9", "av1"];
+const REMUX_AUDIO_TO_WEBM: &[&str] = &["opus", "vorbis"];
+
+/// Routes advertised by the native registry. Every route in this slice is a
+/// stream copy; incompatible codec/container pairs are rejected rather than
+/// transcoded.
+pub fn native_video_routes() -> Vec<VideoRouteInfo> {
+    vec![
+        VideoRouteInfo {
+            source_extension: "mp4",
+            target: OutputFormat::Webm,
+            route: VideoRoute::Remux,
+            video_codecs: REMUX_VIDEO_TO_WEBM,
+            audio_codecs: REMUX_AUDIO_TO_WEBM,
+        },
+        VideoRouteInfo {
+            source_extension: "mkv",
+            target: OutputFormat::Webm,
+            route: VideoRoute::Remux,
+            video_codecs: REMUX_VIDEO_TO_WEBM,
+            audio_codecs: REMUX_AUDIO_TO_WEBM,
+        },
+        VideoRouteInfo {
+            source_extension: "webm",
+            target: OutputFormat::Mp4,
+            route: VideoRoute::Remux,
+            video_codecs: REMUX_VIDEO_TO_MP4,
+            audio_codecs: REMUX_AUDIO_TO_MP4,
+        },
+        VideoRouteInfo {
+            source_extension: "mkv",
+            target: OutputFormat::Mp4,
+            route: VideoRoute::Remux,
+            video_codecs: REMUX_VIDEO_TO_MP4,
+            audio_codecs: REMUX_AUDIO_TO_MP4,
+        },
+    ]
 }
 
 #[derive(Debug, Error)]
@@ -573,6 +831,34 @@ pub enum ConvertError {
     Cancelled,
     #[error("the archive would contain {count} entries, more than the {max}-entry limit")]
     ArchiveTooManyEntries { count: usize, max: usize },
+    #[error("the archive expands to more than {max} bytes")]
+    ArchiveTooLarge { max: u64 },
+    #[error("the archive contains no files")]
+    NoArchiveEntries,
+    #[error("archive entry {0:?} would escape the output directory")]
+    UnsafeArchivePath(String),
+    #[error("could not read the PDF: {0}")]
+    Pdf(String),
+    #[error(
+        "ffmpeg was not found ({path}); install it on PATH or set CONVERT2IT_FFMPEG to its path"
+    )]
+    FfmpegNotFound { path: String },
+    #[error("ffmpeg exited with {status}: {stderr}")]
+    FfmpegFailed { status: String, stderr: String },
+    #[error("could not start ffmpeg: {0}")]
+    FfmpegSpawn(String),
+    #[error("ffmpeg produced no output")]
+    FfmpegEmptyOutput,
+    #[error("ffmpeg returned an invalid {container} container")]
+    FfmpegInvalidOutput { container: &'static str },
+    #[error(
+        "cannot stream-copy {stream} codec {codec} into {container}; use a compatible source file"
+    )]
+    UnsupportedVideoCodec {
+        stream: &'static str,
+        codec: String,
+        container: &'static str,
+    },
     #[error("could not decode audio: {0}")]
     Audio(String),
     #[error("TOML output requires an object at the top level")]
@@ -609,7 +895,42 @@ pub fn convert_bytes_with_options(
     target: OutputFormat,
     options: ConversionOptions,
 ) -> Result<Vec<ConvertedFile>, ConvertError> {
+    convert_bytes_with_video_config(
+        input_name,
+        input,
+        target,
+        options,
+        &VideoToolConfig::default(),
+    )
+}
+
+/// Conversion entry point with an explicit ffmpeg configuration. The normal
+/// entry points resolve `CONVERT2IT_FFMPEG`/`FFMPEG` and PATH themselves.
+pub fn convert_bytes_with_video_config(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    options: ConversionOptions,
+    video: &VideoToolConfig,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    convert_bytes_with_video_control(input_name, input, target, options, video, None)
+}
+
+/// Conversion entry point that accepts the reserved transcode progress and
+/// cancellation hooks. This slice's remux and thumbnail paths are synchronous,
+/// so the hooks are ignored; non-video conversions ignore them as well.
+pub fn convert_bytes_with_video_control(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    options: ConversionOptions,
+    video: &VideoToolConfig,
+    _control: Option<&mut VideoControl<'_>>,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
     let extension = file_extension(input_name);
+    if target == OutputFormat::Files {
+        return extract_archive(input_name, input);
+    }
     if target == OutputFormat::Zip {
         let name = safe_file_name(input_name);
         let entries = [(PathBuf::from(name), input.to_vec())];
@@ -635,6 +956,35 @@ pub fn convert_bytes_with_options(
             bytes: gzip_bytes(input, options.archive_compression)?,
         }]);
     }
+    if is_pdf_extension(&extension) {
+        let text = extract_pdf_text(input)?;
+        let bytes = match target {
+            OutputFormat::Text
+            | OutputFormat::TextUtf8NoBom
+            | OutputFormat::TextUtf8Bom
+            | OutputFormat::TextUtf16Le
+            | OutputFormat::TextUtf16Be
+            | OutputFormat::TextUtf32Le
+            | OutputFormat::TextUtf32Be => encode_text(&text, target)?,
+            _ => return Err(unsupported(&extension, target)),
+        };
+        return Ok(vec![ConvertedFile {
+            name: output_name(input_name, target.extension()),
+            bytes,
+        }]);
+    }
+
+    if target.is_video_target() {
+        if !is_video_input_extension(&extension) {
+            return Err(unsupported(&extension, target));
+        }
+        return convert_video(input_name, input, target, video);
+    }
+
+    if target.image_format().is_some() && is_video_input_extension(&extension) {
+        return extract_video_frame(input_name, input, target, options, video);
+    }
+
     if target == OutputFormat::Pdf {
         let bytes = if extension == "txt" {
             text_to_pdf(input, options)?
@@ -659,6 +1009,7 @@ pub fn convert_bytes_with_options(
             load_image(input, options)?
         };
         let bytes = encode_image(image, target, options)?;
+        let bytes = preserve_jpeg_exif(input, bytes, options);
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
             bytes,
@@ -704,6 +1055,11 @@ pub fn convert_bytes_with_options(
             OutputFormat::Mp3 => encode_mp3(audio, options.mp3_bitrate)?,
             _ => unreachable!("only audio targets reach this branch"),
         };
+        let bytes = match target {
+            OutputFormat::Mp3 => preserve_mp3_id3v2(input, bytes),
+            OutputFormat::Flac => preserve_flac_tags(input, bytes),
+            _ => bytes,
+        };
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
             bytes,
@@ -724,6 +1080,15 @@ pub fn convert_batch_with_options(
     inputs: &[(PathBuf, Vec<u8>)],
     target: OutputFormat,
     options: ConversionOptions,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    convert_batch_with_video_config(inputs, target, options, &VideoToolConfig::default())
+}
+
+pub fn convert_batch_with_video_config(
+    inputs: &[(PathBuf, Vec<u8>)],
+    target: OutputFormat,
+    options: ConversionOptions,
+    video: &VideoToolConfig,
 ) -> Result<Vec<ConvertedFile>, ConvertError> {
     if inputs.is_empty() {
         return Err(ConvertError::NoInputFiles);
@@ -787,7 +1152,7 @@ pub fn convert_batch_with_options(
 
     let mut converted = Vec::new();
     for (path, bytes) in inputs {
-        converted.extend(convert_bytes_with_options(
+        converted.extend(convert_bytes_with_video_config(
             path.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -795,6 +1160,7 @@ pub fn convert_batch_with_options(
             bytes,
             target,
             options,
+            video,
         )?);
     }
     Ok(converted)
@@ -874,6 +1240,22 @@ fn convert_text(
         name: output_name(input_name, output_extension),
         bytes: output,
     }])
+}
+
+fn extract_pdf_text(input: &[u8]) -> Result<String, ConvertError> {
+    // pdf-extract is pure Rust and handles the common text operators. It is
+    // deliberately wrapped because malformed PDFs can otherwise unwind through
+    // the conversion API instead of returning a normal error.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(input)
+    }));
+    match result {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(ConvertError::Pdf(format!("{error:?}"))),
+        Err(_) => Err(ConvertError::Pdf(
+            "the PDF parser stopped on a malformed document".to_owned(),
+        )),
+    }
 }
 
 fn decode_text(input: &[u8]) -> Result<String, ConvertError> {
@@ -1077,6 +1459,15 @@ fn file_extension(name: &str) -> String {
         .unwrap_or_default()
 }
 
+fn is_archive_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".zip")
+        || name.ends_with(".tar")
+        || name.ends_with(".tar.gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".gz")
+}
+
 fn output_name(input_name: &str, extension: &str) -> PathBuf {
     let stem = Path::new(input_name)
         .file_stem()
@@ -1104,6 +1495,439 @@ fn is_audio_extension(extension: &str) -> bool {
     input_extensions::AUDIO_INPUT_EXTENSIONS.contains(&extension)
 }
 
+fn is_pdf_extension(extension: &str) -> bool {
+    input_extensions::PDF_INPUT_EXTENSIONS.contains(&extension)
+}
+
+fn is_video_input_extension(extension: &str) -> bool {
+    matches!(extension, "mp4" | "m4v" | "mov" | "mkv" | "webm")
+}
+
+const FFMPEG_STDERR_LIMIT: usize = 8_192;
+static VIDEO_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        #[cfg(windows)]
+        for extension in ["exe", "cmd", "bat", "com"] {
+            let candidate = directory.join(format!("{name}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn ffmpeg_command(path: &Path) -> Command {
+    #[cfg(windows)]
+    if matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("cmd" | "bat")
+    ) {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(path);
+        return command;
+    }
+    Command::new(path)
+}
+
+fn ffmpeg_stderr(bytes: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(FFMPEG_STDERR_LIMIT)
+        .collect();
+    if text.is_empty() {
+        "<no stderr>".to_owned()
+    } else {
+        text
+    }
+}
+
+fn run_ffmpeg(command: &mut Command, ffmpeg: &Path) -> Result<Output, ConvertError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ConvertError::FfmpegNotFound {
+                path: ffmpeg.display().to_string(),
+            }
+        } else {
+            ConvertError::FfmpegSpawn(error.to_string())
+        }
+    })?;
+    if !output.status.success() {
+        let status = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_owned());
+        return Err(ConvertError::FfmpegFailed {
+            status,
+            stderr: ffmpeg_stderr(&output.stderr),
+        });
+    }
+    Ok(output)
+}
+
+struct TempVideoPath {
+    path: PathBuf,
+}
+
+impl TempVideoPath {
+    fn new(extension: &str) -> Self {
+        let sequence = VIDEO_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "convert2it-{}-{sequence}.{extension}",
+            std::process::id()
+        ));
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempVideoPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn resolve_ffmpeg(video: &VideoToolConfig) -> Result<PathBuf, ConvertError> {
+    video.resolve().ok_or_else(|| ConvertError::FfmpegNotFound {
+        path: "ffmpeg".to_owned(),
+    })
+}
+
+fn convert_video(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    video: &VideoToolConfig,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    remux_video(input_name, input, target, video)
+}
+
+fn remux_video(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    video: &VideoToolConfig,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    let extension = file_extension(input_name);
+    validate_remux(input, &extension, target)?;
+    let ffmpeg = resolve_ffmpeg(video)?;
+    let input_path = TempVideoPath::new(if extension.is_empty() {
+        "bin"
+    } else {
+        &extension
+    });
+    std::fs::write(input_path.path(), input)?;
+    let output_path = TempVideoPath::new(target.extension());
+
+    let mut command = ffmpeg_command(&ffmpeg);
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(input_path.path())
+        .args(["-map", "0:v?", "-map", "0:a?", "-c", "copy"]);
+    match target {
+        OutputFormat::Mp4 => {
+            command.args(["-movflags", "+faststart", "-f", "mp4"]);
+        }
+        OutputFormat::Webm => {
+            command.args(["-f", "webm"]);
+        }
+        _ => unreachable!("only video containers reach remux_video"),
+    }
+    command.arg(output_path.path());
+    run_ffmpeg(&mut command, &ffmpeg)?;
+
+    let bytes = std::fs::read(output_path.path()).map_err(|_| ConvertError::FfmpegEmptyOutput)?;
+    if bytes.is_empty() {
+        return Err(ConvertError::FfmpegEmptyOutput);
+    }
+    let valid_container = match target {
+        OutputFormat::Mp4 => bytes.get(4..8) == Some(b"ftyp"),
+        OutputFormat::Webm => bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        _ => true,
+    };
+    if !valid_container {
+        return Err(ConvertError::FfmpegInvalidOutput {
+            container: target.extension(),
+        });
+    }
+    Ok(vec![ConvertedFile {
+        name: output_name(input_name, target.extension()),
+        bytes,
+    }])
+}
+
+fn extract_video_frame(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    options: ConversionOptions,
+    video: &VideoToolConfig,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    let ffmpeg = resolve_ffmpeg(video)?;
+    let extension = file_extension(input_name);
+    let input_path = TempVideoPath::new(if extension.is_empty() {
+        "bin"
+    } else {
+        &extension
+    });
+    std::fs::write(input_path.path(), input)?;
+
+    let frame_time_ms = options
+        .video_frame_time_ms
+        .min(ConversionOptions::MAX_VIDEO_FRAME_TIME_MS);
+    let mut command = ffmpeg_command(&ffmpeg);
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-ss"])
+        .arg(format!("{:.3}", frame_time_ms as f64 / 1_000.0))
+        .arg("-i")
+        .arg(input_path.path())
+        .args(["-map", "0:v:0", "-frames:v", "1", "-an"]);
+    let width = options
+        .video_thumbnail_width
+        .min(ConversionOptions::MAX_VIDEO_THUMBNAIL_WIDTH);
+    if width > 0 {
+        command.args(["-vf", &format!("scale={}:-2:flags=lanczos", width.max(16))]);
+    }
+    command.args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
+
+    let output = run_ffmpeg(&mut command, &ffmpeg)?;
+    if output.stdout.is_empty() {
+        return Err(ConvertError::FfmpegEmptyOutput);
+    }
+    let image = image::load_from_memory(&output.stdout)?;
+    let bytes = encode_image(image, target, options)?;
+    Ok(vec![ConvertedFile {
+        name: output_name(input_name, target.extension()),
+        bytes,
+    }])
+}
+
+#[derive(Default)]
+struct VideoCodecs {
+    video: Vec<String>,
+    audio: Vec<String>,
+    unknown_video: bool,
+    unknown_audio: bool,
+}
+
+fn validate_remux(input: &[u8], extension: &str, target: OutputFormat) -> Result<(), ConvertError> {
+    let codecs = if is_mp4_extension(extension) {
+        mp4_video_codecs(input)
+    } else if matches!(extension, "mkv" | "webm") {
+        matroska_video_codecs(input)
+    } else {
+        None
+    };
+    let Some(codecs) = codecs else {
+        return Ok(());
+    };
+    let (video_allowed, audio_allowed): (&[&str], &[&str]) = match target {
+        OutputFormat::Mp4 => (REMUX_VIDEO_TO_MP4, REMUX_AUDIO_TO_MP4),
+        OutputFormat::Webm => (REMUX_VIDEO_TO_WEBM, REMUX_AUDIO_TO_WEBM),
+        _ => return Ok(()),
+    };
+    for codec in &codecs.video {
+        if !video_allowed.contains(&codec.as_str()) {
+            return Err(ConvertError::UnsupportedVideoCodec {
+                stream: "video",
+                codec: codec.clone(),
+                container: target.extension(),
+            });
+        }
+    }
+    for codec in &codecs.audio {
+        if !audio_allowed.contains(&codec.as_str()) {
+            return Err(ConvertError::UnsupportedVideoCodec {
+                stream: "audio",
+                codec: codec.clone(),
+                container: target.extension(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn mp4_video_codecs(input: &[u8]) -> Option<VideoCodecs> {
+    let moov = mp4_find(input, b"moov")?;
+    let mut codecs = VideoCodecs::default();
+    for (kind, trak) in mp4_child_boxes(moov) {
+        if kind != *b"trak" {
+            continue;
+        }
+        let mdia = match mp4_find(trak, b"mdia") {
+            Some(mdia) => mdia,
+            None => continue,
+        };
+        let handler = mp4_find(mdia, b"hdlr")
+            .and_then(|hdlr| hdlr.get(8..12))
+            .unwrap_or(b"");
+        let stsd = mp4_find(mdia, b"minf")
+            .and_then(|minf| mp4_find(minf, b"stbl"))
+            .and_then(|stbl| mp4_find(stbl, b"stsd"));
+        let Some(stsd) = stsd else {
+            continue;
+        };
+        let entries = stsd
+            .get(4..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_be_bytes)
+            .unwrap_or(0) as usize;
+        let mut position = 8;
+        for _ in 0..entries {
+            let Some(size_bytes) = stsd.get(position..position + 4) else {
+                break;
+            };
+            let size = u32::from_be_bytes(size_bytes.try_into().ok()?) as usize;
+            if size < 8 || position + size > stsd.len() {
+                break;
+            }
+            let format = stsd.get(position + 4..position + 8)?;
+            match handler {
+                b"vide" => match mp4_codec_name(format) {
+                    Some(codec) => codecs.video.push(codec.to_owned()),
+                    None => codecs.unknown_video = true,
+                },
+                b"soun" => match mp4_codec_name(format) {
+                    Some(codec) => codecs.audio.push(codec.to_owned()),
+                    None => codecs.unknown_audio = true,
+                },
+                _ => {}
+            }
+            position += size;
+        }
+    }
+    Some(codecs)
+}
+
+fn mp4_codec_name(format: &[u8]) -> Option<&'static str> {
+    match format {
+        b"avc1" | b"avc3" => Some("h264"),
+        b"hvc1" | b"hev1" => Some("hevc"),
+        b"vp08" => Some("vp8"),
+        b"vp09" => Some("vp9"),
+        b"av01" => Some("av1"),
+        b"mp4a" => Some("aac"),
+        b"Opus" => Some("opus"),
+        b"ac-3" => Some("ac3"),
+        b"ec-3" => Some("eac3"),
+        b"mp3 " => Some("mp3"),
+        b"vorb" => Some("vorbis"),
+        _ => None,
+    }
+}
+
+fn matroska_video_codecs(input: &[u8]) -> Option<VideoCodecs> {
+    let mut position = 0;
+    let (segment_start, segment_end) = loop {
+        let (id, size) = read_ebml_element(input, &mut position)?;
+        if id == 0x1853_8067 {
+            let end = ebml_element_end(position, size, input.len());
+            break (position, end);
+        }
+        skip_ebml_element(input, &mut position, size)?;
+    };
+    let mut codecs = VideoCodecs::default();
+    let mut scan = segment_start;
+    while scan < segment_end {
+        let (id, size) = read_ebml_element(input, &mut scan)?;
+        let end = ebml_element_end(scan, size, segment_end);
+        if id == 0x1654_AE6B {
+            parse_matroska_tracks(&input[scan..end], &mut codecs);
+        }
+        scan = end;
+    }
+    Some(codecs)
+}
+
+fn parse_matroska_tracks(data: &[u8], codecs: &mut VideoCodecs) {
+    let mut position = 0;
+    while position < data.len() {
+        let Some((id, size)) = read_ebml_element(data, &mut position) else {
+            break;
+        };
+        let end = ebml_element_end(position, size, data.len());
+        if id == 0xAE {
+            parse_matroska_track(&data[position..end], codecs);
+        }
+        position = end;
+    }
+}
+
+fn parse_matroska_track(data: &[u8], codecs: &mut VideoCodecs) {
+    let mut track_type = None;
+    let mut codec_id = None;
+    let mut position = 0;
+    while position < data.len() {
+        let Some((id, size)) = read_ebml_element(data, &mut position) else {
+            break;
+        };
+        let end = ebml_element_end(position, size, data.len());
+        match id {
+            0x83 => track_type = size.and_then(|size| read_ebml_uint(data, position, size)),
+            0x86 => {
+                codec_id = size.and_then(|size| {
+                    data.get(position..position + size as usize)
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                })
+            }
+            _ => {}
+        }
+        position = end;
+    }
+    let Some(codec) = codec_id.as_deref().and_then(matroska_codec_name) else {
+        match track_type {
+            Some(1) => codecs.unknown_video = true,
+            Some(2) => codecs.unknown_audio = true,
+            _ => {}
+        }
+        return;
+    };
+    match track_type {
+        Some(1) => codecs.video.push(codec.to_owned()),
+        Some(2) => codecs.audio.push(codec.to_owned()),
+        _ => {}
+    }
+}
+
+fn matroska_codec_name(codec: &str) -> Option<&'static str> {
+    match codec {
+        "V_VP8" => Some("vp8"),
+        "V_VP9" => Some("vp9"),
+        "V_AV1" => Some("av1"),
+        "V_MPEG4/ISO/AVC" => Some("h264"),
+        "V_MPEGH/ISO/HEVC" => Some("hevc"),
+        "A_OPUS" => Some("opus"),
+        "A_VORBIS" => Some("vorbis"),
+        "A_AAC" => Some("aac"),
+        "A_MPEG/L3" => Some("mp3"),
+        "A_AC3" => Some("ac3"),
+        "A_EAC3" => Some("eac3"),
+        _ => None,
+    }
+}
+
 fn load_image(
     input: &[u8],
     options: ConversionOptions,
@@ -1126,9 +1950,10 @@ fn load_image(
 
 /// Reads the EXIF orientation tag from JPEG, TIFF, or PNG (`eXIf`) input.
 ///
-/// A duplicated orientation tag is ambiguous, so it is ignored rather than
-/// picking one and potentially rotating the image the wrong way. The same is
-/// true of a missing or malformed tag; callers then leave the pixels alone.
+/// A duplicated orientation tag in the primary image IFD, or across multiple
+/// primary EXIF segments, is ambiguous, so it is ignored rather than picking
+/// one and potentially rotating the image the wrong way. The same is true of a
+/// missing or malformed tag; callers then leave the pixels alone.
 fn exif_orientation(input: &[u8]) -> Option<u16> {
     let mut orientations = Vec::new();
     if input.starts_with(&[0xFF, 0xD8]) {
@@ -1202,8 +2027,11 @@ fn exif_orientation(input: &[u8]) -> Option<u16> {
     }
 }
 
-/// Collects every orientation tag from the TIFF IFD chain. Returning all of
-/// them lets the caller distinguish one unambiguous tag from duplicates.
+/// Collects orientation tags from the primary image IFD (IFD0) only.
+///
+/// A thumbnail IFD can carry its own orientation tag, but that tag describes
+/// the thumbnail rather than the main image. Returning every primary tag lets
+/// the caller detect duplicates across EXIF segments.
 fn tiff_orientations(tiff: &[u8]) -> Vec<u16> {
     let little = tiff.starts_with(b"II");
     let mut orientations = Vec::new();
@@ -1226,45 +2054,135 @@ fn tiff_orientations(tiff: &[u8]) -> Vec<u16> {
             u32::from_be_bytes(bytes)
         })
     };
-    let mut ifd = match read32(4) {
+    let ifd = match read32(4) {
         Some(ifd) => ifd as usize,
         None => return orientations,
     };
-    // The IFD chain is normally short. A cap also makes a malicious cycle
-    // terminate instead of allocating forever.
-    for _ in 0..16 {
-        if ifd == 0 {
+    let entries = match read16(ifd) {
+        Some(entries) => usize::from(entries),
+        None => return orientations,
+    };
+    for index in 0..entries {
+        let entry = ifd + 2 + index * 12;
+        if read16(entry) == Some(0x0112)
+            && read16(entry + 2) == Some(3)
+            && read32(entry + 4) == Some(1)
+        {
+            if let Some(value) = read16(entry + 8) {
+                orientations.push(value);
+            }
+        }
+    }
+    orientations
+}
+
+/// Copies JPEG APP1 EXIF segments into a JPEG result. The pixels have already
+/// been rotated when `image_apply_exif_orientation` is enabled, so the copied
+/// orientation tag is reset to 1 to avoid rotating the result twice.
+fn preserve_jpeg_exif(input: &[u8], output: Vec<u8>, options: ConversionOptions) -> Vec<u8> {
+    if !input.starts_with(&[0xFF, 0xD8]) || !output.starts_with(&[0xFF, 0xD8]) {
+        return output;
+    }
+    let segments = jpeg_exif_segments(input);
+    if segments.is_empty() {
+        return output;
+    }
+    let mut result =
+        Vec::with_capacity(output.len() + segments.iter().map(Vec::len).sum::<usize>());
+    result.extend_from_slice(&output[..2]);
+    for mut segment in segments {
+        if options.image_apply_exif_orientation && segment.len() > 6 {
+            set_tiff_orientation(&mut segment[6..], 1);
+        }
+        if segment.len() + 2 > usize::from(u16::MAX) {
+            continue;
+        }
+        result.extend_from_slice(&[0xFF, 0xE1]);
+        result.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        result.extend_from_slice(&segment);
+    }
+    result.extend_from_slice(&output[2..]);
+    result
+}
+
+fn jpeg_exif_segments(input: &[u8]) -> Vec<Vec<u8>> {
+    let mut segments = Vec::new();
+    let mut position = 2;
+    while position + 4 <= input.len() {
+        if input[position] != 0xFF {
+            position += 1;
+            continue;
+        }
+        let marker = input[position + 1];
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            position += 2;
+            continue;
+        }
+        if marker == 0xDA || marker == 0xD9 {
             break;
         }
-        let entries = match read16(ifd) {
-            Some(entries) => usize::from(entries),
-            None => break,
-        };
-        let entries_end = match ifd.checked_add(2).and_then(|start| {
-            entries
-                .checked_mul(12)
-                .and_then(|size| start.checked_add(size))
-        }) {
-            Some(end) => end,
-            None => break,
-        };
-        for index in 0..entries {
-            let entry = ifd + 2 + index * 12;
-            if read16(entry) == Some(0x0112)
-                && read16(entry + 2) == Some(3)
-                && read32(entry + 4) == Some(1)
-            {
-                if let Some(value) = read16(entry + 8) {
-                    orientations.push(value);
+        let length = u16::from_be_bytes([input[position + 2], input[position + 3]]) as usize;
+        if length < 2 {
+            break;
+        }
+        if marker == 0xE1 {
+            if let Some(segment) = input.get(position + 4..position + 2 + length) {
+                if segment.starts_with(b"Exif\0\0") {
+                    segments.push(segment.to_vec());
                 }
             }
         }
-        ifd = match read32(entries_end) {
-            Some(next) => next as usize,
+        position = match position.checked_add(2 + length) {
+            Some(next) => next,
             None => break,
         };
     }
-    orientations
+    segments
+}
+
+fn set_tiff_orientation(tiff: &mut [u8], orientation: u16) {
+    let little = tiff.starts_with(b"II");
+    if !little && !tiff.starts_with(b"MM") {
+        return;
+    }
+    let read16 = |bytes: &[u8], position: usize| -> Option<u16> {
+        let bytes = bytes.get(position..position + 2)?.try_into().ok()?;
+        Some(if little {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        })
+    };
+    let read32 = |bytes: &[u8], position: usize| -> Option<u32> {
+        let bytes = bytes.get(position..position + 4)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    };
+    let Some(ifd) = read32(tiff, 4).map(|offset| offset as usize) else {
+        return;
+    };
+    let Some(entries) = read16(tiff, ifd).map(usize::from) else {
+        return;
+    };
+    for index in 0..entries {
+        let entry = ifd + 2 + index * 12;
+        if read16(tiff, entry) == Some(0x0112)
+            && read16(tiff, entry + 2) == Some(3)
+            && read32(tiff, entry + 4) == Some(1)
+        {
+            let value = if little {
+                orientation.to_le_bytes()
+            } else {
+                orientation.to_be_bytes()
+            };
+            if let Some(slot) = tiff.get_mut(entry + 8..entry + 10) {
+                slot.copy_from_slice(&value);
+            }
+        }
+    }
 }
 
 fn apply_orientation(image: image::DynamicImage, orientation: u16) -> image::DynamicImage {
@@ -1280,7 +2198,14 @@ fn apply_orientation(image: image::DynamicImage, orientation: u16) -> image::Dyn
     }
 }
 
-/// Composites transparent pixels onto an opaque background.
+fn composite_channel(source: u8, alpha: u8, background: u8) -> u8 {
+    let alpha = u16::from(alpha);
+    let inverse = 255 - alpha;
+    ((u16::from(source) * alpha + u16::from(background) * inverse + 127) / 255) as u8
+}
+
+/// Composites transparent pixels onto an opaque background using straight-alpha
+/// blending: `source * alpha + background * (1 - alpha)`.
 fn flatten_image(image: image::DynamicImage, background: [u8; 3]) -> image::DynamicImage {
     if !image.color().has_alpha() {
         return image;
@@ -1288,12 +2213,8 @@ fn flatten_image(image: image::DynamicImage, background: [u8; 3]) -> image::Dyna
     let rgba = image.to_rgba8();
     let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
     for (pixel, output) in rgba.pixels().zip(rgb.pixels_mut()) {
-        let alpha = u16::from(pixel[3]);
-        let inverse = 255 - alpha;
         for channel in 0..3 {
-            output[channel] = ((u16::from(pixel[channel]) * alpha
-                + u16::from(background[channel]) * inverse)
-                / 255) as u8;
+            output[channel] = composite_channel(pixel[channel], pixel[3], background[channel]);
         }
     }
     image::DynamicImage::ImageRgb8(rgb)
@@ -1308,15 +2229,7 @@ fn encode_image(
         .image_format()
         .expect("encode_image is only called for image targets");
 
-    let image = if matches!(
-        target,
-        OutputFormat::Jpeg
-            | OutputFormat::Bmp
-            | OutputFormat::Hdr
-            | OutputFormat::Ppm
-            | OutputFormat::Pbm
-            | OutputFormat::Pgm
-    ) {
+    let image = if target.uses_image_background() {
         flatten_image(image, options.image_background)
     } else {
         image
@@ -1588,6 +2501,9 @@ struct AudioTrim {
 enum AudioCodecKind {
     Symphonia,
     Opus,
+    /// AC-3 and E-AC-3 frames come from filmcraft-ac3 because Symphonia 0.5
+    /// has no AC-3 codec feature. They still use the same track selection,
+    /// trim and downmix code as every other codec.
     Ac3,
 }
 
@@ -3410,6 +4326,14 @@ fn apply_audio_options(
 /// Remixes any common channel layout to mono or stereo using the standard
 /// ITU-R BS.775 coefficients, so the centre and surround channels are not
 /// discarded. The result is scaled down only when the mix would clip.
+///
+/// Layouts follow the WAV/film channel order: 1 = mono, 2 = L/R, 3 = L/R/C,
+/// 4 = quad L/R/BL/BR, 5 = L/R/C/BL/BR, 6 = L/R/C/LFE/BL/BR,
+/// 7 = 6.1 L/R/C/LFE/BC/SL/SR, and 8 = 7.1 L/R/C/LFE/BL/BR/SL/SR. Centre and
+/// surround channels use 0.707; quad surrounds use 0.707 on their own side.
+/// LFE is included at 0.5 rather than omitted: that keeps low-frequency energy
+/// in the fold-down while limiting the headroom it consumes. Layouts above
+/// eight channels are treated as 7.1 plus equally weighted extra channels.
 fn remix_channels(mut audio: DecodedAudio, target: AudioChannels) -> DecodedAudio {
     let target_channels = target.count();
     if audio.channels == target_channels {
@@ -3449,6 +4373,8 @@ fn remix_channels(mut audio: DecodedAudio, target: AudioChannels) -> DecodedAudi
     audio
 }
 
+/// Mono fold-down for the layouts documented on [`remix_channels`]. Front
+/// left/right are averaged, centre uses 0.707, and LFE and surrounds use 0.5.
 fn downmix_mono(frame: &[f32]) -> f32 {
     let channel = |index: usize| frame.get(index).copied().unwrap_or(0.0);
     match frame.len() {
@@ -3476,40 +4402,18 @@ fn downmix_mono(frame: &[f32]) -> f32 {
                 + 0.5 * channel(3)
                 + 0.5 * (channel(4) + channel(5) + channel(6) + channel(7))
         }
-        channels => frame.iter().sum::<f32>() / channels as f32,
+        _ => {
+            // 7.1 plus any extra channels, which are split equally so they are
+            // not silently dropped.
+            0.5 * (channel(0) + channel(1))
+                + 0.707 * channel(2)
+                + 0.5 * channel(3)
+                + 0.5 * frame.iter().skip(4).sum::<f32>()
+        }
     }
 }
 
-/// Worst-case gain sum of [`downmix_mono`] or [`downmix_stereo`] for a layout.
-/// Streaming cannot inspect the whole file before writing, so it attenuates by
-/// this amount up front; that guarantees a full-scale source cannot clip.
-fn downmix_gain(source_channels: usize, target_channels: usize) -> f32 {
-    if source_channels <= 2 || target_channels > 2 {
-        return 1.0;
-    }
-    let sum = match target_channels {
-        1 => match source_channels {
-            3 => 1.707,
-            4 => 2.0,
-            5 => 2.707,
-            6 => 3.207,
-            7 => 3.707,
-            8 => 4.207,
-            _ => 4.207,
-        },
-        _ => match source_channels {
-            3 | 4 => 1.707,
-            5 => 2.414,
-            6 => 2.914,
-            7 => 3.414,
-            8 => 3.621,
-            _ => 3.621,
-        },
-    };
-    1.0 / sum
-}
-
-/// Standard film-layout channel order: L, R, C, LFE, back L/R, side L/R.
+/// Stereo fold-down for the layouts documented on [`remix_channels`].
 fn downmix_stereo(frame: &[f32]) -> (f32, f32) {
     let channel = |index: usize| frame.get(index).copied().unwrap_or(0.0);
     let mut left = channel(0);
@@ -3538,10 +4442,21 @@ fn downmix_stereo(frame: &[f32]) -> (f32, f32) {
             left += 0.707 * channel(2) + 0.5 * channel(3) + 0.5 * channel(4) + 0.707 * channel(5);
             right += 0.707 * channel(2) + 0.5 * channel(3) + 0.5 * channel(4) + 0.707 * channel(6);
         }
-        _ => {
+        8 => {
             left += 0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(4) + 0.707 * channel(6);
             right +=
                 0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(5) + 0.707 * channel(7);
+        }
+        _ => {
+            // 7.1 plus any extra channels, which are split equally so they are
+            // not silently dropped.
+            left += 0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(4) + 0.707 * channel(6);
+            right +=
+                0.707 * channel(2) + 0.5 * channel(3) + 0.707 * channel(5) + 0.707 * channel(7);
+            for sample in frame.iter().skip(8) {
+                left += 0.5 * sample;
+                right += 0.5 * sample;
+            }
         }
     }
     (left, right)
@@ -3646,6 +4561,104 @@ fn resample_kernel_table(cutoff: f64) -> Vec<f64> {
         }
     }
     table
+}
+
+fn id3v2_len(input: &[u8]) -> Option<usize> {
+    if input.len() < 10 || &input[..3] != b"ID3" {
+        return None;
+    }
+    let size = ((input[6] as usize & 0x7f) << 21)
+        | ((input[7] as usize & 0x7f) << 14)
+        | ((input[8] as usize & 0x7f) << 7)
+        | (input[9] as usize & 0x7f);
+    let footer = if input[5] & 0x10 != 0 { 10 } else { 0 };
+    let end = 10 + size + footer;
+    (end <= input.len()).then_some(end)
+}
+
+fn preserve_mp3_id3v2(input: &[u8], output: Vec<u8>) -> Vec<u8> {
+    let Some(tag_len) = id3v2_len(input) else {
+        return output;
+    };
+    let audio = strip_id3v2(&output);
+    let mut result = Vec::with_capacity(tag_len + audio.len());
+    result.extend_from_slice(&input[..tag_len]);
+    result.extend_from_slice(audio);
+    result
+}
+
+fn flac_metadata_end(input: &[u8]) -> Option<usize> {
+    if !input.starts_with(b"fLaC") {
+        return None;
+    }
+    let mut position = 4;
+    loop {
+        let header = input.get(position..position + 4)?;
+        let last = header[0] & 0x80 != 0;
+        let length =
+            ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | header[3] as usize;
+        position = position.checked_add(4 + length)?;
+        if last {
+            return (position <= input.len()).then_some(position);
+        }
+    }
+}
+
+fn flac_metadata_blocks(input: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    let end = flac_metadata_end(input)?;
+    let mut blocks = Vec::new();
+    let mut position = 4;
+    while position < end {
+        let header = input.get(position..position + 4)?;
+        let kind = header[0] & 0x7f;
+        let length =
+            ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | header[3] as usize;
+        let data = input.get(position + 4..position + 4 + length)?.to_vec();
+        blocks.push((kind, data));
+        position += 4 + length;
+    }
+    Some(blocks)
+}
+
+fn rebuild_flac(blocks: &[(u8, Vec<u8>)], audio: &[u8]) -> Vec<u8> {
+    let mut output = b"fLaC".to_vec();
+    for (index, (kind, data)) in blocks.iter().enumerate() {
+        let last = index + 1 == blocks.len();
+        output.push(if last { 0x80 } else { 0 } | kind);
+        output.extend_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
+        output.extend_from_slice(data);
+    }
+    output.extend_from_slice(audio);
+    output
+}
+
+/// Copies Vorbis comments and pictures from a FLAC input to FLAC output. The
+/// encoder writes fresh audio metadata, so the descriptive blocks are replaced
+/// rather than appended a second time.
+fn preserve_flac_tags(input: &[u8], output: Vec<u8>) -> Vec<u8> {
+    let input = strip_id3v2(input);
+    let Some(input_blocks) = flac_metadata_blocks(input) else {
+        return output;
+    };
+    let Some(mut output_blocks) = flac_metadata_blocks(&output) else {
+        return output;
+    };
+    let tags: Vec<_> = input_blocks
+        .into_iter()
+        .filter(|(kind, data)| (*kind == 4 || *kind == 6) && data.len() <= 0xFF_FFFF)
+        .collect();
+    if tags.is_empty() {
+        return output;
+    }
+    output_blocks.retain(|(kind, _)| *kind != 4 && *kind != 6);
+    let insert_at = usize::from(output_blocks.first().is_some_and(|(kind, _)| *kind == 0));
+    for (offset, tag) in tags.into_iter().enumerate() {
+        output_blocks.insert(insert_at + offset, tag);
+    }
+    let Some(audio_start) = flac_metadata_end(&output) else {
+        return output;
+    };
+    rebuild_flac(&output_blocks, &output[audio_start..])
 }
 
 fn strip_id3v2(input: &[u8]) -> &[u8] {
@@ -4332,11 +5345,8 @@ fn flatten_to_rgb(image: &image::DynamicImage, background: [u8; 3]) -> Vec<u8> {
     let rgba = image.to_rgba8();
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     for pixel in rgba.pixels() {
-        let alpha = u16::from(pixel[3]);
-        let inverse = 255 - alpha;
         for (channel, background) in pixel.0[..3].iter().zip(background) {
-            let value = (u16::from(*channel) * alpha + u16::from(background) * inverse + 127) / 255;
-            rgb.push(value as u8);
+            rgb.push(composite_channel(*channel, pixel[3], background));
         }
     }
     rgb
@@ -4531,10 +5541,330 @@ fn gzip_bytes(input: &[u8], compression: Option<u8>) -> Result<Vec<u8>, ConvertE
     Ok(encoder.finish()?)
 }
 
+/// Extracts a ZIP, TAR, TAR.GZ or GZIP archive into independent files.
+/// Entry names are normalized to safe relative paths; absolute paths and
+/// parent-directory components are rejected instead of being written outside
+/// the output directory.
+pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFile>, ConvertError> {
+    let lower_name = input_name.to_ascii_lowercase();
+    let mut outputs = Vec::new();
+    let mut names = HashSet::new();
+    let mut total_bytes = 0_u64;
+
+    if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
+        let decoder = flate2::read::GzDecoder::new(Cursor::new(input));
+        extract_tar_entries(decoder, &mut outputs, &mut names, &mut total_bytes)?;
+    } else if lower_name.ends_with(".tar") {
+        extract_tar_entries(
+            Cursor::new(input),
+            &mut outputs,
+            &mut names,
+            &mut total_bytes,
+        )?;
+    } else if lower_name.ends_with(".zip") {
+        extract_zip_entries(input, &mut outputs, &mut names, &mut total_bytes)?;
+    } else if lower_name.ends_with(".gz") {
+        let name = Path::new(input_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".gz"))
+            .filter(|name| !name.is_empty())
+            .unwrap_or("extracted");
+        let mut decoder = flate2::read::GzDecoder::new(Cursor::new(input));
+        let data = read_archive_entry(&mut decoder, MAX_ARCHIVE_ENTRY_BYTES)?;
+        push_archive_entry(&mut outputs, &mut names, &mut total_bytes, name, data)?;
+    } else {
+        return Err(unsupported(
+            &file_extension(input_name),
+            OutputFormat::Files,
+        ));
+    }
+
+    if outputs.is_empty() {
+        return Err(ConvertError::NoArchiveEntries);
+    }
+    Ok(outputs)
+}
+
+fn extract_zip_entries(
+    input: &[u8],
+    outputs: &mut Vec<ConvertedFile>,
+    names: &mut HashSet<PathBuf>,
+    total_bytes: &mut u64,
+) -> Result<(), ConvertError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(ConvertError::ArchiveTooManyEntries {
+            count: archive.len(),
+            max: MAX_ARCHIVE_ENTRIES,
+        });
+    }
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_owned();
+        let data = read_archive_entry(&mut entry, MAX_ARCHIVE_ENTRY_BYTES)?;
+        push_archive_entry(outputs, names, total_bytes, &name, data)?;
+    }
+    Ok(())
+}
+
+fn extract_tar_entries<R: Read>(
+    reader: R,
+    outputs: &mut Vec<ConvertedFile>,
+    names: &mut HashSet<PathBuf>,
+    total_bytes: &mut u64,
+) -> Result<(), ConvertError> {
+    let mut archive = tar::Archive::new(reader);
+    let mut count = 0_usize;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        count += 1;
+        if count > MAX_ARCHIVE_ENTRIES {
+            return Err(ConvertError::ArchiveTooManyEntries {
+                count,
+                max: MAX_ARCHIVE_ENTRIES,
+            });
+        }
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.to_string_lossy().into_owned();
+        let data = read_archive_entry(&mut entry, MAX_ARCHIVE_ENTRY_BYTES)?;
+        push_archive_entry(outputs, names, total_bytes, &path, data)?;
+    }
+    Ok(())
+}
+
+fn read_archive_entry<R: Read>(reader: &mut R, limit: u64) -> Result<Vec<u8>, ConvertError> {
+    let mut data = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Err(ConvertError::ArchiveTooLarge {
+            max: MAX_ARCHIVE_BYTES,
+        });
+    }
+    Ok(data)
+}
+
+fn push_archive_entry(
+    outputs: &mut Vec<ConvertedFile>,
+    names: &mut HashSet<PathBuf>,
+    total_bytes: &mut u64,
+    name: &str,
+    data: Vec<u8>,
+) -> Result<(), ConvertError> {
+    let path = safe_archive_path(name)?;
+    if !names.insert(path.clone()) {
+        return Err(ConvertError::DuplicateArchiveEntryName(
+            path.display().to_string(),
+        ));
+    }
+    *total_bytes = total_bytes.saturating_add(data.len() as u64);
+    if *total_bytes > MAX_ARCHIVE_BYTES {
+        return Err(ConvertError::ArchiveTooLarge {
+            max: MAX_ARCHIVE_BYTES,
+        });
+    }
+    outputs.push(ConvertedFile {
+        name: path,
+        bytes: data,
+    });
+    Ok(())
+}
+
+fn safe_archive_path(name: &str) -> Result<PathBuf, ConvertError> {
+    let normalized = name.replace('\\', "/");
+    if normalized.is_empty() || normalized.contains('\0') || normalized.starts_with('/') {
+        return Err(ConvertError::UnsafeArchivePath(name.to_owned()));
+    }
+    let mut safe = PathBuf::new();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains(':') {
+            return Err(ConvertError::UnsafeArchivePath(name.to_owned()));
+        }
+        safe.push(part);
+    }
+    if safe.as_os_str().is_empty() {
+        return Err(ConvertError::UnsafeArchivePath(name.to_owned()));
+    }
+    Ok(safe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::{
+        ffi::{OsStr, OsString},
+        io::Read,
+        sync::{Mutex, OnceLock},
+    };
+
+    static VIDEO_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn video_testdata(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    fn real_ffmpeg() -> Option<PathBuf> {
+        let path = VideoToolConfig::default().resolve()?;
+        let output = std::process::Command::new(&path)
+            .arg("-version")
+            .output()
+            .ok()?;
+        let version = String::from_utf8_lossy(&output.stdout);
+        (output.status.success() && version.contains("ffmpeg version")).then_some(path)
+    }
+
+    fn generate_real_video(ffmpeg: &Path, path: &Path) {
+        let output = std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libvpx-vp9",
+                "-b:v",
+                "300k",
+                "-c:a",
+                "libopus",
+                "-shortest",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not generate the synthetic sample: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn ffprobe_for(ffmpeg: &Path) -> Option<PathBuf> {
+        let name = if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        let path = ffmpeg.with_file_name(name);
+        path.is_file().then_some(path)
+    }
+
+    fn ffmpeg_stub() -> &'static Path {
+        static STUB: OnceLock<PathBuf> = OnceLock::new();
+        STUB.get_or_init(|| {
+            let directory =
+                std::env::temp_dir().join(format!("convert2it-ffmpeg-stub-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let source = directory.join("ffmpeg_stub.rs");
+            std::fs::write(
+                &source,
+                r#"
+use std::{env, fs, io::{self, Write}, process, thread, time::Duration};
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Ok(log) = env::var("STUB_LOG") {
+        let _ = fs::write(log, args.join("\n"));
+    }
+    if let Ok(code) = env::var("STUB_EXIT") {
+        if let Ok(stderr) = env::var("STUB_STDERR") {
+            eprintln!("{stderr}");
+        }
+        process::exit(code.parse().unwrap_or(1));
+    }
+    if let Ok(duration) = env::var("STUB_DURATION") {
+        eprintln!("Duration: {duration}");
+    }
+    if let Ok(progress) = env::var("STUB_PROGRESS") {
+        for line in progress.split('|') {
+            println!("{line}");
+        }
+    }
+    if let Ok(milliseconds) = env::var("STUB_SLEEP_MS") {
+        thread::sleep(Duration::from_millis(milliseconds.parse().unwrap_or(0)));
+    }
+    if args.iter().any(|arg| arg == "image2pipe") {
+        let path = env::var("STUB_PNG").unwrap();
+        io::stdout().write_all(&fs::read(path).unwrap()).unwrap();
+        return;
+    }
+    if let Some(output) = args.last() {
+        if env::var_os("STUB_EMPTY").is_some() {
+            let _ = fs::write(output, b"");
+        } else if let Ok(prepared) = env::var("STUB_OUTPUT") {
+            fs::copy(prepared, output).unwrap();
+        }
+    }
+}
+"#,
+            )
+            .unwrap();
+            let executable = directory.join(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            });
+            let status = std::process::Command::new("rustc")
+                .arg("--edition=2021")
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("rustc must be available to build the ffmpeg test stub");
+            assert!(status.success(), "could not build the ffmpeg test stub");
+            executable
+        })
+    }
+
+    struct EnvVars(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvVars {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+
+        fn set(&mut self, key: &'static str, value: impl AsRef<OsStr>) -> &mut Self {
+            self.0.push((key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+            self
+        }
+
+        fn remove(&mut self, key: &'static str) -> &mut Self {
+            self.0.push((key, std::env::var_os(key)));
+            std::env::remove_var(key);
+            self
+        }
+    }
+
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..).rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     fn png_fixture() -> Vec<u8> {
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
@@ -4821,6 +6151,87 @@ mod tests {
     }
 
     #[test]
+    fn extracts_zip_tar_and_gzip_archives() {
+        let zip_bytes = {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("nested/one.txt", options).unwrap();
+            writer.write_all(b"one").unwrap();
+            writer.start_file("two.txt", options).unwrap();
+            writer.write_all(b"two").unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let files = convert_bytes("bundle.zip", &zip_bytes, OutputFormat::Files).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, PathBuf::from("nested/one.txt"));
+        assert_eq!(files[0].bytes, b"one");
+        assert_eq!(files[1].name, PathBuf::from("two.txt"));
+        assert_eq!(files[1].bytes, b"two");
+
+        let tar_bytes = {
+            let mut builder = tar::Builder::new(Vec::new());
+            for (name, content) in [("nested/one.txt", &b"one"[..]), ("two.txt", &b"two"[..])] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, content).unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let files = convert_bytes("bundle.tar", &tar_bytes, OutputFormat::Files).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, PathBuf::from("nested/one.txt"));
+        assert_eq!(files[0].bytes, b"one");
+
+        let gzip = convert_bytes("note.txt", b"hello", OutputFormat::Gzip).unwrap();
+        let files = convert_bytes("note.txt.gz", &gzip[0].bytes, OutputFormat::Files).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, PathBuf::from("note.txt"));
+        assert_eq!(files[0].bytes, b"hello");
+    }
+
+    #[test]
+    fn rejects_archive_paths_that_escape_the_output_directory() {
+        let tar_bytes = {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_path("safe.txt").unwrap();
+            header.as_mut_bytes()[..11].copy_from_slice(b"../evil.txt");
+            header.set_size(3);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &b"bad"[..]).unwrap();
+            builder.into_inner().unwrap()
+        };
+        assert!(matches!(
+            convert_bytes("bundle.tar", &tar_bytes, OutputFormat::Files),
+            Err(ConvertError::UnsafeArchivePath(_))
+        ));
+
+        for name in [
+            "../evil.txt",
+            "nested/../../evil.txt",
+            "/absolute.txt",
+            "C:\\evil.txt",
+        ] {
+            let zip_bytes = {
+                let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                let options = zip::write::SimpleFileOptions::default();
+                writer.start_file(name, options).unwrap();
+                writer.write_all(b"bad").unwrap();
+                writer.finish().unwrap().into_inner()
+            };
+            let error = convert_bytes("bundle.zip", &zip_bytes, OutputFormat::Files).unwrap_err();
+            assert!(
+                matches!(error, ConvertError::UnsafeArchivePath(_)),
+                "{name} produced {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_archive_entry_names() {
         let inputs = vec![
             (PathBuf::from("first/one.txt"), b"one".to_vec()),
@@ -4852,8 +6263,444 @@ mod tests {
     }
 
     #[test]
+    fn video_thumbnail_uses_the_ffmpeg_argument_pipeline() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-thumb-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let png = directory.join("thumb.png");
+        let log = directory.join("args.log");
+        std::fs::write(&png, png_fixture()).unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_PNG", &png)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "movie.mp4",
+            &video_testdata("sample-video.mp4"),
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 1_500,
+                video_thumbnail_width: 640,
+                ..Default::default()
+            },
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("movie.png"));
+        assert_eq!(
+            image::load_from_memory(&result[0].bytes).unwrap().width(),
+            2
+        );
+
+        let args = std::fs::read_to_string(&log).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.windows(2).any(|pair| pair == ["-ss", "1.500"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-vf", "scale=640:-2:flags=lanczos"]));
+        assert!(args.contains(&"image2pipe"));
+        assert!(args.windows(2).any(|pair| pair == ["-frames:v", "1"]));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn remux_copies_streams_and_rejects_empty_ffmpeg_output() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-remux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.webm");
+        let log = directory.join("args.log");
+        let prepared_bytes = b"\x1aE\xdf\xa3stub-webm".to_vec();
+        std::fs::write(&prepared, &prepared_bytes).unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("sample-vp9-opus.webm"));
+        assert_eq!(result[0].bytes, prepared_bytes);
+        let args = std::fs::read_to_string(&log).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.windows(2).any(|pair| pair == ["-c", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:v?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-f", "webm"]));
+
+        env.set("STUB_EMPTY", "1");
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.webm",
+            &video_testdata("sample-vp9-opus.webm"),
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::FfmpegEmptyOutput));
+
+        let invalid = directory.join("invalid.webm");
+        std::fs::write(&invalid, b"not-a-container").unwrap();
+        env.remove("STUB_EMPTY").set("STUB_OUTPUT", &invalid);
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::FfmpegInvalidOutput { container: "webm" }
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn remux_surfaces_ffmpeg_stderr_and_missing_binary() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-failure-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_EXIT", "7")
+            .set("STUB_STDERR", "stub failure details")
+            .remove("STUB_EMPTY");
+
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap_err();
+        match error {
+            ConvertError::FfmpegFailed { status, stderr } => {
+                assert_eq!(status, "7");
+                assert!(stderr.contains("stub failure details"), "{stderr}");
+            }
+            other => panic!("expected FfmpegFailed, got {other}"),
+        }
+
+        let missing = directory.join("does-not-exist");
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(missing),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::FfmpegNotFound { .. }));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn ffmpeg_is_discovered_on_path_and_incompatible_codecs_are_rejected() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-path-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.mp4");
+        let log = directory.join("args.log");
+        std::fs::write(&prepared, b"\0\0\0\x18ftypstub").unwrap();
+        let stub_directory = ffmpeg_stub().parent().unwrap();
+        let mut env = EnvVars::new();
+        env.set("PATH", stub_directory)
+            .set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("CONVERT2IT_FFMPEG")
+            .remove("FFMPEG")
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "sample-vp9-opus.webm",
+            &video_testdata("sample-vp9-opus.webm"),
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result[0].bytes, b"\0\0\0\x18ftypstub");
+
+        let error = validate_remux(
+            &video_testdata("sample-video.mp4"),
+            "mp4",
+            OutputFormat::Webm,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedVideoCodec {
+                stream: "video",
+                codec,
+                container: "webm"
+            } if codec == "h264"
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn incompatible_stream_copy_combinations_return_a_typed_error() {
+        let missing_ffmpeg = std::env::temp_dir().join("convert2it-definitely-missing-ffmpeg");
+        for name in ["sample-even-h264.mp4", "sample-multitrack-h264.mp4"] {
+            let error = convert_bytes_with_video_config(
+                name,
+                &video_testdata(name),
+                OutputFormat::Webm,
+                ConversionOptions::default(),
+                &VideoToolConfig::with_ffmpeg(&missing_ffmpeg),
+            )
+            .unwrap_err();
+            match error {
+                ConvertError::UnsupportedVideoCodec {
+                    stream: "video",
+                    codec,
+                    container: "webm",
+                } => assert_eq!(codec, "h264", "{name}"),
+                other => panic!("{name}: expected an unsupported-codec error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn h264_mp4_to_mp4_remuxes_with_stream_copy() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-mp4-remux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.mp4");
+        let log = directory.join("args.log");
+        std::fs::write(&prepared, b"\0\0\0\x18ftypstub").unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "sample-odd-h264.mp4",
+            &video_testdata("sample-odd-h264.mp4"),
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("sample-odd-h264.mp4"));
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.contains("-c\ncopy"), "{args}");
+        assert!(args.contains("-map\n0:v?"), "{args}");
+        assert!(args.contains("-map\n0:a?"), "{args}");
+        assert!(!args.contains("libvpx"), "{args}");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn real_ffmpeg_generated_media_remux_and_thumbnails_when_available() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let Some(ffmpeg) = real_ffmpeg() else {
+            eprintln!("skipping real-ffmpeg library test: ffmpeg is not available");
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-real-video-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let input_path = directory.join("synthetic.mp4");
+        generate_real_video(&ffmpeg, &input_path);
+        let input = std::fs::read(&input_path).unwrap();
+        let config = VideoToolConfig::with_ffmpeg(&ffmpeg);
+
+        let webm = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(webm[0].name, PathBuf::from("synthetic.webm"));
+        assert!(!webm[0].bytes.is_empty());
+        assert!(webm[0].bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]));
+        let webm_path = directory.join("synthetic.webm");
+        std::fs::write(&webm_path, &webm[0].bytes).unwrap();
+        let ffprobe = ffprobe_for(&ffmpeg);
+        let mut webm_streams = None;
+        if let Some(ffprobe) = ffprobe.as_ref() {
+            let output = std::process::Command::new(ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=format_name:stream=codec_name,codec_type,width,height,channels",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                ])
+                .arg(&webm_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let probe = String::from_utf8_lossy(&output.stdout);
+            assert!(probe.contains("format_name=matroska,webm"), "{probe}");
+            assert!(probe.contains("codec_name=vp9"), "{probe}");
+            assert!(probe.contains("codec_name=opus"), "{probe}");
+            assert!(probe.contains("width=320"), "{probe}");
+            assert!(probe.contains("height=240"), "{probe}");
+            let streams = probe
+                .lines()
+                .filter(|line| !line.starts_with("format_name="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(streams.contains("codec_type=video"), "{streams}");
+            assert!(streams.contains("codec_type=audio"), "{streams}");
+            webm_streams = Some(streams);
+        }
+
+        let back = convert_bytes_with_video_config(
+            "synthetic.webm",
+            &webm[0].bytes,
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(back[0].name, PathBuf::from("synthetic.mp4"));
+        assert_eq!(back[0].bytes.get(4..8), Some(b"ftyp".as_slice()));
+        let back_path = directory.join("synthetic-roundtrip.mp4");
+        std::fs::write(&back_path, &back[0].bytes).unwrap();
+        if let Some(ffprobe) = ffprobe.as_ref() {
+            let output = std::process::Command::new(ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=format_name:stream=codec_name,codec_type,width,height,channels",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                ])
+                .arg(&back_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let probe = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                probe.contains("format_name=") && probe.contains("mp4"),
+                "{probe}"
+            );
+            assert!(probe.contains("codec_name=vp9"), "{probe}");
+            assert!(probe.contains("codec_name=opus"), "{probe}");
+            assert!(probe.contains("width=320"), "{probe}");
+            assert!(probe.contains("height=240"), "{probe}");
+            let streams = probe
+                .lines()
+                .filter(|line| !line.starts_with("format_name="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(webm_streams) = webm_streams.as_deref() {
+                assert_eq!(webm_streams, streams);
+            }
+        }
+
+        let thumbnails = [
+            (OutputFormat::Png, image::ImageFormat::Png),
+            (OutputFormat::Jpeg, image::ImageFormat::Jpeg),
+            (OutputFormat::Webp, image::ImageFormat::WebP),
+        ];
+        for (target, format) in thumbnails {
+            let thumbnail = convert_bytes_with_video_config(
+                "synthetic.mp4",
+                &input,
+                target,
+                ConversionOptions {
+                    video_frame_time_ms: 500,
+                    video_thumbnail_width: 160,
+                    ..Default::default()
+                },
+                &config,
+            )
+            .unwrap();
+            assert!(!thumbnail[0].bytes.is_empty());
+            assert_eq!(image::guess_format(&thumbnail[0].bytes).unwrap(), format);
+            let decoded = image::load_from_memory(&thumbnail[0].bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (160, 120));
+        }
+
+        let at_zero = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 0,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap();
+        let at_half_second = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 500,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap();
+        assert_ne!(at_zero[0].bytes, at_half_second[0].bytes);
+
+        let error = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 10_000,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::FfmpegEmptyOutput));
+        assert_eq!(error.to_string(), "ffmpeg produced no output");
+
+        let error = convert_bytes_with_video_config(
+            "broken.mp4",
+            b"not a movie",
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap_err();
+        match error {
+            ConvertError::FfmpegFailed { status, stderr } => {
+                assert_ne!(status, "0");
+                assert!(!stderr.is_empty());
+            }
+            other => panic!("expected a real ffmpeg failure, got {other}"),
+        }
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn reports_unsupported_format_pairs() {
-        let error = convert_bytes("movie.mp4", b"not a movie", OutputFormat::Png).unwrap_err();
+        let error = convert_bytes("movie.mp4", b"not a movie", OutputFormat::Pdf).unwrap_err();
         assert!(matches!(error, ConvertError::Unsupported { .. }));
     }
 
@@ -5913,6 +7760,45 @@ mod tests {
     }
 
     #[test]
+    fn native_registry_lists_pdf_archive_and_media_handlers() {
+        let registry = native_format_registry();
+        assert_eq!(registry.len(), input_format::InputFormat::SELECTABLE.len());
+        assert!(registry.iter().all(|handler| !handler.outputs.is_empty()));
+
+        let pdf = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Pdf)
+            .unwrap();
+        assert!(pdf.outputs.contains(&OutputFormat::Text));
+        assert!(pdf.outputs.contains(&OutputFormat::TextUtf16Le));
+        assert!(!pdf.outputs.contains(&OutputFormat::Png));
+
+        let archive = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Archive)
+            .unwrap();
+        assert!(archive.outputs.contains(&OutputFormat::Files));
+        assert!(archive.outputs.contains(&OutputFormat::Zip));
+
+        let video = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Video)
+            .unwrap();
+        assert!(video.outputs.contains(&OutputFormat::Png));
+        assert!(video.outputs.contains(&OutputFormat::Jpeg));
+        assert!(video.outputs.contains(&OutputFormat::Webp));
+        assert!(video.outputs.contains(&OutputFormat::Mp4));
+        assert!(video.outputs.contains(&OutputFormat::Webm));
+        assert!(!video.outputs.contains(&OutputFormat::Gif));
+
+        let any = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Any)
+            .unwrap();
+        assert_eq!(any.outputs.first(), Some(&OutputFormat::Files));
+    }
+
+    #[test]
     fn recognizes_the_new_input_formats() {
         assert!(OutputFormat::Png.supports_input("icon.svg"));
         assert!(OutputFormat::Ico.supports_input("icon.ico"));
@@ -5955,7 +7841,11 @@ mod tests {
         for format in OutputFormat::ALL.iter() {
             if matches!(
                 *format,
-                OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip
+                OutputFormat::Zip
+                    | OutputFormat::Tar
+                    | OutputFormat::TarGz
+                    | OutputFormat::Gzip
+                    | OutputFormat::Files
             ) {
                 continue;
             }
@@ -5968,10 +7858,10 @@ mod tests {
             );
         }
 
-        for extension in ["zip", "tar", "tar.gz", "tgz", "gz"] {
+        for extension in ["zip", "tar", "tgz", "gz"] {
             assert!(
-                !extensions.contains(&extension),
-                "archives must not be in the default Supported files filter"
+                extensions.contains(&extension),
+                "archives must be selectable so they can be extracted"
             );
         }
 
@@ -6064,6 +7954,36 @@ mod tests {
         assert!(pdf.contains("/F1 11 Tf"));
         let pages = pdf.matches("/Type /Page").count() - pdf.matches("/Type /Pages").count();
         assert_eq!(pages, 3);
+    }
+
+    #[test]
+    fn extracts_text_from_pdf_input() {
+        let pdf = convert_bytes(
+            "notes.txt",
+            b"Hello from PDF\nSecond line\n",
+            OutputFormat::Pdf,
+        )
+        .unwrap();
+        let text = convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::Text).unwrap();
+        let text = String::from_utf8(text[0].bytes.clone()).unwrap();
+        assert!(text.contains("Hello from PDF"), "extracted: {text:?}");
+        assert!(text.contains("Second line"), "extracted: {text:?}");
+
+        let utf16 = convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::TextUtf16Le).unwrap();
+        assert_eq!(&utf16[0].bytes[..2], &[0xff, 0xfe]);
+
+        assert!(matches!(
+            convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::Png),
+            Err(ConvertError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            convert_bytes(
+                "broken.pdf",
+                b"%PDF-1.7\nnot a document",
+                OutputFormat::Text
+            ),
+            Err(ConvertError::Pdf(_))
+        ));
     }
 
     #[test]
@@ -6649,6 +8569,63 @@ mod tests {
     }
 
     #[test]
+    fn streams_multichannel_downmix_keeps_standard_level() {
+        let directory = stream_temp_dir("stream-downmix-level");
+        let input = directory.join("centre.wav");
+        std::fs::write(
+            &input,
+            wav_channels_at(48_000, 480, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.samples.len(), 480 * 2);
+        let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
+        let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
+        assert!(
+            (left - 0.3535).abs() < 0.002,
+            "streamed centre left was {left}, expected 0.707 * 0.5"
+        );
+        assert!(
+            (right - 0.3535).abs() < 0.002,
+            "streamed centre right was {right}, expected 0.707 * 0.5"
+        );
+
+        std::fs::write(
+            &input,
+            wav_channels_at(48_000, 480, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0]),
+        )
+        .unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
+        let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
+        assert!(
+            (left - 0.3535).abs() < 0.002,
+            "streamed surround left was {left}, expected 0.707 * 0.5"
+        );
+        assert!(
+            right.abs() < 0.002,
+            "a back-left signal leaked into the right channel: {right}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn lists_tracks_from_a_file_without_loading_it() {
         let tracks =
             super::audio_tracks_from_path(&fixture_path("sample-two-opus-tracks.webm")).unwrap();
@@ -6733,6 +8710,23 @@ mod tests {
                 available: 2
             }
         ));
+    }
+
+    #[test]
+    fn path_and_memory_track_lists_agree() {
+        for (name, extension) in [
+            ("sample-two-opus-tracks.webm", "webm"),
+            ("sample-interleaved-tracks.mkv", "mkv"),
+            ("sample-video.mp4", "mp4"),
+        ] {
+            let input = fixture(name);
+            let path = fixture_path(name);
+            assert_eq!(
+                super::audio_tracks(&input, extension).unwrap(),
+                super::audio_tracks_from_path(&path).unwrap(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -6822,9 +8816,15 @@ mod tests {
                 .bytes,
         );
 
+        for parsed in [&default, &first, &second] {
+            assert_eq!(parsed.channels, 1);
+            assert_eq!(parsed.sample_rate, 48_000);
+        }
         assert_eq!(default.samples.len(), 48_000);
         assert_eq!(first.samples.len(), 48_000);
         assert_eq!(second.samples.len(), 48_480);
+        assert_eq!(default.samples, first.samples);
+        assert_ne!(first.samples, second.samples);
         assert!((decoded_tone_frequency(&default) - 440.0).abs() < 5.0);
         assert!((decoded_tone_frequency(&first) - 440.0).abs() < 5.0);
         assert!((decoded_tone_frequency(&second) - 880.0).abs() < 5.0);
@@ -6868,6 +8868,10 @@ mod tests {
                 available: 2
             }
         ));
+        assert!(
+            output.get_ref().is_empty(),
+            "an invalid track selection wrote audio before returning an error"
+        );
     }
 
     #[test]
@@ -7144,6 +9148,20 @@ mod tests {
         // Only the centre channel carries audio. Keeping the first two channels
         // would produce silence, which is the bug this test guards against.
         let input = fixture("sample-ac3-center.ac3");
+        let decoded = convert_bytes("sample-ac3-center.ac3", &input, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 6);
+        assert_eq!(decoded.sample_rate, 48_000);
+        let centre_peak = decoded
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(centre_peak > 1_000, "the AC-3 centre channel is silent");
+
         let stereo = convert_bytes_with_options(
             "sample-ac3-center.ac3",
             &input,
@@ -7156,7 +9174,37 @@ mod tests {
         .unwrap();
         let stereo = parse_wav(&stereo[0].bytes);
         assert_eq!(stereo.channels, 2);
-        assert_audible(&stereo.samples);
+        assert_eq!(stereo.sample_rate, 48_000);
+        assert_eq!(stereo.samples.len(), decoded.samples.len() / 3);
+        let left_peak = stereo
+            .samples
+            .iter()
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        let right_peak = stereo
+            .samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(left_peak > 1_000, "the centre tone was lost from the left");
+        assert!(
+            right_peak > 1_000,
+            "the centre tone was lost from the right"
+        );
+        assert!(
+            left_peak.abs_diff(right_peak) < left_peak / 20,
+            "the centre tone was not balanced: {left_peak} vs {right_peak}"
+        );
+        let ratio = f32::from(left_peak) / f32::from(centre_peak);
+        assert!(
+            (ratio - 0.707).abs() < 0.02,
+            "the centre channel was downmixed at {ratio}, expected 0.707"
+        );
 
         let mono = convert_bytes_with_options(
             "sample-ac3-center.ac3",
@@ -7170,6 +9218,7 @@ mod tests {
         .unwrap();
         let mono = parse_wav(&mono[0].bytes);
         assert_eq!(mono.channels, 1);
+        assert_eq!(mono.sample_rate, 48_000);
         assert_audible(&mono.samples);
     }
 
@@ -7250,6 +9299,7 @@ mod tests {
             .unwrap();
             let parsed = parse_wav(&converted[0].bytes);
             assert_eq!(parsed.channels, 2, "{name}");
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
             assert_eq!(parsed.samples.len(), 128 * 2, "{name}");
             let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
             let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
@@ -7260,6 +9310,205 @@ mod tests {
             assert!(
                 (right - expected_right).abs() < 0.002,
                 "{name}: right was {right}, expected {expected_right}"
+            );
+        }
+    }
+
+    #[test]
+    fn multichannel_audio_converts_to_every_audio_target() {
+        let input = wav_channels_at(48_000, 48_000, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        for target in [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Aiff,
+            OutputFormat::Au,
+            OutputFormat::Opus,
+            OutputFormat::Mp3,
+        ] {
+            let converted = convert_bytes_with_options(
+                "surround.wav",
+                &input,
+                target,
+                ConversionOptions::default(),
+            )
+            .unwrap();
+            let bytes = &converted[0].bytes;
+            assert!(!bytes.is_empty(), "{target:?} produced no output");
+
+            match target {
+                OutputFormat::Wav => {
+                    let parsed = parse_wav(bytes);
+                    assert_eq!(parsed.channels, 6, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert_eq!(parsed.samples.len(), 48_000 * 6, "{target:?}");
+                    assert_audible(&parsed.samples);
+                }
+                OutputFormat::Flac => {
+                    let wav = convert_bytes("surround.flac", bytes, OutputFormat::Wav).unwrap();
+                    let parsed = parse_wav(&wav[0].bytes);
+                    assert_eq!(parsed.channels, 6, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert_eq!(parsed.samples.len(), 48_000 * 6, "{target:?}");
+                    assert_audible(&parsed.samples);
+                }
+                OutputFormat::Aiff => {
+                    assert_eq!(&bytes[..4], b"FORM", "{target:?}");
+                    assert_eq!(u16::from_be_bytes(bytes[20..22].try_into().unwrap()), 6);
+                    assert_eq!(
+                        u32::from_be_bytes(bytes[22..26].try_into().unwrap()),
+                        48_000
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(bytes[42..46].try_into().unwrap()),
+                        48_000 * 6 * 2 + 8
+                    );
+                }
+                OutputFormat::Au => {
+                    assert_eq!(&bytes[..4], b".snd", "{target:?}");
+                    assert_eq!(
+                        u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+                        48_000 * 6 * 2
+                    );
+                    assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 6);
+                }
+                OutputFormat::Opus => {
+                    let wav = convert_bytes("surround.opus", bytes, OutputFormat::Wav).unwrap();
+                    let parsed = parse_wav(&wav[0].bytes);
+                    assert_eq!(parsed.channels, 6, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert!(
+                        parsed.samples.len() / 6 >= 48_000,
+                        "{target:?} was truncated"
+                    );
+                    assert_audible(&parsed.samples);
+                }
+                OutputFormat::Mp3 => {
+                    let wav = convert_bytes("surround.mp3", bytes, OutputFormat::Wav).unwrap();
+                    let parsed = parse_wav(&wav[0].bytes);
+                    assert_eq!(parsed.channels, 2, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert!(
+                        parsed.samples.len() / 2 >= 47_000,
+                        "{target:?} was truncated"
+                    );
+                    assert_audible(&parsed.samples);
+                    let left_peak = parsed
+                        .samples
+                        .iter()
+                        .step_by(2)
+                        .map(|sample| sample.unsigned_abs())
+                        .max()
+                        .unwrap();
+                    let right_peak = parsed
+                        .samples
+                        .iter()
+                        .skip(1)
+                        .step_by(2)
+                        .map(|sample| sample.unsigned_abs())
+                        .max()
+                        .unwrap();
+                    assert!(left_peak > 1_000, "the centre tone was lost from the left");
+                    assert!(
+                        right_peak > 1_000,
+                        "the centre tone was lost from the right"
+                    );
+                }
+                _ => unreachable!("unexpected audio target {target:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn downmix_layouts_use_explicit_coefficients() {
+        // Each case has one non-zero channel, so the result is exactly the
+        // coefficient for that layout rather than an accidental slice.
+        // Expected values: stereo left/right and mono.
+        let cases: &[(&str, &[f32], f32, f32, f32)] = &[
+            ("mono up-mix", &[0.5], 0.5, 0.5, 0.5),
+            ("stereo", &[0.5, 0.25], 0.5, 0.25, 0.375),
+            ("3.0 centre", &[0.0, 0.0, 0.5], 0.3535, 0.3535, 0.3535),
+            ("quad back left", &[0.0, 0.0, 0.5, 0.0], 0.3535, 0.0, 0.25),
+            ("quad back right", &[0.0, 0.0, 0.0, 0.5], 0.0, 0.3535, 0.25),
+            (
+                "5.0 back left",
+                &[0.0, 0.0, 0.0, 0.5, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            ("5.1 LFE", &[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], 0.25, 0.25, 0.25),
+            (
+                "6.1 back centre",
+                &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+                0.25,
+                0.25,
+                0.25,
+            ),
+            (
+                "6.1 side left",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            (
+                "7.1 back left",
+                &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            (
+                "7.1 side left",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            (
+                "7.1 side right",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                0.0,
+                0.3535,
+                0.25,
+            ),
+            (
+                "extra channel above 7.1",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                0.25,
+                0.25,
+                0.25,
+            ),
+        ];
+
+        for (name, frame, expected_left, expected_right, expected_mono) in cases {
+            let audio = super::DecodedAudio {
+                samples: frame.to_vec(),
+                channels: frame.len(),
+                sample_rate: 48_000,
+                source_bits: None,
+            };
+            let stereo = super::remix_channels(audio.clone(), AudioChannels::Stereo);
+            assert_eq!(stereo.channels, 2, "{name}");
+            assert_eq!(stereo.samples.len(), 2, "{name}");
+            assert!(
+                (stereo.samples[0] - expected_left).abs() < 1e-5,
+                "{name}: left was {}, expected {expected_left}",
+                stereo.samples[0]
+            );
+            assert!(
+                (stereo.samples[1] - expected_right).abs() < 1e-5,
+                "{name}: right was {}, expected {expected_right}",
+                stereo.samples[1]
+            );
+
+            let mono = super::remix_channels(audio, AudioChannels::Mono);
+            assert_eq!(mono.channels, 1, "{name}");
+            assert_eq!(mono.samples.len(), 1, "{name}");
+            assert!(
+                (mono.samples[0] - expected_mono).abs() < 1e-5,
+                "{name}: mono was {}, expected {expected_mono}",
+                mono.samples[0]
             );
         }
     }
@@ -7316,6 +9565,32 @@ mod tests {
             );
             assert!(direct_peak > 0.99, "the downmix was over-attenuated");
         }
+    }
+
+    #[test]
+    fn hot_downmix_preserves_relative_levels() {
+        // The left side is twice the right before the mix (L + BL vs R + BR).
+        // Peak scaling must keep that 2:1 balance.
+        let frame = [1.0_f32, 0.5, 0.0, 0.0, 0.5, 0.25];
+        let samples = frame.iter().copied().cycle().take(6 * 256).collect();
+        let direct = super::remix_channels(
+            super::DecodedAudio {
+                samples,
+                channels: 6,
+                sample_rate: 48_000,
+                source_bits: None,
+            },
+            AudioChannels::Stereo,
+        );
+        assert!(direct.samples.iter().all(|sample| sample.is_finite()));
+        let left = direct.samples[0];
+        let right = direct.samples[1];
+        assert!(left <= 1.0 + 1e-6, "the downmix exceeded full scale");
+        assert!(left > 0.99, "the downmix was over-attenuated");
+        assert!(
+            (right / left - 0.5).abs() < 1e-5,
+            "peak scaling changed the channel balance: {left} vs {right}"
+        );
     }
 
     #[test]
@@ -7437,6 +9712,36 @@ mod tests {
             .max()
             .unwrap();
         assert!(centre_peak > 1_000, "the centre channel was not preserved");
+
+        let directory = stream_temp_dir("opus-51-stream");
+        let path = directory.join("centre.wav");
+        std::fs::write(&path, &input).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &path,
+            "centre.wav",
+            OutputFormat::Opus,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let streamed =
+            convert_bytes("centre.opus", &output.into_inner(), OutputFormat::Wav).unwrap();
+        let streamed = parse_wav(&streamed[0].bytes);
+        assert_eq!(streamed.channels, 6);
+        let centre_peak = streamed
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(
+            centre_peak > 1_000,
+            "streaming Opus did not preserve the centre channel"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -8363,6 +10668,46 @@ mod tests {
     }
 
     #[test]
+    fn preserves_id3v2_tags_when_re_encoding_mp3() {
+        let mp3 = convert_bytes(
+            "tone.wav",
+            &wav_fixture_at(44_100, 8_000),
+            OutputFormat::Mp3,
+        )
+        .unwrap();
+        let mut tagged = b"ID3\x04\x00\x00\x00\x00\x00\x0a".to_vec();
+        tagged.extend([0_u8; 10]);
+        tagged.extend_from_slice(&mp3[0].bytes);
+
+        let reencoded = convert_bytes("tagged.mp3", &tagged, OutputFormat::Mp3).unwrap();
+        assert!(reencoded[0].bytes.starts_with(&tagged[..20]));
+    }
+
+    #[test]
+    fn preserves_flac_vorbis_comments_and_pictures() {
+        let flac = convert_bytes(
+            "tone.wav",
+            &wav_fixture_at(44_100, 8_000),
+            OutputFormat::Flac,
+        )
+        .unwrap();
+        let mut blocks = flac_metadata_blocks(&flac[0].bytes).unwrap();
+        let mut comment = Vec::new();
+        comment.extend_from_slice(&4_u32.to_le_bytes());
+        comment.extend_from_slice(b"test");
+        comment.extend_from_slice(&0_u32.to_le_bytes());
+        blocks.insert(1, (4, comment.clone()));
+        let audio_start = flac_metadata_end(&flac[0].bytes).unwrap();
+        let tagged = rebuild_flac(&blocks, &flac[0].bytes[audio_start..]);
+
+        let reencoded = convert_bytes("tagged.flac", &tagged, OutputFormat::Flac).unwrap();
+        let output_blocks = flac_metadata_blocks(&reencoded[0].bytes).unwrap();
+        assert!(output_blocks
+            .iter()
+            .any(|(kind, data)| *kind == 4 && data == &comment));
+    }
+
+    #[test]
     fn mp3_output_preserves_tone_channels_duration_and_bitrate() {
         for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
             let frames = sample_rate;
@@ -8499,7 +10844,31 @@ mod tests {
         tiff
     }
 
+    fn tiff_with_primary_and_thumbnail_orientations(primary: u16, thumbnail: u16) -> Vec<u8> {
+        fn push_ifd(tiff: &mut Vec<u8>, orientation: u16, next_ifd: u32) {
+            tiff.extend_from_slice(&1_u16.to_le_bytes());
+            tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+            tiff.extend_from_slice(&3_u16.to_le_bytes());
+            tiff.extend_from_slice(&1_u32.to_le_bytes());
+            tiff.extend_from_slice(&orientation.to_le_bytes());
+            tiff.extend_from_slice(&[0, 0]);
+            tiff.extend_from_slice(&next_ifd.to_le_bytes());
+        }
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        let thumbnail_ifd = 8 + 2 + 12 + 4;
+        push_ifd(&mut tiff, primary, thumbnail_ifd);
+        push_ifd(&mut tiff, thumbnail, 0);
+        tiff
+    }
+
     fn jpeg_with_exif_orientations(image: &image::DynamicImage, orientations: &[u16]) -> Vec<u8> {
+        jpeg_with_exif_tiff(image, &tiff_with_orientations(orientations))
+    }
+
+    fn jpeg_with_exif_tiff(image: &image::DynamicImage, tiff: &[u8]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
         image
             .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
@@ -8509,9 +10878,8 @@ mod tests {
             .unwrap();
         let jpeg = cursor.into_inner();
         let mut result = jpeg[..2].to_vec();
-        let tiff = tiff_with_orientations(orientations);
         let mut segment = b"Exif\0\0".to_vec();
-        segment.extend_from_slice(&tiff);
+        segment.extend_from_slice(tiff);
         result.extend_from_slice(&[0xFF, 0xE1]);
         result.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
         result.extend_from_slice(&segment);
@@ -8526,6 +10894,46 @@ mod tests {
                 "{label}: channel {channel} got {actual}, expected {expected}"
             );
         }
+    }
+
+    fn expected_composite(source: [u8; 3], alpha: u8, background: [u8; 3]) -> [u8; 3] {
+        let alpha = u16::from(alpha);
+        let inverse = 255 - alpha;
+        std::array::from_fn(|channel| {
+            ((u16::from(source[channel]) * alpha + u16::from(background[channel]) * inverse + 127)
+                / 255) as u8
+        })
+    }
+
+    #[test]
+    fn preserves_jpeg_exif_without_double_rotating() {
+        let source = image::RgbImage::from_fn(8, 8, |x, _| {
+            if x < 4 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+        let input = jpeg_with_exif_orientations(&image::DynamicImage::ImageRgb8(source), &[6]);
+
+        let rotated = convert_bytes("photo.jpg", &input, OutputFormat::Jpeg).unwrap();
+        assert_eq!(exif_orientation(&rotated[0].bytes), Some(1));
+        assert_eq!(
+            image::load_from_memory(&rotated[0].bytes).unwrap().width(),
+            8
+        );
+
+        let unrotated = convert_bytes_with_options(
+            "photo.jpg",
+            &input,
+            OutputFormat::Jpeg,
+            ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(exif_orientation(&unrotated[0].bytes), Some(6));
     }
 
     #[test]
@@ -8606,6 +11014,29 @@ mod tests {
             [255, 0, 0],
             35,
             "disabled top-left",
+        );
+    }
+
+    #[test]
+    fn exif_orientation_ignores_thumbnail_ifd_orientation() {
+        let mut source = image::RgbImage::new(2, 1);
+        source.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        source.put_pixel(1, 0, image::Rgb([0, 0, 255]));
+        let source = image::DynamicImage::ImageRgb8(source);
+        let jpeg =
+            jpeg_with_exif_tiff(&source, &tiff_with_primary_and_thumbnail_orientations(6, 3));
+
+        assert_eq!(super::exif_orientation(&jpeg), Some(6));
+        let converted = convert_bytes("photo.jpg", &jpeg, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1, 2));
+        let pixels = decoded.to_rgb8();
+        let top = pixels.get_pixel(0, 0).0;
+        let bottom = pixels.get_pixel(0, 1).0;
+        assert!(top[0] > 200 && top[2] < 60, "top pixel is {top:?}");
+        assert!(
+            bottom[2] > 200 && bottom[0] < 60,
+            "bottom pixel is {bottom:?}"
         );
     }
 
@@ -8697,12 +11128,15 @@ mod tests {
 
     #[test]
     fn composites_transparency_into_jpeg_and_bmp_with_two_backgrounds() {
-        let mut rgba = image::RgbaImage::new(16, 8);
+        let transparent = image::Rgba([255, 0, 0, 0]);
+        let semi_transparent = image::Rgba([200, 100, 50, 128]);
+        let opaque = image::Rgba([10, 200, 30, 255]);
+        let mut rgba = image::RgbaImage::new(24, 8);
         for (x, _, pixel) in rgba.enumerate_pixels_mut() {
-            *pixel = if x < 8 {
-                image::Rgba([255, 0, 0, 0])
-            } else {
-                image::Rgba([10, 200, 30, 255])
+            *pixel = match x {
+                0..=7 => transparent,
+                8..=15 => semi_transparent,
+                _ => opaque,
             };
         }
         let mut png = Vec::new();
@@ -8711,6 +11145,11 @@ mod tests {
             .unwrap();
 
         for background in [[0, 0, 255], [12, 34, 56]] {
+            let expected = [
+                expected_composite([255, 0, 0], 0, background),
+                expected_composite([200, 100, 50], 128, background),
+                expected_composite([10, 200, 30], 255, background),
+            ];
             for (target, format, tolerance) in [
                 (OutputFormat::Jpeg, image::ImageFormat::Jpeg, 25),
                 (OutputFormat::Bmp, image::ImageFormat::Bmp, 0),
@@ -8729,19 +11168,57 @@ mod tests {
                 let decoded = image::load_from_memory_with_format(&converted[0].bytes, format)
                     .unwrap()
                     .to_rgb8();
-                assert_eq!((decoded.width(), decoded.height()), (16, 8));
-                assert_rgb_near(
-                    decoded.get_pixel(2, 4).0,
-                    background,
-                    tolerance,
-                    "transparent area",
-                );
-                assert_rgb_near(
-                    decoded.get_pixel(13, 4).0,
-                    [10, 200, 30],
-                    tolerance,
-                    "opaque area",
-                );
+                assert_eq!((decoded.width(), decoded.height()), (24, 8));
+                for (x, expected, label) in [
+                    (4, expected[0], "transparent area"),
+                    (12, expected[1], "semi-transparent area"),
+                    (20, expected[2], "opaque area"),
+                ] {
+                    assert_rgb_near(decoded.get_pixel(x, 4).0, expected, tolerance, label);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_preserving_targets_ignore_the_configured_background() {
+        let pixels = [
+            image::Rgba([255, 0, 0, 0]),
+            image::Rgba([200, 100, 50, 128]),
+            image::Rgba([10, 200, 30, 255]),
+        ];
+        let mut rgba = image::RgbaImage::new(3, 1);
+        for (x, pixel) in pixels.iter().enumerate() {
+            rgba.put_pixel(x as u32, 0, *pixel);
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        for (target, format) in [
+            (OutputFormat::Png, image::ImageFormat::Png),
+            (OutputFormat::Webp, image::ImageFormat::WebP),
+        ] {
+            let converted = convert_bytes_with_options(
+                "alpha.png",
+                &png,
+                target,
+                ConversionOptions {
+                    image_background: [1, 2, 3],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let decoded = image::load_from_memory_with_format(&converted[0].bytes, format).unwrap();
+            assert!(
+                decoded.color().has_alpha(),
+                "{target:?} output lost its alpha channel"
+            );
+            let decoded = decoded.to_rgba8();
+            assert_eq!((decoded.width(), decoded.height()), (3, 1));
+            for (x, expected) in pixels.iter().enumerate() {
+                assert_eq!(*decoded.get_pixel(x as u32, 0), *expected);
             }
         }
     }

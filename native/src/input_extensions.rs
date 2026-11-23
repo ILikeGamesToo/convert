@@ -9,6 +9,10 @@ pub const IMAGE_INPUT_EXTENSIONS: &[&str] = &[
 /// Text and data extensions accepted by the conversion engine.
 pub const DATA_INPUT_EXTENSIONS: &[&str] = &["txt", "csv", "json", "yaml", "yml", "toml"];
 
+/// PDF documents are read as text. Rendering PDF pages to images requires a
+/// separate PDF rasterizer and is not part of the native handler yet.
+pub const PDF_INPUT_EXTENSIONS: &[&str] = &["pdf"];
+
 /// Audio extensions accepted by the conversion engine, including video
 /// containers whose audio track can be extracted.
 pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
@@ -16,14 +20,19 @@ pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
     "alac", "aiff", "aif", "ac3", "eac3", "ec3",
 ];
 
-/// Every non-archive extension accepted by the conversion engine, for the
-/// default "Supported files" filter. Archive files can be selected through
-/// "All files" when creating a new archive.
+/// Archive extensions accepted for extraction and re-packing.
+pub const ARCHIVE_INPUT_EXTENSIONS: &[&str] = &["zip", "tar", "gz", "tgz"];
+
+/// Every extension accepted by the conversion engine, for the default
+/// "Supported files" filter. Archive inputs are included so ZIP/TAR/GZIP can be
+/// extracted with the `files` target.
 pub fn supported_input_extensions() -> Vec<&'static str> {
     IMAGE_INPUT_EXTENSIONS
         .iter()
         .chain(DATA_INPUT_EXTENSIONS)
+        .chain(PDF_INPUT_EXTENSIONS)
         .chain(AUDIO_INPUT_EXTENSIONS)
+        .chain(ARCHIVE_INPUT_EXTENSIONS)
         .copied()
         .collect()
 }

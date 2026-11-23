@@ -1,10 +1,32 @@
 # Native test fixtures
 
-These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding plus audio extraction from MP4 and WebM videos, including a VP9 + Opus WebM → MP4 → WebM remux round trip.
+These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, and H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies.
 
 - `piano.ogg` — Ogg Vorbis, CC0 1.0. Source: [`themankindproject/audiofp`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/piano.ogg); its [`CREDITS.md`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/CREDITS.md) marks it CC0 and generated for that project.
 - `sample.m4a` — AAC in an audio-only M4A, 22 KB. Remuxed from the audio track of WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4) with the video track removed and the `esds` SLConfigDescriptor set to the MP4 predefined value. WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
 - `sample-video.mp4` — H.264 video with an AAC audio track, 53 KB. Copied from WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4). WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
+- `sample-odd-h264.mp4` — 321×241 H.264 High 4:4:4 Predictive (`yuv444p`) with one 48 kHz mono AAC track, 1 s. Generated with FFmpeg 9.1 (libx264 and the native AAC encoder) from FFmpeg's own `color` and `sine` sources, so it contains no third-party media. This is the odd-dimension MP4 remux fixture; tests must not need libx264 because the file is committed:
+
+  ```sh
+  ffmpeg -y -f lavfi -i color=c=black:s=321x241:r=30:d=1 \
+    -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1 \
+    -c:v libx264 -pix_fmt yuv444p -profile:v high444 -crf 18 \
+    -c:a aac -b:a 96k -ac 1 -shortest sample-odd-h264.mp4
+  ```
+- `sample-even-h264.mp4` — 320×240 H.264 High (`yuv420p`) with one 48 kHz mono AAC track, 1 s. The even-dimension counterpart, generated with the same FFmpeg 9.1 sources and encoder settings as the odd fixture; used for the H.264→WebM rejection test:
+
+  ```sh
+  ffmpeg -y -f lavfi -i color=c=black:s=320x240:r=30:d=1 \
+    -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1 \
+    -c:v libx264 -pix_fmt yuv420p -profile:v high -crf 18 \
+    -c:a aac -b:a 96k -ac 1 -shortest sample-even-h264.mp4
+  ```
+- `sample-multitrack-h264.mp4` — two copied H.264 video tracks plus the AAC track from `sample-even-h264.mp4`. Used to prove that an MP4 with more than one video track is rejected instead of being stream-copied:
+
+  ```sh
+  ffmpeg -y -i sample-even-h264.mp4 -map 0:v:0 -map 0:v:0 -map 0:a:0 \
+    -c copy sample-multitrack-h264.mp4
+  ```
 - `sample-opus.webm` — VP9 video with an Opus audio track, 99 KB. Copied from Chromium's [`media/test/data/bear-vp9-opus.webm`](https://github.com/chromium/chromium/blob/main/media/test/data/bear-vp9-opus.webm). Chromium is licensed under the [3-Clause BSD License](https://chromium.googlesource.com/chromium/src/+/main/LICENSE).
 - `sample-opus.mp4` — AV1 video with an Opus audio track, 49 KB. Copied from Chromium's [`media/test/data/bear-av1-opus.mp4`](https://github.com/chromium/chromium/blob/main/media/test/data/bear-av1-opus.mp4). Chromium is licensed under the [3-Clause BSD License](https://chromium.googlesource.com/chromium/src/+/main/LICENSE).
 - `sample-vp9-opus.webm`, `sample-vp9-opus.mp4`, and `sample-vp9-opus-roundtrip.webm` — 2 s of generated 320×240 VP9 video and a 440 Hz Opus sine tone, remuxed WebM → MP4 → WebM without re-encoding. Generated with FFmpeg 9.1 (libvpx 1.17.0, libopus) from FFmpeg's own `testsrc2` and `sine` sources, so they contain no third-party media:

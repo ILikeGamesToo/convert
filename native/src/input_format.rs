@@ -25,6 +25,7 @@ pub enum InputFormat {
     Json,
     Yaml,
     Toml,
+    Pdf,
     Wav,
     Mp3,
     Flac,
@@ -41,7 +42,7 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 31] = [
+    pub const SELECTABLE: [Self; 32] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -62,6 +63,7 @@ impl InputFormat {
         Self::Json,
         Self::Yaml,
         Self::Toml,
+        Self::Pdf,
         Self::Wav,
         Self::Mp3,
         Self::Flac,
@@ -96,6 +98,7 @@ impl InputFormat {
             Self::Json => "JSON data",
             Self::Yaml => "YAML data",
             Self::Toml => "TOML data",
+            Self::Pdf => "PDF document",
             Self::Wav => "WAV audio",
             Self::Mp3 => "MP3 audio",
             Self::Flac => "FLAC audio",
@@ -133,6 +136,7 @@ impl InputFormat {
             Self::Json => "JavaScript Object Notation",
             Self::Yaml => "YAML data",
             Self::Toml => "TOML data",
+            Self::Pdf => "PDF text extraction",
             Self::Wav => "Waveform audio",
             Self::Mp3 => "MPEG audio",
             Self::Flac => "Free Lossless Audio Codec",
@@ -169,6 +173,7 @@ impl InputFormat {
             Self::Json => "JSON",
             Self::Yaml => "YAML",
             Self::Toml => "TOML",
+            Self::Pdf => "PDF",
             Self::Wav => "WAV",
             Self::Mp3 => "MP3",
             Self::Flac => "FLAC",
@@ -206,6 +211,7 @@ impl InputFormat {
             Self::Json => "json",
             Self::Yaml => "yaml",
             Self::Toml => "toml",
+            Self::Pdf => "pdf",
             Self::Wav => "wav",
             Self::Mp3 => "mp3",
             Self::Flac => "flac",
@@ -314,6 +320,7 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "json" => InputFormat::Json,
         "yaml" | "yml" => InputFormat::Yaml,
         "toml" => InputFormat::Toml,
+        "pdf" => InputFormat::Pdf,
         "wav" => InputFormat::Wav,
         "mp3" => InputFormat::Mp3,
         "flac" => InputFormat::Flac,
@@ -377,6 +384,9 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
     }
     if bytes.starts_with(b"DDS ") {
         return Some(InputFormat::Dds);
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some(InputFormat::Pdf);
     }
     if bytes.starts_with(b"fLaC") {
         return Some(InputFormat::Flac);
@@ -474,6 +484,7 @@ mod tests {
             ("data.yaml", InputFormat::Yaml),
             ("data.yml", InputFormat::Yaml),
             ("data.toml", InputFormat::Toml),
+            ("document.pdf", InputFormat::Pdf),
             ("song.wav", InputFormat::Wav),
             ("song.mp3", InputFormat::Mp3),
             ("song.flac", InputFormat::Flac),
@@ -506,7 +517,7 @@ mod tests {
 
     #[test]
     fn covers_every_supported_input_extension() {
-        for extension in convert_to_it_native::supported_input_extensions() {
+        for extension in crate::supported_input_extensions() {
             let format = detect_from_bytes(&format!("sample.{extension}"), b"");
             assert_ne!(format, InputFormat::Any, ".{extension} was not mapped");
             assert_ne!(format, InputFormat::Mixed, ".{extension} mapped to mixed");

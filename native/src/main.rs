@@ -14,17 +14,17 @@ use std::{
     time::Duration,
 };
 
-mod input_format;
-
 use convert_to_it_native::{
     audio_output_name, audio_tracks_from_path, convert_audio_file_to_writer_with_cancel,
-    convert_batch_with_options, convert_bytes_with_options, supported_input_extensions,
-    AudioBitDepth, AudioChannels, AudioTrackInfo, ConversionOptions, ConvertError, Mp3Bitrate,
-    OutputFormat, PdfImageFit, PdfOrientation, PdfPageSize,
+    convert_batch_with_options, convert_bytes_with_video_config, input_format,
+    input_format::InputFormat, supported_input_extensions, AudioBitDepth, AudioChannels,
+    AudioTrackInfo, ConversionOptions, ConvertError, Mp3Bitrate, OutputFormat, PdfImageFit,
+    PdfOrientation, PdfPageSize, VideoToolConfig,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
-use input_format::{common_format, detect, InputFormat};
+use input_format::{common_format, detect};
 use rfd::FileDialog;
+use serde::{Deserialize, Serialize};
 
 const BG: Color32 = Color32::from_rgb(25, 25, 25);
 const CARD: Color32 = Color32::from_rgb(32, 32, 32);
@@ -40,24 +40,24 @@ const ACTION_BAR_HEIGHT: f32 = 70.0;
 const FORMAT_LIST_SCROLLBAR_GUTTER: f32 = 15.0;
 const HOME_CARD_HEIGHT: f32 = 354.36;
 const HOME_FOOTER_HEIGHT: f32 = 27.78;
+const APP_ID: &str = "Convert to it!";
+const SETTINGS_KEY: &str = "convert-to-it/settings";
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct PersistedSettings {
+    output_directory: Option<PathBuf>,
+    target: Option<OutputFormat>,
+    conversion_options: ConversionOptions,
+}
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([767.0, 675.0])
-            .with_min_inner_size([600.0, 600.0]),
-        ..Default::default()
-    };
+    let options = native_options(persistence_path());
     let result = eframe::run_native(
-        "Convert to it!",
+        APP_ID,
         options,
         Box::new(|creation_context| {
             apply_theme(&creation_context.egui_ctx);
-            let app = ConvertApp {
-                output_directory: default_output_directory(),
-                ..Default::default()
-            };
-            Ok(Box::new(app))
+            Ok(Box::new(ConvertApp::from_storage(creation_context.storage)))
         }),
     );
     if let Err(error) = &result {
@@ -68,6 +68,25 @@ fn main() -> eframe::Result<()> {
             .show();
     }
     result
+}
+
+fn native_options(persistence_path: Option<PathBuf>) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([767.0, 675.0])
+            .with_min_inner_size([600.0, 600.0]),
+        persistence_path,
+        ..Default::default()
+    }
+}
+
+fn persistence_path() -> Option<PathBuf> {
+    persistence_path_in(&eframe::storage_dir(APP_ID)?)
+}
+
+fn persistence_path_in(directory: &Path) -> Option<PathBuf> {
+    fs::create_dir_all(directory).ok()?;
+    Some(directory.join("app.ron"))
 }
 
 fn default_output_directory() -> Option<PathBuf> {
@@ -290,16 +309,18 @@ enum FormatCategory {
     Text,
     Data,
     Audio,
+    Video,
     Archive,
 }
 
 impl FormatCategory {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Image,
         Self::Document,
         Self::Text,
         Self::Data,
         Self::Audio,
+        Self::Video,
         Self::Archive,
     ];
 
@@ -310,6 +331,7 @@ impl FormatCategory {
             Self::Text => "Text",
             Self::Data => "Data",
             Self::Audio => "Audio",
+            Self::Video => "Video",
             Self::Archive => "Archive",
         }
     }
@@ -349,9 +371,12 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Au
         | OutputFormat::Opus
         | OutputFormat::Mp3 => FormatCategory::Audio,
-        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Gzip => {
-            FormatCategory::Archive
-        }
+        OutputFormat::Mp4 | OutputFormat::Webm => FormatCategory::Video,
+        OutputFormat::Zip
+        | OutputFormat::Tar
+        | OutputFormat::TarGz
+        | OutputFormat::Gzip
+        | OutputFormat::Files => FormatCategory::Archive,
     }
 }
 
@@ -394,6 +419,9 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Tar => "TAR",
         OutputFormat::TarGz => "TAR.GZ",
         OutputFormat::Gzip => "GZ",
+        OutputFormat::Mp4 => "MP4",
+        OutputFormat::Webm => "WEBM",
+        OutputFormat::Files => "FILES",
     }
 }
 
@@ -436,10 +464,14 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Tar => "TAR archive",
         OutputFormat::TarGz => "Gzipped TAR archive",
         OutputFormat::Gzip => "GZIP compressed file",
+        OutputFormat::Mp4 => "MP4 video (stream copy)",
+        OutputFormat::Webm => "WebM video (stream copy)",
+        OutputFormat::Files => "Extract archive into files",
     }
 }
 
-const ARCHIVE_TARGETS: [OutputFormat; 4] = [
+const ARCHIVE_TARGETS: [OutputFormat; 5] = [
+    OutputFormat::Files,
     OutputFormat::Zip,
     OutputFormat::Tar,
     OutputFormat::TarGz,
@@ -521,14 +553,26 @@ fn primary_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response 
 }
 
 fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions) -> bool {
-    let image_changed = options.image_background != ConversionOptions::DEFAULT_IMAGE_BACKGROUND
+    let image_changed = (target.uses_image_background()
+        && options.image_background != ConversionOptions::DEFAULT_IMAGE_BACKGROUND)
         || !options.image_apply_exif_orientation;
     match target {
-        OutputFormat::Jpeg => options.jpeg_quality.is_some() || image_changed,
-        OutputFormat::Png => options.png_compression.is_some() || image_changed,
+        OutputFormat::Jpeg => {
+            options.jpeg_quality.is_some()
+                || image_changed
+                || options.video_frame_time_ms > 0
+                || options.video_thumbnail_width > 0
+        }
+        OutputFormat::Png => {
+            options.png_compression.is_some()
+                || image_changed
+                || options.video_frame_time_ms > 0
+                || options.video_thumbnail_width > 0
+        }
         OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
             options.archive_compression.is_some()
         }
+        OutputFormat::Mp4 | OutputFormat::Webm => false,
         OutputFormat::Wav | OutputFormat::Flac => {
             options.audio_sample_rate.is_some()
                 || options.audio_channels.is_some()
@@ -554,7 +598,9 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
                 || options.pdf_margin != ConversionOptions::DEFAULT_PDF_MARGIN
                 || image_changed
         }
-        target if format_category(target) == FormatCategory::Image => image_changed,
+        target if format_category(target) == FormatCategory::Image => {
+            image_changed || options.video_frame_time_ms > 0 || options.video_thumbnail_width > 0
+        }
         _ => false,
     }
 }
@@ -752,31 +798,33 @@ fn audio_bit_depth_setting(ui: &mut egui::Ui, depth: &mut AudioBitDepth, target:
     });
 }
 
-fn image_settings(ui: &mut egui::Ui, options: &mut ConversionOptions) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new("Background").size(12.8).strong().color(TEXT));
-        ui.label(
-            RichText::new("Used when transparency is saved to a format without alpha.")
-                .size(11.5)
-                .color(MUTED),
-        );
-        settings_input_frame(ui, |ui| {
-            ui.horizontal(|ui| {
-                egui::color_picker::color_edit_button_srgb(ui, &mut options.image_background);
-                ui.label(
-                    RichText::new(format!(
-                        "#{:02X}{:02X}{:02X}",
-                        options.image_background[0],
-                        options.image_background[1],
-                        options.image_background[2]
-                    ))
-                    .size(12.0)
+fn image_settings(ui: &mut egui::Ui, options: &mut ConversionOptions, show_background: bool) {
+    if show_background {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Background").size(12.8).strong().color(TEXT));
+            ui.label(
+                RichText::new("Used when transparency is saved to a format without alpha.")
+                    .size(11.5)
                     .color(MUTED),
-                );
+            );
+            settings_input_frame(ui, |ui| {
+                ui.horizontal(|ui| {
+                    egui::color_picker::color_edit_button_srgb(ui, &mut options.image_background);
+                    ui.label(
+                        RichText::new(format!(
+                            "#{:02X}{:02X}{:02X}",
+                            options.image_background[0],
+                            options.image_background[1],
+                            options.image_background[2]
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                });
             });
         });
-    });
-    ui.add_space(14.0);
+        ui.add_space(14.0);
+    }
     ui.checkbox(
         &mut options.image_apply_exif_orientation,
         RichText::new("Apply EXIF orientation")
@@ -833,12 +881,58 @@ fn number_setting(
     });
 }
 
+fn video_settings(ui: &mut egui::Ui, options: &mut ConversionOptions, target: OutputFormat) {
+    settings_section_heading(ui, "Video", None);
+    ui.add_space(10.0);
+    if target == OutputFormat::Webm {
+        ui.label(
+            RichText::new(
+                "Compatible codecs are stream-copied without re-encoding. Incompatible codec/container pairs are rejected.",
+            )
+            .size(11.5)
+            .color(MUTED),
+        );
+    } else if target == OutputFormat::Mp4 {
+        ui.label(
+            RichText::new("Streams are copied into the MP4 container without re-encoding.")
+                .size(11.5)
+                .color(MUTED),
+        );
+    } else {
+        number_setting(
+            ui,
+            "Frame time",
+            &mut options.video_frame_time_ms,
+            0..=ConversionOptions::MAX_VIDEO_FRAME_TIME_MS,
+            "ms",
+        );
+        ui.add_space(14.0);
+        number_setting(
+            ui,
+            "Thumbnail width",
+            &mut options.video_thumbnail_width,
+            0..=ConversionOptions::MAX_VIDEO_THUMBNAIL_WIDTH,
+            "px (0 = source)",
+        );
+    }
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("Requires ffmpeg on PATH or CONVERT2IT_FFMPEG.")
+            .size(11.0)
+            .color(MUTED),
+    );
+}
+
 fn audio_track_selection_label(options: &ConversionOptions, choices: &[AudioTrackInfo]) -> String {
     options
         .audio_track
         .and_then(|index| choices.get(index))
         .map(AudioTrackInfo::label)
         .unwrap_or_else(|| "Auto (first track)".to_owned())
+}
+
+fn audio_track_picker_is_visible(choices: &[AudioTrackInfo]) -> bool {
+    choices.len() > 1
 }
 
 impl eframe::App for ConvertApp {
@@ -863,9 +957,34 @@ impl eframe::App for ConvertApp {
 
         context.request_repaint_after(Duration::from_millis(100));
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let settings = PersistedSettings {
+            output_directory: self.output_directory.clone(),
+            target: self.target,
+            conversion_options: self.conversion_options,
+        };
+        eframe::set_value(storage, SETTINGS_KEY, &settings);
+        storage.flush();
+    }
 }
 
 impl ConvertApp {
+    fn from_storage(storage: Option<&dyn eframe::Storage>) -> Self {
+        let mut app = Self::default();
+        if let Some(settings) = storage
+            .and_then(|storage| eframe::get_value::<PersistedSettings>(storage, SETTINGS_KEY))
+        {
+            app.output_directory = settings.output_directory.filter(|path| path.is_dir());
+            app.conversion_options = settings.conversion_options;
+            app.target = settings.target;
+        }
+        if app.output_directory.is_none() {
+            app.output_directory = default_output_directory();
+        }
+        app
+    }
+
     fn show_upload_page(&mut self, ui: &mut egui::Ui) {
         let viewport = ui.max_rect();
         let body_height = (viewport.height() - HOME_FOOTER_HEIGHT).max(0.0);
@@ -1282,6 +1401,10 @@ impl ConvertApp {
 
         match target {
             OutputFormat::Jpeg => {
+                if self.effective_input_format() == Some(InputFormat::Video) {
+                    video_settings(ui, &mut self.conversion_options, OutputFormat::Jpeg);
+                    ui.add_space(18.0);
+                }
                 settings_section_heading(
                     ui,
                     "Quality",
@@ -1298,9 +1421,13 @@ impl ConvertApp {
                 ui.add_space(18.0);
                 settings_section_heading(ui, "Image", None);
                 ui.add_space(10.0);
-                image_settings(ui, &mut self.conversion_options);
+                image_settings(ui, &mut self.conversion_options, true);
             }
             OutputFormat::Png => {
+                if self.effective_input_format() == Some(InputFormat::Video) {
+                    video_settings(ui, &mut self.conversion_options, OutputFormat::Png);
+                    ui.add_space(18.0);
+                }
                 settings_section_heading(ui, "Other", None);
                 ui.add_space(10.0);
                 optional_setting(
@@ -1313,7 +1440,7 @@ impl ConvertApp {
                 ui.add_space(18.0);
                 settings_section_heading(ui, "Image", None);
                 ui.add_space(10.0);
-                image_settings(ui, &mut self.conversion_options);
+                image_settings(ui, &mut self.conversion_options, false);
             }
             OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
                 settings_section_heading(ui, "Other", None);
@@ -1351,6 +1478,9 @@ impl ConvertApp {
                         target,
                     );
                 }
+            }
+            OutputFormat::Mp4 | OutputFormat::Webm => {
+                video_settings(ui, &mut self.conversion_options, target);
             }
             OutputFormat::Pdf => {
                 settings_section_heading(ui, "Page", None);
@@ -1410,13 +1540,21 @@ impl ConvertApp {
                     ui.add_space(18.0);
                     settings_section_heading(ui, "Image", None);
                     ui.add_space(10.0);
-                    image_settings(ui, &mut self.conversion_options);
+                    image_settings(ui, &mut self.conversion_options, true);
                 }
             }
             _ if format_category(target) == FormatCategory::Image => {
+                if self.effective_input_format() == Some(InputFormat::Video) {
+                    video_settings(ui, &mut self.conversion_options, target);
+                    ui.add_space(18.0);
+                }
                 settings_section_heading(ui, "Image", None);
                 ui.add_space(10.0);
-                image_settings(ui, &mut self.conversion_options);
+                image_settings(
+                    ui,
+                    &mut self.conversion_options,
+                    target.uses_image_background(),
+                );
             }
             _ => {
                 ui.add_space(24.0);
@@ -1436,6 +1574,9 @@ impl ConvertApp {
 
     fn audio_track_setting(&mut self, ui: &mut egui::Ui) {
         let choices = self.audio_track_choices.clone();
+        if !choices.is_empty() && !audio_track_picker_is_visible(&choices) {
+            return;
+        }
         ui.vertical(|ui| {
             ui.label(RichText::new("Audio track").size(12.8).strong().color(TEXT));
             if choices.is_empty() {
@@ -2675,8 +2816,9 @@ impl ConvertApp {
                         .color(MUTED),
                 );
                 ui.add_space(14.0);
-                let fraction = (job.completed as f32 / job.total.max(1) as f32).clamp(0.0, 1.0);
-                ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                let step_fraction =
+                    (job.completed as f32 / job.total.max(1) as f32).clamp(0.0, 1.0);
+                ui.add(egui::ProgressBar::new(step_fraction).show_percentage());
                 ui.add_space(8.0);
                 ui.label(RichText::new(job.message.as_str()).size(12.0).color(TEXT));
                 ui.add_space(16.0);
@@ -3205,6 +3347,7 @@ fn paint_category_icon(
         FormatCategory::Text => paint_text_category_icon(painter, rect, color),
         FormatCategory::Data => paint_braces_icon(painter, rect, color),
         FormatCategory::Audio => paint_audio_icon(painter, rect, color),
+        FormatCategory::Video => paint_image_icon(painter, rect, color),
         FormatCategory::Archive => paint_archive_icon(painter, rect, color),
     }
 }
@@ -3238,6 +3381,7 @@ fn paint_format_icon(painter: &egui::Painter, rect: egui::Rect, format: OutputFo
             );
         }
         FormatCategory::Audio => paint_audio_icon(painter, rect, GREEN),
+        FormatCategory::Video => paint_image_icon(painter, rect, GREEN),
         FormatCategory::Archive => paint_archive_icon(painter, rect, GREEN),
     }
 }
@@ -3326,6 +3470,7 @@ fn convert_to_directory(
 ) -> Result<String, ConversionFailure> {
     let mut completed = 0;
     let mut written = Vec::new();
+    let video = VideoToolConfig::default();
     if matches!(
         target,
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
@@ -3447,13 +3592,19 @@ fn convert_to_directory(
                 inputs.len()
             ),
         );
-        let outputs = match convert_bytes_with_options(file_name(path), &bytes, target, options) {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                remove_written(&written);
-                return Err(ConversionFailure::Message(error.to_string()));
-            }
-        };
+        let outputs =
+            match convert_bytes_with_video_config(file_name(path), &bytes, target, options, &video)
+            {
+                Ok(outputs) => outputs,
+                Err(ConvertError::Cancelled) => {
+                    remove_written(&written);
+                    return Err(ConversionFailure::Cancelled);
+                }
+                Err(error) => {
+                    remove_written(&written);
+                    return Err(ConversionFailure::Message(error.to_string()));
+                }
+            };
         drop(bytes);
         completed += 1;
 
@@ -3590,7 +3741,380 @@ fn validate_relative_path(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use convert_to_it_native::convert_audio_file_to_writer;
+    use convert_to_it_native::{convert_audio_file_to_writer, VideoToolConfig};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static VIDEO_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn ffmpeg_stub() -> &'static Path {
+        static STUB: OnceLock<PathBuf> = OnceLock::new();
+        STUB.get_or_init(|| {
+            let directory = std::env::temp_dir()
+                .join(format!("convert2it-gui-ffmpeg-stub-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let source = directory.join("ffmpeg_stub.rs");
+            std::fs::write(
+                &source,
+                r#"
+use std::{env, fs, process};
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Ok(code) = env::var("STUB_EXIT") {
+        process::exit(code.parse().unwrap_or(1));
+    }
+    if let Some(output) = args.last() {
+        fs::copy(env::var("STUB_OUTPUT").unwrap(), output).unwrap();
+    }
+}
+"#,
+            )
+            .unwrap();
+            let executable = directory.join(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            });
+            let status = std::process::Command::new("rustc")
+                .arg("--edition=2021")
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("rustc must be available to build the ffmpeg test stub");
+            assert!(status.success(), "could not build the ffmpeg test stub");
+            executable
+        })
+    }
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvGuard {
+        fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+            self.0.push((key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+            self
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..).rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn real_ffmpeg() -> Option<PathBuf> {
+        let path = VideoToolConfig::default().resolve()?;
+        let output = std::process::Command::new(&path)
+            .arg("-version")
+            .output()
+            .ok()?;
+        let version = String::from_utf8_lossy(&output.stdout);
+        (output.status.success() && version.contains("ffmpeg version")).then_some(path)
+    }
+
+    fn generate_real_video(ffmpeg: &Path, path: &Path) {
+        let output = std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libvpx-vp9",
+                "-b:v",
+                "300k",
+                "-c:a",
+                "libopus",
+                "-shortest",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not generate the synthetic sample: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    fn non_default_settings_options() -> ConversionOptions {
+        ConversionOptions {
+            jpeg_quality: Some(91),
+            png_compression: Some(8),
+            archive_compression: Some(2),
+            audio_sample_rate: Some(48_000),
+            audio_channels: Some(AudioChannels::Stereo),
+            audio_track: Some(1),
+            audio_bit_depth: AudioBitDepth::Bit24,
+            mp3_bitrate: Mp3Bitrate::Kbps320,
+            image_background: [12, 34, 56],
+            image_apply_exif_orientation: false,
+            pdf_page_size: PdfPageSize::Letter,
+            pdf_orientation: PdfOrientation::Landscape,
+            pdf_image_fit: PdfImageFit::Cover,
+            pdf_font_size: 14,
+            pdf_margin: 24,
+            video_frame_time_ms: 1_250,
+            video_thumbnail_width: 480,
+        }
+    }
+
+    struct CloseAfterFirstFrame {
+        app: ConvertApp,
+    }
+
+    impl eframe::App for CloseAfterFirstFrame {
+        fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+            self.app.update(context, frame);
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        fn save(&mut self, storage: &mut dyn eframe::Storage) {
+            self.app.save(storage);
+        }
+    }
+
+    const DISK_TEST_APP_ID: &str = "Convert to it! disk storage test";
+
+    fn run_hidden_eframe(
+        persistence_path: &Path,
+        app_creator: eframe::AppCreator<'static>,
+    ) -> eframe::Result<()> {
+        eframe::run_native(
+            DISK_TEST_APP_ID,
+            eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([64.0, 64.0])
+                    .with_position(egui::pos2(-10_000.0, -10_000.0))
+                    .with_visible(false),
+                persistence_path: Some(persistence_path.to_path_buf()),
+                run_and_return: true,
+                event_loop_builder: Some(Box::new(|builder| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        use winit::platform::windows::EventLoopBuilderExtWindows as _;
+                        builder.with_any_thread(true);
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = builder;
+                })),
+                ..Default::default()
+            },
+            app_creator,
+        )
+    }
+
+    fn write_settings_via_real_eframe(
+        persistence_path: &Path,
+        output_directory: &Path,
+        target: OutputFormat,
+        conversion_options: ConversionOptions,
+    ) {
+        let output_directory = output_directory.to_path_buf();
+        let result = run_hidden_eframe(
+            persistence_path,
+            Box::new(move |creation_context| {
+                apply_theme(&creation_context.egui_ctx);
+                let mut app = ConvertApp::from_storage(creation_context.storage);
+                app.output_directory = Some(output_directory);
+                app.target = Some(target);
+                app.conversion_options = conversion_options;
+                Ok(Box::new(CloseAfterFirstFrame { app }))
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "eframe disk-storage save failed: {result:?}"
+        );
+    }
+
+    type LoadedSettings = (Option<PathBuf>, Option<OutputFormat>, ConversionOptions);
+
+    fn read_settings_via_real_eframe(persistence_path: &Path) -> LoadedSettings {
+        let loaded = Arc::new(Mutex::new(None::<LoadedSettings>));
+        let loaded_for_creator = Arc::clone(&loaded);
+        let result = run_hidden_eframe(
+            persistence_path,
+            Box::new(move |creation_context| {
+                apply_theme(&creation_context.egui_ctx);
+                let app = ConvertApp::from_storage(creation_context.storage);
+                *loaded_for_creator.lock().unwrap() = Some((
+                    app.output_directory.clone(),
+                    app.target,
+                    app.conversion_options,
+                ));
+                Ok(Box::new(CloseAfterFirstFrame { app }))
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "eframe disk-storage load failed: {result:?}"
+        );
+        let settings = loaded
+            .lock()
+            .unwrap()
+            .take()
+            .expect("eframe app creator did not run");
+        settings
+    }
+
+    fn disk_test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-eframe-disk-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn settings_round_trip_through_eframe_storage() {
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-settings-round-trip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let options = non_default_settings_options();
+        let mut app = ConvertApp {
+            output_directory: Some(directory.clone()),
+            target: Some(OutputFormat::Jpeg),
+            conversion_options: options,
+            ..Default::default()
+        };
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = ConvertApp::from_storage(Some(&storage));
+        assert_eq!(restored.output_directory, Some(directory.clone()));
+        assert_eq!(restored.target, Some(OutputFormat::Jpeg));
+        assert_eq!(restored.conversion_options, options);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "opens a native eframe window; run explicitly to verify real disk persistence"]
+    fn settings_round_trip_through_real_eframe_disk_storage() {
+        let directory = disk_test_directory("round-trip");
+        let output_directory = directory.join("output");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        let persistence = directory.join("app.ron");
+        let options = non_default_settings_options();
+
+        write_settings_via_real_eframe(
+            &persistence,
+            &output_directory,
+            OutputFormat::Jpeg,
+            options,
+        );
+
+        let blob = std::fs::read_to_string(&persistence)
+            .expect("eframe should have written its disk-backed app.ron");
+        assert!(
+            blob.contains(SETTINGS_KEY),
+            "eframe's app.ron did not contain the persisted settings key: {blob}"
+        );
+
+        let (restored_output, restored_target, restored_options) =
+            read_settings_via_real_eframe(&persistence);
+        assert_eq!(restored_output, Some(output_directory));
+        assert_eq!(restored_target, Some(OutputFormat::Jpeg));
+        assert_eq!(restored_options, options);
+
+        let cases: [(&str, Option<&str>); 3] = [
+            ("absent", None),
+            ("empty", Some("")),
+            ("corrupt", Some("{ this is not a RON map")),
+        ];
+        for (label, contents) in cases {
+            let _ = std::fs::remove_file(&persistence);
+            if let Some(contents) = contents {
+                std::fs::write(&persistence, contents).unwrap();
+            }
+            let (output, target, options) = read_settings_via_real_eframe(&persistence);
+            assert_eq!(output, default_output_directory(), "{label} blob");
+            assert_eq!(target, None, "{label} blob");
+            assert_eq!(options, ConversionOptions::default(), "{label} blob");
+        }
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn persistence_path_is_writable_in_supplied_directory() {
+        let root = disk_test_directory("persistence-path");
+        let directory = root.join("data");
+        let path =
+            persistence_path_in(&directory).expect("persistence directory should be creatable");
+        assert_eq!(path, directory.join("app.ron"));
+        assert!(directory.is_dir());
+
+        std::fs::write(&path, b"probe").expect("persistence file should be writable");
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn production_native_options_pass_persistence_path() {
+        let path = std::env::temp_dir().join(format!(
+            "convert2it-native-options-{}.ron",
+            std::process::id()
+        ));
+        let options = native_options(Some(path.clone()));
+        assert_eq!(options.persistence_path, Some(path));
+    }
+
+    #[test]
+    fn absent_settings_storage_uses_defaults() {
+        let app = ConvertApp::from_storage(None);
+        assert_eq!(app.output_directory, default_output_directory());
+        assert_eq!(app.target, None);
+        assert_eq!(app.conversion_options, ConversionOptions::default());
+    }
+
+    #[test]
+    fn corrupt_settings_storage_falls_back_to_defaults_without_panicking() {
+        for blob in [
+            "{not valid json",
+            "{}",
+            "{\"output_directory\":42,\"target\":\"Bogus\"}",
+        ] {
+            let mut storage = MemoryStorage::default();
+            eframe::Storage::set_string(&mut storage, SETTINGS_KEY, blob.to_owned());
+            let app = ConvertApp::from_storage(Some(&storage));
+            assert_eq!(app.output_directory, default_output_directory());
+            assert_eq!(app.target, None);
+            assert_eq!(app.conversion_options, ConversionOptions::default());
+        }
+    }
 
     fn test_conversion_job(receiver: Receiver<ConversionEvent>) -> ConversionJob {
         ConversionJob {
@@ -3669,6 +4193,26 @@ mod tests {
     }
 
     #[test]
+    fn pdf_files_offer_text_and_archive_outputs() {
+        assert_eq!(
+            available_targets(Some(InputFormat::Pdf)),
+            [
+                OutputFormat::Text,
+                OutputFormat::TextUtf8NoBom,
+                OutputFormat::TextUtf8Bom,
+                OutputFormat::TextUtf16Le,
+                OutputFormat::TextUtf16Be,
+                OutputFormat::TextUtf32Le,
+                OutputFormat::TextUtf32Be,
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip
+            ]
+        );
+    }
+
+    #[test]
     fn bmp_and_tiff_files_offer_supported_image_outputs() {
         let expected = [
             OutputFormat::Png,
@@ -3707,6 +4251,7 @@ mod tests {
         assert_eq!(
             available_targets(Some(InputFormat::Any)),
             [
+                OutputFormat::Files,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
@@ -3720,6 +4265,7 @@ mod tests {
         assert_eq!(
             available_targets(Some(InputFormat::Mixed)),
             [
+                OutputFormat::Files,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
@@ -3736,7 +4282,8 @@ mod tests {
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
-                OutputFormat::Gzip
+                OutputFormat::Gzip,
+                OutputFormat::Files
             ]
         );
     }
@@ -3749,7 +4296,8 @@ mod tests {
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
-                OutputFormat::Gzip
+                OutputFormat::Gzip,
+                OutputFormat::Files
             ]
         );
     }
@@ -3760,6 +4308,9 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-interleaved-tracks.mkv");
         let choices = audio_tracks_from_path(&path).unwrap();
 
+        assert!(!audio_track_picker_is_visible(&[]));
+        assert!(!audio_track_picker_is_visible(&choices[..1]));
+        assert!(audio_track_picker_is_visible(&choices));
         assert_eq!(
             audio_track_selection_label(&ConversionOptions::default(), &choices),
             "Auto (first track)"
@@ -3805,6 +4356,66 @@ mod tests {
         ));
         assert_eq!(Mp3Bitrate::ALL.len(), 4);
         assert_eq!(Mp3Bitrate::Kbps320.kbps(), 320);
+    }
+
+    #[test]
+    fn image_background_setting_is_scoped_to_alpha_less_targets() {
+        for target in [
+            OutputFormat::Jpeg,
+            OutputFormat::Bmp,
+            OutputFormat::Hdr,
+            OutputFormat::Ppm,
+            OutputFormat::Pbm,
+            OutputFormat::Pgm,
+            OutputFormat::Pdf,
+        ] {
+            assert!(target.uses_image_background(), "{target:?}");
+        }
+        for target in [
+            OutputFormat::Png,
+            OutputFormat::Webp,
+            OutputFormat::Gif,
+            OutputFormat::Tiff,
+            OutputFormat::Ico,
+            OutputFormat::Pam,
+            OutputFormat::Tga,
+            OutputFormat::Qoi,
+            OutputFormat::Farbfeld,
+        ] {
+            assert!(!target.uses_image_background(), "{target:?}");
+        }
+
+        let custom_background = ConversionOptions {
+            image_background: [1, 2, 3],
+            ..Default::default()
+        };
+        assert!(target_has_applied_setting(
+            OutputFormat::Jpeg,
+            &custom_background
+        ));
+        assert!(target_has_applied_setting(
+            OutputFormat::Bmp,
+            &custom_background
+        ));
+        assert!(target_has_applied_setting(
+            OutputFormat::Pdf,
+            &custom_background
+        ));
+        assert!(!target_has_applied_setting(
+            OutputFormat::Png,
+            &custom_background
+        ));
+        assert!(!target_has_applied_setting(
+            OutputFormat::Webp,
+            &custom_background
+        ));
+        assert!(target_has_applied_setting(
+            OutputFormat::Png,
+            &ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            }
+        ));
     }
 
     #[test]
@@ -3894,10 +4505,185 @@ mod tests {
             InputFormat::Opus,
             InputFormat::M4a,
             InputFormat::Aiff,
-            InputFormat::Video,
         ] {
             assert_eq!(available_targets(Some(input)), expected);
         }
+    }
+
+    #[test]
+    fn video_files_offer_thumbnails_remux_and_audio_outputs() {
+        assert_eq!(
+            available_targets(Some(InputFormat::Video)),
+            [
+                OutputFormat::Png,
+                OutputFormat::Jpeg,
+                OutputFormat::Webp,
+                OutputFormat::Wav,
+                OutputFormat::Flac,
+                OutputFormat::Aiff,
+                OutputFormat::Au,
+                OutputFormat::Opus,
+                OutputFormat::Mp3,
+                OutputFormat::Mp4,
+                OutputFormat::Webm,
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip
+            ]
+        );
+    }
+
+    #[test]
+    fn video_directory_conversion_reports_progress_and_writes_remux() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-gui-video-test-{}", std::process::id()));
+        let output_directory = directory.join("out");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        let input = directory.join("sample-vp9-opus.mp4");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join("sample-vp9-opus.mp4"),
+            &input,
+        )
+        .unwrap();
+        let prepared = directory.join("prepared.webm");
+        std::fs::write(&prepared, b"\x1aE\xdf\xa3gui-webm").unwrap();
+        let mut env = EnvGuard(Vec::new());
+        env.set("CONVERT2IT_FFMPEG", ffmpeg_stub())
+            .set("STUB_OUTPUT", &prepared);
+
+        let mut messages = Vec::new();
+        let summary = convert_to_directory(
+            &[input],
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &output_directory,
+            &AtomicBool::new(false),
+            |completed, message| messages.push((completed, message)),
+        )
+        .unwrap();
+        let written = output_directory.join("sample-vp9-opus.webm");
+        assert_eq!(std::fs::read(&written).unwrap(), b"\x1aE\xdf\xa3gui-webm");
+        assert_eq!(summary, format!("Created 1 file(s): {}", written.display()));
+        assert!(messages
+            .iter()
+            .any(|(_, message)| message.starts_with("Reading")));
+        assert!(messages
+            .iter()
+            .any(|(_, message)| message.contains("Converting")));
+        assert!(messages
+            .iter()
+            .any(|(_, message)| message.starts_with("Saving")));
+        assert!(messages
+            .iter()
+            .any(|(_, message)| message.starts_with("Saved")));
+        assert_eq!(messages.last().unwrap().0, 3);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn real_ffmpeg_gui_video_when_available() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let Some(ffmpeg) = real_ffmpeg() else {
+            eprintln!("skipping real-ffmpeg GUI test: ffmpeg is not available");
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-gui-real-video-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("synthetic.mp4");
+        generate_real_video(&ffmpeg, &input);
+        let output_directory = directory.join("out");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        let mut env = EnvGuard(Vec::new());
+        env.set("CONVERT2IT_FFMPEG", &ffmpeg);
+
+        let mut messages = Vec::new();
+        let summary = convert_to_directory(
+            std::slice::from_ref(&input),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &output_directory,
+            &AtomicBool::new(false),
+            |completed, message| messages.push((completed, message)),
+        )
+        .unwrap();
+        let webm = std::fs::read(output_directory.join("synthetic.webm")).unwrap();
+        assert!(!webm.is_empty());
+        assert!(webm.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]));
+        assert!(summary.contains("synthetic.webm"));
+        assert!(messages
+            .iter()
+            .any(|(_, message)| message.contains("Converting")));
+
+        let back_directory = directory.join("back");
+        std::fs::create_dir_all(&back_directory).unwrap();
+        let back_summary = convert_to_directory(
+            &[output_directory.join("synthetic.webm")],
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &back_directory,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(back_summary.contains("synthetic.mp4"));
+        let back = std::fs::read(back_directory.join("synthetic.mp4")).unwrap();
+        assert_eq!(back.get(4..8), Some(b"ftyp".as_slice()));
+
+        for (target, format, extension) in [
+            (OutputFormat::Png, image::ImageFormat::Png, "png"),
+            (OutputFormat::Jpeg, image::ImageFormat::Jpeg, "jpg"),
+            (OutputFormat::Webp, image::ImageFormat::WebP, "webp"),
+        ] {
+            let summary = convert_to_directory(
+                std::slice::from_ref(&input),
+                target,
+                ConversionOptions {
+                    video_frame_time_ms: 500,
+                    video_thumbnail_width: 160,
+                    ..Default::default()
+                },
+                &output_directory,
+                &AtomicBool::new(false),
+                |_, _| {},
+            )
+            .unwrap();
+            assert!(summary.contains(&format!("synthetic.{extension}")));
+            let bytes =
+                std::fs::read(output_directory.join(format!("synthetic.{extension}"))).unwrap();
+            assert_eq!(image::guess_format(&bytes).unwrap(), format);
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (160, 120));
+        }
+
+        let empty_output = directory.join("empty-out");
+        std::fs::create_dir_all(&empty_output).unwrap();
+        let error = convert_to_directory(
+            std::slice::from_ref(&input),
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 10_000,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &empty_output,
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap_err();
+        match error {
+            ConversionFailure::Message(message) => {
+                assert!(message.contains("ffmpeg produced no output"), "{message}");
+            }
+            other => panic!("expected the empty-output error, got {other:?}"),
+        }
+        assert!(std::fs::read_dir(&empty_output).unwrap().next().is_none());
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

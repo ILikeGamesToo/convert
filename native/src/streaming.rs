@@ -756,7 +756,9 @@ fn target_channels(
         .map(AudioChannels::count)
         .unwrap_or(source_channels)
         .max(1);
-    if matches!(target, OutputFormat::Opus | OutputFormat::Mp3) {
+    // MP3 is the only streaming encoder that cannot carry more than stereo;
+    // Opus uses the multistream encoder for surround layouts.
+    if target == OutputFormat::Mp3 {
         requested.min(2)
     } else {
         requested
@@ -789,7 +791,6 @@ struct AudioProcessor {
     tail_padding: usize,
     frames_seen: usize,
     tail: Vec<f32>,
-    gain: f32,
     resampler: Option<StreamingResampler>,
 }
 
@@ -801,7 +802,6 @@ impl AudioProcessor {
         target_rate: u32,
         trim: AudioTrim,
     ) -> Self {
-        let gain = downmix_gain(source_channels, target_channels);
         let resampler = (source_rate != target_rate)
             .then(|| StreamingResampler::new(source_rate, target_rate, target_channels));
         Self {
@@ -812,7 +812,6 @@ impl AudioProcessor {
             tail_padding: trim.tail_padding,
             frames_seen: 0,
             tail: Vec::new(),
-            gain,
             resampler,
         }
     }
@@ -837,24 +836,28 @@ impl AudioProcessor {
             }
             let frame = &samples[frame_index * channels..(frame_index + 1) * channels];
             match self.target_channels {
-                1 => mixed.push((downmix_mono(frame) * self.gain).clamp(-1.0, 1.0)),
+                1 => mixed.push(downmix_mono(frame)),
                 2 => {
                     let (left, right) = if channels == 1 {
                         (frame[0], frame[0])
                     } else {
                         downmix_stereo(frame)
                     };
-                    mixed.push((left * self.gain).clamp(-1.0, 1.0));
-                    mixed.push((right * self.gain).clamp(-1.0, 1.0));
+                    mixed.push(left);
+                    mixed.push(right);
                 }
-                _ => {
-                    for sample in frame {
-                        mixed.push((*sample * self.gain).clamp(-1.0, 1.0));
-                    }
-                }
+                _ => mixed.extend_from_slice(frame),
             }
         }
         self.frames_seen += frames;
+
+        // A fixed worst-case attenuation would make a centre-only 5.1 tone
+        // much quieter than its 0.707 downmix coefficient. Scale each chunk
+        // only when it would clip instead, so normal content keeps its level
+        // and hot content is attenuated linearly without wrapping.
+        if self.target_channels <= 2 && self.source_channels != self.target_channels {
+            limit_downmix_peak(&mut mixed);
+        }
 
         self.tail.extend_from_slice(&mixed);
         let padding = self.tail_padding.saturating_mul(self.target_channels);
@@ -864,19 +867,54 @@ impl AudioProcessor {
         let mut emit = self.tail.len() - padding;
         emit -= emit % self.target_channels;
         let chunk: Vec<f32> = self.tail.drain(..emit).collect();
-        Ok(match self.resampler.as_mut() {
+        let chunk = match self.resampler.as_mut() {
             Some(resampler) => resampler.push(&chunk),
             None => chunk,
-        })
+        };
+        Ok(clamp_stream_samples(chunk))
     }
 
     fn finish(&mut self) -> Result<Vec<f32>, ConvertError> {
         self.tail.clear();
-        Ok(match self.resampler.as_mut() {
+        let chunk = match self.resampler.as_mut() {
             Some(resampler) => resampler.finish(),
             None => Vec::new(),
-        })
+        };
+        Ok(clamp_stream_samples(chunk))
     }
+}
+
+/// Keeps a downmixed chunk within full scale. A linear scale preserves the
+/// relative level of every channel in the chunk, unlike clipping each peak.
+fn limit_downmix_peak(samples: &mut [f32]) {
+    for sample in samples.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    if peak > 1.0 {
+        let scale = 1.0 / peak;
+        for sample in samples {
+            *sample *= scale;
+        }
+    }
+}
+
+/// The band-limited resampler can overshoot slightly, and a source may carry
+/// out-of-range samples. Encoders should never see NaN, infinity or values
+/// beyond full scale.
+fn clamp_stream_samples(mut samples: Vec<f32>) -> Vec<f32> {
+    for sample in &mut samples {
+        *sample = if sample.is_finite() {
+            sample.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+    samples
 }
 
 struct StreamingResampler {
@@ -1535,7 +1573,7 @@ impl StreamingEncoder for Mp3StreamEncoder<'_> {
 
 struct OpusStreamEncoder<'a> {
     writer: Option<opus_pure::OggOpusWriter<&'a mut dyn WriteSeek>>,
-    encoder: opus_pure::OpusEncoder,
+    encoder: OpusPcmEncoder,
     channels: usize,
     sample_rate: u32,
     frame_size: usize,
@@ -1554,12 +1592,10 @@ impl<'a> OpusStreamEncoder<'a> {
         sample_rate: u32,
         channels: usize,
     ) -> Result<Self, ConvertError> {
-        use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead};
+        use opus_pure::OggOpusWriter;
 
-        let encoder = OpusEncoder::new(sample_rate as i32, channels, Application::Audio).map_err(
-            |error| ConvertError::Audio(format!("could not start the Opus encoder: {error}")),
-        )?;
-        let head = OpusHead::for_encoder(&encoder, sample_rate);
+        let encoder = OpusPcmEncoder::new(sample_rate, channels)?;
+        let head = encoder.head(sample_rate);
         let pre_skip = u64::from(head.pre_skip);
         let writer = OggOpusWriter::new(writer, head).map_err(|error| {
             ConvertError::Audio(format!("could not start the Opus stream: {error}"))
@@ -1607,6 +1643,16 @@ impl<'a> OpusStreamEncoder<'a> {
     }
 
     fn write_frame(&mut self, frame: &[f32], final_frame: bool) -> Result<(), ConvertError> {
+        // Opus multistream packets use the Vorbis channel order. The rest of
+        // the pipeline, including the downmixer, uses film/WAV order.
+        let mut reordered;
+        let frame = if self.channels > 2 {
+            reordered = frame.to_vec();
+            reorder_film_to_opus_channels(&mut reordered, self.channels);
+            reordered.as_slice()
+        } else {
+            frame
+        };
         let len = self
             .encoder
             .encode(frame, self.frame_size, &mut self.packet)
