@@ -243,9 +243,8 @@ impl SymphoniaChunkReader {
                     ConvertError::Audio(format!("could not start the audio decoder: {error}"))
                 }
             })?;
-        let source_bits = codec_params
-            .bits_per_sample
-            .and_then(|bits| u16::try_from(bits).ok());
+        let source_bits =
+            crate::reported_source_bits(codec_params.codec, codec_params.bits_per_sample);
         Ok(Self {
             format,
             decoder,

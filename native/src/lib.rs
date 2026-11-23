@@ -1948,6 +1948,28 @@ fn audio_track_entries_from_format(
     Ok(entries)
 }
 
+/// Precision of the decoded integer source when it is meaningful. Lossy
+/// codecs decode through an f32 pipeline and do not have a source integer
+/// precision, so they are reported as unknown and get 16-bit dither.
+fn reported_source_bits(
+    codec: symphonia::core::codecs::CodecType,
+    bits_per_sample: Option<u32>,
+) -> Option<u16> {
+    use symphonia::core::codecs::*;
+    if matches!(
+        codec,
+        CODEC_TYPE_AAC
+            | CODEC_TYPE_MP1
+            | CODEC_TYPE_MP2
+            | CODEC_TYPE_MP3
+            | CODEC_TYPE_VORBIS
+            | CODEC_TYPE_OPUS
+    ) {
+        return None;
+    }
+    bits_per_sample.and_then(|bits| u16::try_from(bits).ok())
+}
+
 fn is_known_audio_codec(codec: symphonia::core::codecs::CodecType) -> bool {
     use symphonia::core::codecs::*;
     matches!(
@@ -2222,9 +2244,7 @@ fn decode_symphonia_track(
         return Err(ConvertError::NoAudioTrack);
     }
 
-    let source_bits = codec_params
-        .bits_per_sample
-        .and_then(|bits| u16::try_from(bits).ok());
+    let source_bits = reported_source_bits(codec_params.codec, codec_params.bits_per_sample);
     Ok(DecodedAudio {
         samples,
         channels,
@@ -3793,12 +3813,13 @@ impl Dither {
 
     fn quantize_i16(&mut self, sample: f32, source_bits: Option<u16>) -> i16 {
         // A source known to be 16-bit needs no dither when it is written back
-        // at 16 bits. Deeper sources are reduced from the f32 pipeline and are
-        // dithered; unknown precision is left undithered for compatibility
-        // with decoders that do not report it.
-        if source_bits.is_some_and(|bits| bits > 16) {
+        // at 16 bits. Deeper sources and f32-decoded sources with no reported
+        // integer precision are reductions and are always dithered.
+        if source_bits != Some(16) {
             let dither = self.next() / f32::from(i16::MAX);
-            sample_to_i16((sample + dither).clamp(-1.0, 1.0))
+            // Clamp before adding dither so samples at or beyond full scale
+            // saturate identically in every decode path.
+            sample_to_i16((sample.clamp(-1.0, 1.0) + dither).clamp(-1.0, 1.0))
         } else {
             sample_to_i16(sample)
         }
@@ -5111,6 +5132,12 @@ mod tests {
     fn flac_24_bit_samples(bytes: &[u8]) -> Vec<i32> {
         let mut reader = claxon::FlacReader::new(std::io::Cursor::new(bytes)).unwrap();
         assert_eq!(reader.streaminfo().bits_per_sample, 24);
+        reader.samples().map(Result::unwrap).collect()
+    }
+
+    fn flac_16_bit_samples(bytes: &[u8]) -> Vec<i32> {
+        let mut reader = claxon::FlacReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 16);
         reader.samples().map(Result::unwrap).collect()
     }
 
@@ -8084,6 +8111,126 @@ mod tests {
         assert!(float
             .iter()
             .all(|sample| (*sample - 1.0 / 8_388_608.0).abs() <= 1.0e-7));
+    }
+
+    #[test]
+    fn unknown_precision_f32_to_16_bit_is_dithered() {
+        let samples = vec![1.0 / 1_048_576.0; 8_000];
+        let unknown = DecodedAudio {
+            samples: samples.clone(),
+            channels: 1,
+            sample_rate: 48_000,
+            source_bits: None,
+        };
+        let known_24 = DecodedAudio {
+            source_bits: Some(24),
+            ..unknown.clone()
+        };
+        let known_32 = DecodedAudio {
+            source_bits: Some(32),
+            ..unknown.clone()
+        };
+
+        let unknown_wav = encode_wav(&unknown, AudioBitDepth::Bit16).unwrap();
+        assert_eq!(
+            unknown_wav,
+            encode_wav(&known_24, AudioBitDepth::Bit16).unwrap(),
+            "unknown and 24-bit sources should dither identically"
+        );
+        assert_eq!(
+            unknown_wav,
+            encode_wav(&known_32, AudioBitDepth::Bit16).unwrap(),
+            "unknown and 32-bit sources should dither identically"
+        );
+        let decoded = parse_wav(&unknown_wav);
+        let mut distinct = decoded.samples.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "unknown-precision 16-bit output was crushed instead of dithered"
+        );
+        assert_eq!(
+            unknown_wav,
+            encode_wav(&unknown, AudioBitDepth::Bit16).unwrap(),
+            "dither must be reproducible"
+        );
+
+        let unknown_flac = encode_flac(&unknown, AudioBitDepth::Bit16).unwrap();
+        assert_eq!(
+            unknown_flac,
+            encode_flac(&known_24, AudioBitDepth::Bit16).unwrap(),
+            "unknown and 24-bit FLAC should dither identically"
+        );
+        let mut reader = claxon::FlacReader::new(std::io::Cursor::new(unknown_flac)).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 16);
+        let decoded: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        let mut distinct = decoded;
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "unknown-precision 16-bit FLAC was crushed instead of dithered"
+        );
+    }
+
+    #[test]
+    fn aac_16_bit_output_is_dithered_and_streaming_matches() {
+        let path = fixture_path("sample.m4a");
+        let input = std::fs::read(&path).unwrap();
+        let buffered =
+            parse_wav(&convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap()[0].bytes);
+        let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+        assert_eq!(buffered.samples, streamed.samples, "sample.m4a differs");
+
+        let again =
+            parse_wav(&convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap()[0].bytes);
+        assert_eq!(
+            buffered.samples, again.samples,
+            "dither must be reproducible"
+        );
+
+        // The AAC fixture starts with the encoder's quiet pre-roll. A 16-bit
+        // conversion without dither crushes that region to zero.
+        let quiet = &buffered.samples[..512];
+        assert!(
+            quiet
+                .iter()
+                .map(|sample| sample.unsigned_abs())
+                .max()
+                .unwrap()
+                <= 4,
+            "the AAC fixture's quiet pre-roll is no longer quiet"
+        );
+        let mut distinct = quiet.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() > 1, "AAC 16-bit output was not dithered");
+        assert!(
+            quiet.iter().any(|sample| *sample != 0),
+            "AAC 16-bit output was a silent crush"
+        );
+
+        let buffered_flac = convert_bytes("sample.m4a", &input, OutputFormat::Flac)
+            .unwrap()
+            .remove(0)
+            .bytes;
+        let mut streamed_flac = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &path,
+            "sample.m4a",
+            OutputFormat::Flac,
+            ConversionOptions::default(),
+            &mut streamed_flac,
+        )
+        .unwrap();
+        let buffered_flac = flac_16_bit_samples(&buffered_flac);
+        let streamed_flac = flac_16_bit_samples(&streamed_flac.into_inner());
+        assert_eq!(buffered_flac, streamed_flac, "sample.m4a FLAC differs");
+        let mut quiet = buffered_flac[..512].to_vec();
+        quiet.sort_unstable();
+        quiet.dedup();
+        assert!(quiet.len() > 1, "AAC 16-bit FLAC was not dithered");
     }
 
     #[test]

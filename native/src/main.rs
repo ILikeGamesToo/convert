@@ -710,18 +710,28 @@ fn mp3_bitrate_setting(ui: &mut egui::Ui, bitrate: &mut Mp3Bitrate) {
     });
 }
 
-fn audio_bit_depth_setting(ui: &mut egui::Ui, depth: &mut AudioBitDepth, target: OutputFormat) {
-    let choices: &[AudioBitDepth] = if target == OutputFormat::Flac {
-        &[AudioBitDepth::Bit16, AudioBitDepth::Bit24]
+const FLAC_AUDIO_BIT_DEPTHS: [AudioBitDepth; 2] = [AudioBitDepth::Bit16, AudioBitDepth::Bit24];
+
+fn audio_bit_depth_choices(target: OutputFormat) -> &'static [AudioBitDepth] {
+    if target == OutputFormat::Flac {
+        &FLAC_AUDIO_BIT_DEPTHS
     } else {
         &AudioBitDepth::ALL
-    };
-    // A depth chosen for WAV may not be valid after switching the target to
-    // FLAC. Fall back to the default instead of leaving an unsupported value
-    // selected but hidden from the combo box.
-    if !choices.contains(&*depth) {
+    }
+}
+
+/// A depth chosen for WAV may not be valid after switching the target to FLAC.
+/// Fall back to the default instead of leaving an unsupported value selected
+/// but hidden from the combo box.
+fn normalize_audio_bit_depth(depth: &mut AudioBitDepth, target: OutputFormat) {
+    if !audio_bit_depth_choices(target).contains(depth) {
         *depth = AudioBitDepth::Bit16;
     }
+}
+
+fn audio_bit_depth_setting(ui: &mut egui::Ui, depth: &mut AudioBitDepth, target: OutputFormat) {
+    normalize_audio_bit_depth(depth, target);
+    let choices = audio_bit_depth_choices(target);
     ui.vertical(|ui| {
         ui.label(RichText::new("Bit depth").size(12.8).strong().color(TEXT));
         settings_input_frame(ui, |ui| {
@@ -3580,6 +3590,7 @@ fn validate_relative_path(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use convert_to_it_native::convert_audio_file_to_writer;
 
     fn test_conversion_job(receiver: Receiver<ConversionEvent>) -> ConversionJob {
         ConversionJob {
@@ -3794,6 +3805,72 @@ mod tests {
         ));
         assert_eq!(Mp3Bitrate::ALL.len(), 4);
         assert_eq!(Mp3Bitrate::Kbps320.kbps(), 320);
+    }
+
+    #[test]
+    fn audio_bit_depth_settings_reach_encoders_and_flac_resets_float() {
+        assert!(audio_bit_depth_choices(OutputFormat::Wav).contains(&AudioBitDepth::Float32));
+        assert!(audio_bit_depth_choices(OutputFormat::Wav).contains(&AudioBitDepth::Bit24));
+        assert!(!audio_bit_depth_choices(OutputFormat::Flac).contains(&AudioBitDepth::Float32));
+
+        fn wav_format_and_bits(bytes: &[u8]) -> (u16, u16) {
+            assert_eq!(&bytes[0..4], b"RIFF");
+            assert_eq!(&bytes[12..16], b"fmt ");
+            (
+                u16::from_le_bytes(bytes[20..22].try_into().unwrap()),
+                u16::from_le_bytes(bytes[34..36].try_into().unwrap()),
+            )
+        }
+
+        fn flac_bits_per_sample(bytes: &[u8]) -> u16 {
+            assert_eq!(&bytes[0..4], b"fLaC");
+            let streaminfo = &bytes[8..8 + 34];
+            let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+            (((packed >> 36) & 0x1F) + 1) as u16
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-depth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("tone.wav");
+        fs::write(&input, tiny_wav()).unwrap();
+
+        let encode = |requested: AudioBitDepth, target: OutputFormat| {
+            let mut options = ConversionOptions {
+                audio_bit_depth: requested,
+                ..Default::default()
+            };
+            normalize_audio_bit_depth(&mut options.audio_bit_depth, target);
+            let mut output = std::io::Cursor::new(Vec::new());
+            convert_audio_file_to_writer(&input, "tone.wav", target, options, &mut output).unwrap();
+            (options.audio_bit_depth, output.into_inner())
+        };
+
+        let (depth, wav24) = encode(AudioBitDepth::Bit24, OutputFormat::Wav);
+        assert_eq!(depth, AudioBitDepth::Bit24);
+        assert_eq!(wav_format_and_bits(&wav24), (1, 24));
+
+        let (depth, wav_float) = encode(AudioBitDepth::Float32, OutputFormat::Wav);
+        assert_eq!(depth, AudioBitDepth::Float32);
+        assert_eq!(wav_format_and_bits(&wav_float), (3, 32));
+
+        let (depth, flac24) = encode(AudioBitDepth::Bit24, OutputFormat::Flac);
+        assert_eq!(depth, AudioBitDepth::Bit24);
+        assert_eq!(flac_bits_per_sample(&flac24), 24);
+
+        // Selecting float for WAV and then switching to FLAC must reset to a
+        // supported depth instead of encoding a hidden invalid value.
+        let (depth, flac_reset) = encode(AudioBitDepth::Float32, OutputFormat::Flac);
+        assert_eq!(depth, AudioBitDepth::Bit16);
+        assert_eq!(flac_bits_per_sample(&flac_reset), 16);
+
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
