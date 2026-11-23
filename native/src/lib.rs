@@ -5141,6 +5141,15 @@ mod tests {
         reader.samples().map(Result::unwrap).collect()
     }
 
+    /// The deterministic 16-bit truncation the old bypass produced: no dither,
+    /// just the same f32 samples rounded and clamped.
+    fn undithered_i16(samples: &[f32]) -> Vec<i16> {
+        samples
+            .iter()
+            .map(|&sample| sample_to_i16(sample))
+            .collect()
+    }
+
     /// Encodes a 5.1 Ogg Opus stream with the Vorbis channel order the Opus
     /// mapping family expects: FL, FC, FR, RL, RR, LFE.
     fn opus_surround_fixture(channels: [f32; 6]) -> Vec<u8> {
@@ -7524,6 +7533,28 @@ mod tests {
                 "{name} streaming"
             );
             assert_eq!(streamed.samples, parsed.samples, "{name} differs");
+
+            let float_options = ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            };
+            let buffered_float = wav_float_samples(
+                &convert_bytes_with_options(name, &input, OutputFormat::Wav, float_options)
+                    .unwrap()[0]
+                    .bytes,
+            );
+            let streamed_float = wav_float_samples(&stream_wav(&path, float_options));
+            assert_eq!(
+                buffered_float, streamed_float,
+                "{name} float samples differ"
+            );
+            let truncation = undithered_i16(&buffered_float);
+            let buffered_dithered = parsed.samples != truncation;
+            let streamed_dithered = streamed.samples != truncation;
+            assert!(
+                buffered_dithered && streamed_dithered,
+                "{name} must differ from the undithered truncation (buffered: {buffered_dithered}, streaming: {streamed_dithered})"
+            );
         }
 
         let aac = fixture("sample-aac.m4a");
@@ -8143,6 +8174,11 @@ mod tests {
             "unknown and 32-bit sources should dither identically"
         );
         let decoded = parse_wav(&unknown_wav);
+        let truncation = undithered_i16(&samples);
+        assert_ne!(
+            decoded.samples, truncation,
+            "unknown-precision WAV matches the undithered truncation"
+        );
         let mut distinct = decoded.samples.clone();
         distinct.sort_unstable();
         distinct.dedup();
@@ -8162,9 +8198,19 @@ mod tests {
             encode_flac(&known_24, AudioBitDepth::Bit16).unwrap(),
             "unknown and 24-bit FLAC should dither identically"
         );
+        assert_eq!(
+            unknown_flac,
+            encode_flac(&unknown, AudioBitDepth::Bit16).unwrap(),
+            "FLAC dither must be reproducible"
+        );
         let mut reader = claxon::FlacReader::new(std::io::Cursor::new(unknown_flac)).unwrap();
         assert_eq!(reader.streaminfo().bits_per_sample, 16);
         let decoded: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        let truncation: Vec<i32> = truncation.iter().map(|&sample| i32::from(sample)).collect();
+        assert_ne!(
+            decoded, truncation,
+            "unknown-precision FLAC matches the undithered truncation"
+        );
         let mut distinct = decoded;
         distinct.sort_unstable();
         distinct.dedup();
@@ -8182,6 +8228,28 @@ mod tests {
             parse_wav(&convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap()[0].bytes);
         let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
         assert_eq!(buffered.samples, streamed.samples, "sample.m4a differs");
+
+        let float_options = ConversionOptions {
+            audio_bit_depth: AudioBitDepth::Float32,
+            ..Default::default()
+        };
+        let buffered_float = wav_float_samples(
+            &convert_bytes_with_options("sample.m4a", &input, OutputFormat::Wav, float_options)
+                .unwrap()[0]
+                .bytes,
+        );
+        let streamed_float = wav_float_samples(&stream_wav(&path, float_options));
+        assert_eq!(
+            buffered_float, streamed_float,
+            "sample.m4a float samples differ"
+        );
+        let truncation = undithered_i16(&buffered_float);
+        let buffered_dithered = buffered.samples != truncation;
+        let streamed_dithered = streamed.samples != truncation;
+        assert!(
+            buffered_dithered && streamed_dithered,
+            "AAC 16-bit output must differ from the undithered truncation (buffered: {buffered_dithered}, streaming: {streamed_dithered})"
+        );
 
         let again =
             parse_wav(&convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap()[0].bytes);
@@ -8227,6 +8295,13 @@ mod tests {
         let buffered_flac = flac_16_bit_samples(&buffered_flac);
         let streamed_flac = flac_16_bit_samples(&streamed_flac.into_inner());
         assert_eq!(buffered_flac, streamed_flac, "sample.m4a FLAC differs");
+        let truncation: Vec<i32> = truncation.iter().map(|&sample| i32::from(sample)).collect();
+        let buffered_dithered = buffered_flac != truncation;
+        let streamed_dithered = streamed_flac != truncation;
+        assert!(
+            buffered_dithered && streamed_dithered,
+            "AAC FLAC output must differ from the undithered truncation (buffered: {buffered_dithered}, streaming: {streamed_dithered})"
+        );
         let mut quiet = buffered_flac[..512].to_vec();
         quiet.sort_unstable();
         quiet.dedup();
