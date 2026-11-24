@@ -20,8 +20,10 @@ mod format;
 pub mod input_extensions;
 pub mod input_format;
 mod options;
+mod shared;
 mod streaming;
 
+use crate::shared::*;
 pub use error::ConvertError;
 pub use format::{native_format_registry, FormatHandler, OutputFormat};
 pub use input_extensions::supported_input_extensions;
@@ -954,65 +956,6 @@ fn create_zip(
     }
 
     Ok(archive.finish()?.into_inner())
-}
-
-fn safe_file_name(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty() && name != "." && name != "..")
-        .unwrap_or_else(|| "file".to_owned())
-}
-
-fn file_extension(name: &str) -> String {
-    Path::new(name)
-        .extension()
-        .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
-}
-
-fn is_archive_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.ends_with(".zip")
-        || name.ends_with(".tar")
-        || name.ends_with(".tar.gz")
-        || name.ends_with(".tgz")
-        || name.ends_with(".gz")
-}
-
-fn output_name(input_name: &str, extension: &str) -> PathBuf {
-    let stem = Path::new(input_name)
-        .file_stem()
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| std::ffi::OsStr::new("converted"));
-    PathBuf::from(format!("{}.{}", stem.to_string_lossy(), extension))
-}
-
-fn unsupported(extension: &str, target: OutputFormat) -> ConvertError {
-    ConvertError::Unsupported {
-        input_extension: extension.to_owned(),
-        target: target.label(),
-    }
-}
-
-fn is_image_input_extension(extension: &str) -> bool {
-    input_extensions::IMAGE_INPUT_EXTENSIONS.contains(&extension)
-}
-
-fn is_data_extension(extension: &str) -> bool {
-    input_extensions::DATA_INPUT_EXTENSIONS.contains(&extension)
-}
-
-fn is_audio_extension(extension: &str) -> bool {
-    input_extensions::AUDIO_INPUT_EXTENSIONS.contains(&extension)
-}
-
-fn is_pdf_extension(extension: &str) -> bool {
-    input_extensions::PDF_INPUT_EXTENSIONS.contains(&extension)
-}
-
-fn is_video_input_extension(extension: &str) -> bool {
-    matches!(extension, "mp4" | "m4v" | "mov" | "mkv" | "webm")
 }
 
 const FFMPEG_STDERR_LIMIT: usize = 8_192;

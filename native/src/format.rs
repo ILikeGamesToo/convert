@@ -3,7 +3,7 @@
 //! Output formats and the native format registry.
 
 use crate::input_format;
-use crate::{
+use crate::shared::{
     file_extension, is_archive_name, is_audio_extension, is_data_extension,
     is_image_input_extension, is_video_input_extension,
 };
