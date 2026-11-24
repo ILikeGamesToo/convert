@@ -32,7 +32,9 @@ const SOFT: Color32 = Color32::from_rgb(37, 37, 37);
 const BORDER: Color32 = Color32::from_rgb(55, 55, 55);
 const PRIMARY: Color32 = Color32::from_rgb(35, 131, 226);
 const TEXT: Color32 = Color32::from_rgb(209, 209, 209);
-const MUTED: Color32 = Color32::from_rgb(128, 128, 128);
+// Secondary text. 154 keeps body-size text at 5.45:1 on `SOFT` and 5.79:1 on
+// `CARD`; 128 was 3.88:1, under the 4.5:1 that small text needs.
+const MUTED: Color32 = Color32::from_rgb(154, 154, 154);
 const FOOTER_TEXT: Color32 = Color32::from_rgb(94, 94, 94);
 const GREEN: Color32 = Color32::from_rgb(83, 190, 132);
 const RED: Color32 = Color32::from_rgb(235, 93, 93);
@@ -1310,7 +1312,7 @@ impl ConvertApp {
                                             .unwrap_or_else(|| "No folder selected".to_owned()),
                                     )
                                     .size(12.0)
-                                    .color(FOOTER_TEXT),
+                                    .color(MUTED),
                                 );
                             });
                             ui.with_layout(
@@ -3265,7 +3267,7 @@ fn paint_action_button(
             if enabled {
                 Color32::WHITE
             } else {
-                FOOTER_TEXT
+                MUTED
             }
         } else if enabled {
             MUTED
@@ -4132,6 +4134,37 @@ fn main() {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn secondary_text_clears_the_body_contrast_target() {
+        fn luminance(color: Color32) -> f64 {
+            fn channel(value: u8) -> f64 {
+                let value = f64::from(value) / 255.0;
+                if value <= 0.039_28 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            }
+            0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+        }
+
+        fn contrast(foreground: Color32, background: Color32) -> f64 {
+            let foreground = luminance(foreground);
+            let background = luminance(background);
+            let lighter = foreground.max(background);
+            let darker = foreground.min(background);
+            (lighter + 0.05) / (darker + 0.05)
+        }
+
+        for background in [BG, CARD, SOFT] {
+            let ratio = contrast(MUTED, background);
+            assert!(
+                ratio >= 4.5,
+                "MUTED on {background:?} is {ratio:.2}:1, under the 4.5:1 body-text target"
+            );
+        }
     }
 
     #[test]
