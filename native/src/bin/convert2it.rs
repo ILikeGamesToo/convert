@@ -53,7 +53,7 @@ Options:
       --list-formats          Print the native input/output registry and exit
       --list-video            Print the automatic video routes and exit
 
-Use `--format files` to extract a ZIP, TAR, TAR.GZ or GZIP archive.
+Use `--format files` to extract a ZIP, TAR, TAR.GZ, GZIP, RAR or 7z archive.
 Video remux (`mp4`/`webm`) and thumbnails (`png`/`jpg`/`webp` from video)
 require ffmpeg on PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg. This is
 stream-copy remux plus frame/thumbnail extraction. Incompatible
