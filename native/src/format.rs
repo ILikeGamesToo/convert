@@ -7,7 +7,7 @@ use crate::shared::{
     file_extension, is_archive_name, is_audio_extension, is_data_extension,
     is_image_input_extension, is_video_input_extension,
 };
-use crate::{native_video_routes, VideoRouteInfo};
+use crate::video::{native_video_routes, VideoRouteInfo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

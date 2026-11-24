@@ -3,7 +3,7 @@
 //! Locating and running the external ffmpeg binary.
 
 use crate::error::ConvertError;
-use crate::VideoToolConfig;
+use crate::video::VideoToolConfig;
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
