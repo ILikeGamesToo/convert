@@ -29,6 +29,12 @@ pub(crate) fn is_archive_name(name: &str) -> bool {
         || name.ends_with(".tar.gz")
         || name.ends_with(".tgz")
         || name.ends_with(".gz")
+        || name.ends_with(".rar")
+        || name.ends_with(".7z")
+        || name.ends_with(".cbr")
+        || name.ends_with(".cbz")
+        || name.ends_with(".cbt")
+        || name.ends_with(".cb7")
 }
 
 fn output_stem(input_name: &str) -> &std::ffi::OsStr {

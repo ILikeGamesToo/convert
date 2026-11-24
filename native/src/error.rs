@@ -63,6 +63,15 @@ pub enum ConvertError {
     ArchiveTooLarge { max: u64 },
     #[error("the archive contains no files")]
     NoArchiveEntries,
+    #[error("the archive is encrypted or password-protected; this app cannot ask for a password")]
+    ArchiveEncrypted,
+    #[error("the {format} decoder refused the archive: {message}")]
+    ArchiveDecoder {
+        format: &'static str,
+        message: String,
+    },
+    #[error("the archive took longer than {seconds} seconds to decode")]
+    ArchiveDecodeTimeout { seconds: u64 },
     #[error("archive entry {0:?} would escape the output directory")]
     UnsafeArchivePath(String),
     #[error("could not read the PDF: {0}")]

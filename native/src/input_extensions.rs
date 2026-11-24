@@ -24,8 +24,12 @@ pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
 /// because their first face is converted.
 pub const FONT_INPUT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2", "ttc", "otc"];
 
-/// Archive extensions accepted for extraction and re-packing.
-pub const ARCHIVE_INPUT_EXTENSIONS: &[&str] = &["zip", "tar", "gz", "tgz"];
+/// Archive extensions accepted for extraction and re-packing. The comic
+/// extensions name the same four containers: CBR is a RAR, CBZ a ZIP, CBT a
+/// TAR and CB7 a 7z.
+pub const ARCHIVE_INPUT_EXTENSIONS: &[&str] = &[
+    "zip", "tar", "gz", "tgz", "rar", "cbr", "7z", "cb7", "cbz", "cbt",
+];
 
 /// Every extension accepted by the conversion engine, for the default
 /// "Supported files" filter. Archive inputs are included so ZIP/TAR/GZIP can be

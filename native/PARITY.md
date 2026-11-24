@@ -21,7 +21,7 @@ The same data is available from the library as `native_format_registry()`.
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
 | PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, SVG pages, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro` or vectorise through `hayro-svg`, one file per page; see [PDF rasterisation](#pdf-rasterisation) and [PDF page SVGs](#pdf-page-svgs) for the scale, the naming and the limits. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. Tags are carried between MP3, FLAC and Opus; see [Audio tags](#audio-tags). |
-| Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP | ZIP, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. |
+| Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP, RAR 4/5, 7z | ZIP, CBZ, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. RAR and 7z are read-only and decoded in-process by pure-Rust crates, so nothing external is installed. An archive input re-packs into the target container instead of being nested, which is what turns a CBR or CB7 into a readable CBZ. Encrypted archives are refused with a typed error, and a decode is bounded by a 120 s deadline and a 512 MiB dictionary cap. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
 
 | Fonts | TTF, OTF, WOFF, WOFF2, TTC/OTC | TTF, OTF, WOFF, WOFF2, SVG | Every font table is copied verbatim and only the container is rewritten, so outlines, advance widths, units-per-em, the cmap and the name table survive a conversion. TTF and OTF output relabel the container and keep the source outline format, so they differ only in file name; there is no `glyf`↔`CFF ` outline conversion (see Known gaps). A `.ttc`/`.otc` collection is converted from its first face. WOFF2 input reverses the `glyf`/`loca` transform; WOFF2 output uses the null transform the format allows. SVG output is the web handler's font specimen (one `<glyph>` per mapped codepoint), not a rasterisable text document. |
@@ -30,7 +30,8 @@ The same data is available from the library as `native_format_registry()`.
 
 The web app (`src/handlers/index.ts`) also has dedicated handlers for vector
 tracing, EPUB/AZW3/MOBI, office documents, Typst/Pandoc, 3D models,
-SQLite, 7z/RAR/LZH, comic archives, game formats, and MIDI/module music. Those handlers depend on
+SQLite, LZH, the comic packer that builds a CBZ/CBT/CBR/CB7 from loose images, game
+formats, and MIDI/module music. Those handlers depend on
 JavaScript/WASM libraries or
 external tools that do not have a verified native equivalent in this crate.
 

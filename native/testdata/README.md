@@ -1,7 +1,7 @@
 # Native test fixtures
 
-These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies, and font container conversions for TrueType (glyf) and OpenType (CFF) fonts, plus AVIF and HEIC decoding, and PDF page rasterisation of a
-document Chrome wrote.
+These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies, and font container conversions for TrueType (glyf) and OpenType (CFF) fonts, plus AVIF and HEIC decoding, PDF page rasterisation of a
+document Chrome wrote, and RAR and 7z reading for the comic re-pack path.
 - `piano.ogg` — Ogg Vorbis, CC0 1.0. Source: [`themankindproject/audiofp`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/piano.ogg); its [`CREDITS.md`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/CREDITS.md) marks it CC0 and generated for that project.
 - `sample.m4a` — AAC in an audio-only M4A, 22 KB. Remuxed from the audio track of WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4) with the video track removed and the `esds` SLConfigDescriptor set to the MP4 predefined value. WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
 - `sample-video.mp4` — H.264 video with an AAC audio track, 53 KB. Copied from WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4). WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
@@ -153,6 +153,47 @@ document Chrome wrote.
 - `pdf-source.html` — the page `sample-chrome.pdf` is printed from, kept so the
   fixture can be regenerated. It loads `abel-regular.ttf` and
   `source-code-pro-regular.otf` from this directory through `@font-face`.
+
+- `sample-comic.cbr`, `sample-rar5.cbr`, and `sample-encrypted.rar` — the same
+  three-entry comic (a 4x4 PNG `page-1.png`, a second `page-2.png`, and a
+  `ComicInfo.xml`) stored as RAR 4, RAR 5, and RAR 5 with its file contents
+  encrypted under the password `capy-min13`. The pages were drawn by a throwaway
+  Node script from flat colour blocks: a 4x4 RGB PNG is 96 bytes, small enough
+  that a two-page comic fits in a test fixture and real enough that the re-packed
+  CBZ pages still decode. The archives themselves were written by `rars` 0.13.0's
+  own `Builder` (`ArchiveVersion::Rar40` and `Rar50`, `Builder::password` for the
+  encrypted one), so no WinRAR licence is involved, and each unencrypted one was
+  then confirmed readable by an independent extractor:
+
+  ```sh
+  7z t sample-comic.cbr     # Everything is Ok
+  7z t sample-rar5.cbr      # Everything is Ok
+  ```
+
+  `sample-comic.cbr` compresses `ComicInfo.xml` from 397 to 259 bytes and
+  `sample-rar5.cbr` to 283, so both run a real decompressor instead of a copy.
+  The encrypted archive still lists its table of contents but refuses the
+  contents themselves, which is what the encrypted-input test asserts. `rars`'
+  builder refuses a member named `../evil.txt`, so a traversal fixture cannot be
+  generated this way; path safety is enforced by the same `safe_archive_path`
+  guard the ZIP and TAR fixtures already cover.
+- `sample-comic.cb7`, `sample-bzip2.7z`, `sample-encrypted.7z`, and
+  `sample-encrypted-header.7z` — the same comic as 7z archives written by 7-Zip
+  24.08: one solid LZMA2 block at `mx=9`, one BZip2 archive, one with the
+  contents encrypted under `capy-min13`, and one with the contents and the
+  headers both encrypted:
+
+  ```sh
+  7z a -t7z -mx=9 sample-comic.cb7 page-1.png page-2.png ComicInfo.xml
+  7z a -t7z -m0=BZip2 sample-bzip2.7z page-1.png page-2.png ComicInfo.xml
+  7z a -t7z -pcapy-min13 sample-encrypted.7z page-1.png page-2.png
+  7z a -t7z -pcapy-min13 -mhe=on sample-encrypted-header.7z page-1.png page-2.png
+  ```
+
+  7-Zip's own `7z t` passes on the two unencrypted archives. The LZMA2 and BZip2
+  pair covers two different codecs, and the two encrypted archives cover the case
+  where the entry table is still readable and the case where it is not: the app
+  has to refuse both with the same typed error.
 
 ## Metadata fixtures
 

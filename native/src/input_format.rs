@@ -39,6 +39,11 @@ pub enum InputFormat {
     Ac3,
     Video,
     Archive,
+    /// RAR, including the CBR comic extension. Read-only: the native build
+    /// extracts and re-packs it, but never writes one.
+    Rar,
+    /// 7z, including the CB7 comic extension. Read-only for the same reason.
+    SevenZip,
     Ttf,
     Otf,
     Woff,
@@ -48,7 +53,7 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 38] = [
+    pub const SELECTABLE: [Self; 40] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -83,6 +88,8 @@ impl InputFormat {
         Self::Ac3,
         Self::Video,
         Self::Archive,
+        Self::Rar,
+        Self::SevenZip,
         Self::Ttf,
         Self::Otf,
         Self::Woff,
@@ -124,6 +131,8 @@ impl InputFormat {
             Self::Ac3 => "Dolby audio",
             Self::Video => "Video",
             Self::Archive => "Archive file",
+            Self::Rar => "RAR archive",
+            Self::SevenZip => "7z archive",
             Self::Ttf => "TrueType font",
             Self::Otf => "OpenType font",
             Self::Woff => "WOFF font",
@@ -168,6 +177,8 @@ impl InputFormat {
             Self::Ac3 => "AC-3 or E-AC-3 audio",
             Self::Video => "MP4, MOV, MKV, or WebM with an audio track",
             Self::Archive => "ZIP, TAR, TAR.GZ, or GZIP; archive creation only",
+            Self::Rar => "RAR version 4 or 5; extraction and re-packing only",
+            Self::SevenZip => "7z; extraction and re-packing only",
             Self::Ttf => "TrueType outlines in an sfnt container",
             Self::Otf => "CFF outlines in an OpenType container",
             Self::Woff => "Web Open Font Format 1.0",
@@ -211,6 +222,8 @@ impl InputFormat {
             Self::Ac3 => "AC3",
             Self::Video => "VIDEO",
             Self::Archive => "ARCHIVE",
+            Self::Rar => "RAR",
+            Self::SevenZip => "7Z",
             Self::Ttf => "TTF",
             Self::Otf => "OTF",
             Self::Woff => "WOFF",
@@ -255,6 +268,8 @@ impl InputFormat {
             Self::Ac3 => "ac3",
             Self::Video => "mp4",
             Self::Archive => "zip",
+            Self::Rar => "rar",
+            Self::SevenZip => "7z",
             Self::Ttf => "ttf",
             Self::Otf => "otf",
             Self::Woff => "woff",
@@ -371,7 +386,9 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "aiff" | "aif" => InputFormat::Aiff,
         "ac3" | "eac3" | "ec3" => InputFormat::Ac3,
         "mp4" | "m4v" | "mov" | "mkv" | "webm" => InputFormat::Video,
-        "zip" | "tar" | "gz" | "tgz" => InputFormat::Archive,
+        "zip" | "tar" | "gz" | "tgz" | "cbz" | "cbt" => InputFormat::Archive,
+        "rar" | "cbr" => InputFormat::Rar,
+        "7z" | "cb7" => InputFormat::SevenZip,
         "ttf" => InputFormat::Ttf,
         "otf" => InputFormat::Otf,
         "woff" => InputFormat::Woff,
@@ -386,6 +403,12 @@ fn is_ogg_opus(bytes: &[u8]) -> bool {
 }
 
 fn sniff(bytes: &[u8]) -> Option<InputFormat> {
+    if crate::archive_readers::is_rar(bytes) {
+        return Some(InputFormat::Rar);
+    }
+    if crate::archive_readers::is_seven_zip(bytes) {
+        return Some(InputFormat::SevenZip);
+    }
     if let Some(font) = crate::fonts::sniff(bytes) {
         return Some(match font {
             crate::fonts::FontContainer::TrueType | crate::fonts::FontContainer::Collection => {
@@ -573,6 +596,12 @@ mod tests {
             ("archive.tar.gz", InputFormat::Archive),
             ("archive.tgz", InputFormat::Archive),
             ("archive.gz", InputFormat::Archive),
+            ("archive.rar", InputFormat::Rar),
+            ("comic.cbr", InputFormat::Rar),
+            ("archive.7z", InputFormat::SevenZip),
+            ("comic.cb7", InputFormat::SevenZip),
+            ("comic.cbz", InputFormat::Archive),
+            ("comic.cbt", InputFormat::Archive),
         ];
         for (name, expected) in cases {
             assert_eq!(detect_from_bytes(name, b""), expected, "{name}");
@@ -595,6 +624,15 @@ mod tests {
 
         let jpeg = [0xff, 0xd8, 0xff, 0xe0];
         assert_eq!(detect_from_bytes("mystery.png", &jpeg), InputFormat::Jpeg);
+
+        assert_eq!(
+            detect_from_bytes("mystery.zip", b"Rar!\x1a\x07\x00"),
+            InputFormat::Rar
+        );
+        assert_eq!(
+            detect_from_bytes("mystery.zip.gz", b"7z\xbc\xaf\x27\x1c\x00\x04"),
+            InputFormat::SevenZip
+        );
 
         let wav = b"RIFF\x24\x00\x00\x00WAVEfmt ";
         assert_eq!(detect_from_bytes("mystery.bin", wav), InputFormat::Wav);

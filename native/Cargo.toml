@@ -62,8 +62,24 @@ rav1d = { version = "1.1.0", default-features = false, features = [
     "bitdepth_8",
     "bitdepth_16",
 ] }
+# RAR and 7z are input-only: `rars` decodes RAR and `sevenz-rust2` decodes 7z,
+# so a CBR or CB7 comic can be re-packed as a CBZ. Both are pure Rust with no
+# `build.rs`, no C library and no network call. `rars` keeps only its decoders
+# plus the crypto checks that make an encrypted archive report itself as
+# encrypted; `sevenz-rust2` keeps its decoders plus the codecs that are pure
+# Rust here — its `bzip2` feature uses the crate's default `libbz2-rs-sys`
+# backend, and `zstd` is left out because that one binds the C library.
+rars = { version = "0.13", default-features = false, features = ["encryption"] }
 rfd = "0.15"
 resvg = "0.50"
+sevenz-rust2 = { version = "0.25", default-features = false, features = [
+    "aes256",
+    "brotli",
+    "bzip2",
+    "deflate",
+    "lz4",
+    "ppmd",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"

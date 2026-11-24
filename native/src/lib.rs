@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 mod archive;
+mod archive_readers;
 mod audio;
 mod audio_tags;
 mod container;

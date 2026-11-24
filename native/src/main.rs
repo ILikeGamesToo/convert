@@ -389,6 +389,7 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Tar
         | OutputFormat::TarGz
         | OutputFormat::Gzip
+        | OutputFormat::Cbz
         | OutputFormat::Files => FormatCategory::Archive,
         OutputFormat::Ttf
         | OutputFormat::Otf
@@ -437,6 +438,7 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Tar => "TAR",
         OutputFormat::TarGz => "TAR.GZ",
         OutputFormat::Gzip => "GZ",
+        OutputFormat::Cbz => "CBZ",
         OutputFormat::Mp4 => "MP4",
         OutputFormat::Webm => "WEBM",
         OutputFormat::Files => "FILES",
@@ -488,6 +490,7 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Tar => "TAR archive",
         OutputFormat::TarGz => "Gzipped TAR archive",
         OutputFormat::Gzip => "GZIP compressed file",
+        OutputFormat::Cbz => "Comic book archive (CBZ)",
         OutputFormat::Mp4 => "MP4 video (stream copy)",
         OutputFormat::Webm => "WebM video (stream copy)",
         OutputFormat::Files => "Extract archive into files",
@@ -599,7 +602,7 @@ fn target_has_applied_setting(target: OutputFormat, options: &ConversionOptions)
                 || options.video_frame_time_ms > 0
                 || options.video_thumbnail_width > 0
         }
-        OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
+        OutputFormat::Zip | OutputFormat::Cbz | OutputFormat::TarGz | OutputFormat::Gzip => {
             options.archive_compression.is_some()
         }
         OutputFormat::Mp4 | OutputFormat::Webm => false,
@@ -1478,7 +1481,7 @@ impl ConvertApp {
                 ui.add_space(10.0);
                 image_settings(ui, &mut self.conversion_options, false);
             }
-            OutputFormat::Zip | OutputFormat::TarGz | OutputFormat::Gzip => {
+            OutputFormat::Zip | OutputFormat::Cbz | OutputFormat::TarGz | OutputFormat::Gzip => {
                 settings_section_heading(ui, "Other", None);
                 ui.add_space(10.0);
                 optional_setting(
@@ -3580,7 +3583,7 @@ enum ConversionFailure {
 fn planned_step_total(inputs: &[PathBuf], target: OutputFormat) -> usize {
     if matches!(
         target,
-        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
+        OutputFormat::Zip | OutputFormat::Cbz | OutputFormat::Tar | OutputFormat::TarGz
     ) {
         return inputs.len().saturating_add(2);
     }
@@ -3614,7 +3617,7 @@ fn convert_to_directory(
     let video = VideoToolConfig::default();
     if matches!(
         target,
-        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
+        OutputFormat::Zip | OutputFormat::Cbz | OutputFormat::Tar | OutputFormat::TarGz
     ) {
         let mut files = Vec::with_capacity(inputs.len());
         for path in inputs {
@@ -4471,6 +4474,7 @@ fn main() {
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
                 OutputFormat::Gzip,
+                OutputFormat::Cbz,
                 OutputFormat::Files
             ]
         );
@@ -4485,11 +4489,28 @@ fn main() {
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
                 OutputFormat::Gzip,
+                OutputFormat::Cbz,
                 OutputFormat::Files
             ]
         );
     }
 
+    #[test]
+    fn rar_and_seven_zip_inputs_offer_archive_outputs() {
+        for input in [InputFormat::Rar, InputFormat::SevenZip] {
+            assert_eq!(
+                available_targets(Some(input)),
+                [
+                    OutputFormat::Zip,
+                    OutputFormat::Tar,
+                    OutputFormat::TarGz,
+                    OutputFormat::Gzip,
+                    OutputFormat::Cbz,
+                    OutputFormat::Files
+                ]
+            );
+        }
+    }
     #[test]
     fn audio_track_picker_defaults_to_auto_and_uses_probed_metadata() {
         let path =

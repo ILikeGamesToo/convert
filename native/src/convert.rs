@@ -3,7 +3,8 @@
 //! Conversion entry points that route an input to the per-medium handlers.
 
 use crate::archive::{
-    archive_entry_count, create_tar, create_zip, extract_archive, gzip_bytes, MAX_ARCHIVE_ENTRIES,
+    archive_entry_count, create_tar, create_zip, extract_archive, gzip_bytes, is_archive_bytes,
+    MAX_ARCHIVE_ENTRIES,
 };
 use crate::audio::{
     apply_audio_options, decode_audio, encode_aiff, encode_au, encode_flac, encode_mp3,
@@ -19,9 +20,9 @@ use crate::images::{encode_image, encode_image_with_metadata, load_image, raster
 use crate::options::ConversionOptions;
 use crate::pdf;
 use crate::shared::{
-    file_extension, is_audio_extension, is_font_extension, is_image_input_extension,
-    is_pdf_extension, is_video_input_extension, output_name, page_output_name, safe_file_name,
-    unsupported,
+    file_extension, is_archive_name, is_audio_extension, is_font_extension,
+    is_image_input_extension, is_pdf_extension, is_video_input_extension, output_name,
+    page_output_name, safe_file_name, unsupported,
 };
 use crate::text::{convert_text, encode_text};
 use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
@@ -71,6 +72,30 @@ pub fn convert_bytes_with_video_config(
     convert_bytes_with_video_control(input_name, input, target, options, video, None)
 }
 
+/// The entries an archive target should hold for one input. An input that is
+/// itself an archive is unpacked so its members are re-packed into the target
+/// container instead of the whole archive being nested inside it, which is what
+/// turns a CBR or CB7 comic into a readable CBZ. Anything else becomes a single
+/// entry named after the input file.
+fn archive_entries(
+    input_name: &str,
+    input: &[u8],
+) -> Result<Vec<(PathBuf, Vec<u8>)>, ConvertError> {
+    // The name is checked beside the magic bytes because an old v7 tar carries
+    // no ustar marker, and a .cbr or .cb7 is a comic whose extension says what
+    // it holds whether or not the bytes are readable.
+    if !is_archive_bytes(input) && !is_archive_name(input_name) {
+        return Ok(vec![(
+            PathBuf::from(safe_file_name(input_name)),
+            input.to_vec(),
+        )]);
+    }
+    Ok(extract_archive(input_name, input)?
+        .into_iter()
+        .map(|file| (file.name, file.bytes))
+        .collect())
+}
+
 /// Conversion entry point that accepts the reserved transcode progress and
 /// cancellation hooks. This slice's remux and thumbnail paths are synchronous,
 /// so the hooks are ignored; non-video conversions ignore them as well.
@@ -86,9 +111,8 @@ pub fn convert_bytes_with_video_control(
     if target == OutputFormat::Files {
         return extract_archive(input_name, input);
     }
-    if target == OutputFormat::Zip {
-        let name = safe_file_name(input_name);
-        let entries = [(PathBuf::from(name), input.to_vec())];
+    if matches!(target, OutputFormat::Zip | OutputFormat::Cbz) {
+        let entries = archive_entries(input_name, input)?;
         let bytes = create_zip(&entries, options.archive_compression)?;
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
@@ -96,8 +120,7 @@ pub fn convert_bytes_with_video_control(
         }]);
     }
     if target == OutputFormat::Tar || target == OutputFormat::TarGz {
-        let name = safe_file_name(input_name);
-        let entries = [(PathBuf::from(name), input.to_vec())];
+        let entries = archive_entries(input_name, input)?;
         let gzip = target == OutputFormat::TarGz;
         let bytes = create_tar(&entries, gzip, options.archive_compression)?;
         return Ok(vec![ConvertedFile {
@@ -342,7 +365,7 @@ pub fn convert_batch_with_video_config(
 
     if matches!(
         target,
-        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
+        OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz | OutputFormat::Cbz
     ) {
         if inputs.len() > MAX_ARCHIVE_ENTRIES {
             return Err(ConvertError::ArchiveTooManyEntries {
@@ -354,16 +377,28 @@ pub fn convert_batch_with_video_config(
         let mut entries = Vec::with_capacity(inputs.len());
 
         for (path, bytes) in inputs {
-            let name = safe_file_name(path.to_string_lossy().as_ref());
-            if !seen_names.insert(name.clone()) {
-                return Err(ConvertError::DuplicateArchiveEntryName(name));
+            for (name, member) in archive_entries(path.to_string_lossy().as_ref(), bytes)? {
+                let key = name.to_string_lossy().into_owned();
+                if !seen_names.insert(key.clone()) {
+                    return Err(ConvertError::DuplicateArchiveEntryName(key));
+                }
+                entries.push((name, member));
             }
-            entries.push((PathBuf::from(name), bytes.clone()));
+            if entries.len() > MAX_ARCHIVE_ENTRIES {
+                return Err(ConvertError::ArchiveTooManyEntries {
+                    count: entries.len(),
+                    max: MAX_ARCHIVE_ENTRIES,
+                });
+            }
         }
 
         let (name, bytes) = match target {
-            OutputFormat::Zip => (
-                "converted.zip",
+            OutputFormat::Zip | OutputFormat::Cbz => (
+                if target == OutputFormat::Cbz {
+                    "converted.cbz"
+                } else {
+                    "converted.zip"
+                },
                 create_zip(&entries, options.archive_compression)?,
             ),
             OutputFormat::Tar => (

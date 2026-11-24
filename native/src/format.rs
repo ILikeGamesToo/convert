@@ -54,6 +54,10 @@ pub enum OutputFormat {
     Tar,
     TarGz,
     Gzip,
+    /// The same ZIP container as [`Self::Zip`] written with the `.cbz`
+    /// extension every comic reader opens, so a CBR or CB7 can be re-packed
+    /// into a CBZ.
+    Cbz,
     /// Extract an archive into separate files instead of creating one.
     Files,
     Ttf,
@@ -67,7 +71,7 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 46] = [
+    pub const ALL: [Self; 47] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -107,6 +111,7 @@ impl OutputFormat {
         Self::Tar,
         Self::TarGz,
         Self::Gzip,
+        Self::Cbz,
         Self::Files,
         Self::Ttf,
         Self::Otf,
@@ -157,6 +162,7 @@ impl OutputFormat {
             Self::Tar => "TAR archive",
             Self::TarGz => "TAR.GZ archive",
             Self::Gzip => "GZIP compressed file",
+            Self::Cbz => "Comic book archive (CBZ)",
             Self::Files => "Extracted files",
             Self::Ttf => "TrueType font",
             Self::Otf => "OpenType font",
@@ -249,6 +255,7 @@ impl OutputFormat {
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
             Self::Gzip => "gz",
+            Self::Cbz => "cbz",
             Self::Files => "files",
             Self::Ttf => "ttf",
             Self::Otf => "otf",
@@ -325,7 +332,7 @@ impl OutputFormat {
             }
             Self::Mp4 | Self::Webm => is_video_input_extension(&extension),
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
-            Self::Files => is_archive_name(file_name),
+            Self::Cbz | Self::Files => is_archive_name(file_name),
             Self::Ttf | Self::Otf | Self::Woff | Self::Woff2 | Self::Svg => {
                 is_font_extension(&extension)
             }
@@ -454,6 +461,17 @@ mod tests {
         assert!(OutputFormat::Wav.supports_input("movie.mkv"));
         assert!(OutputFormat::Pbm.supports_input("photo.png"));
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
+    }
+    #[test]
+    fn cbz_is_a_zip_comic_target_for_archive_inputs_only() {
+        assert_eq!(OutputFormat::Cbz.extension(), "cbz");
+        assert_eq!(OutputFormat::Cbz.label(), "Comic book archive (CBZ)");
+        assert!(OutputFormat::Cbz.supports_input("comic.cbr"));
+        assert!(OutputFormat::Cbz.supports_input("comic.cb7"));
+        assert!(OutputFormat::Cbz.supports_input("comic.cbz"));
+        assert!(!OutputFormat::Cbz.supports_input("page.png"));
+        assert!(!OutputFormat::Cbz.supports_input("notes.txt"));
+        assert!(OutputFormat::ALL.contains(&OutputFormat::Cbz));
     }
     #[test]
     fn registry_lists_avif_and_heic_as_image_inputs() {

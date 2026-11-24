@@ -2,6 +2,7 @@
 
 //! ZIP, TAR, TAR.GZ and GZIP creation and extraction.
 
+use crate::archive_readers;
 use crate::convert::ConvertedFile;
 use crate::error::ConvertError;
 use crate::format::OutputFormat;
@@ -72,11 +73,32 @@ pub(crate) fn gzip_bytes(input: &[u8], compression: Option<u8>) -> Result<Vec<u8
     Ok(encoder.finish()?)
 }
 
+/// Whether `bytes` are an archive this module can extract, judged by magic
+/// bytes alone. An archive target that receives one of these re-packs its
+/// files instead of wrapping the archive in a second container.
+pub(crate) fn is_archive_bytes(bytes: &[u8]) -> bool {
+    archive_readers::is_archive(bytes)
+        || bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+        || bytes.starts_with(&[0x1f, 0x8b])
+        || (bytes.len() >= 262 && &bytes[257..262] == b"ustar")
+}
+
 /// Extracts a ZIP, TAR, TAR.GZ or GZIP archive into independent files.
 /// Entry names are normalized to safe relative paths; absolute paths and
 /// parent-directory components are rejected instead of being written outside
 /// the output directory.
 pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFile>, ConvertError> {
+    // RAR and 7z are recognised by their magic bytes, because a `.cbr` or a
+    // `.cb7` is just a RAR or a 7z under a comic's name.
+    if archive_readers::is_rar(input) {
+        return archive_readers::extract_rar(input);
+    }
+    if archive_readers::is_seven_zip(input) {
+        return archive_readers::extract_seven_zip(input);
+    }
+
     let lower_name = input_name.to_ascii_lowercase();
     let mut outputs = Vec::new();
     let mut names = HashSet::new();
@@ -85,14 +107,14 @@ pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFi
     if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
         let decoder = flate2::read::GzDecoder::new(Cursor::new(input));
         extract_tar_entries(decoder, &mut outputs, &mut names, &mut total_bytes)?;
-    } else if lower_name.ends_with(".tar") {
+    } else if lower_name.ends_with(".tar") || lower_name.ends_with(".cbt") {
         extract_tar_entries(
             Cursor::new(input),
             &mut outputs,
             &mut names,
             &mut total_bytes,
         )?;
-    } else if lower_name.ends_with(".zip") {
+    } else if lower_name.ends_with(".zip") || lower_name.ends_with(".cbz") {
         extract_zip_entries(input, &mut outputs, &mut names, &mut total_bytes)?;
     } else if lower_name.ends_with(".gz") {
         let name = Path::new(input_name)
@@ -121,14 +143,20 @@ pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFi
 /// are skipped, matching what `extract_archive` returns. Counting a compressed
 /// tarball decompresses it, so this costs about as much as listing it.
 pub fn archive_entry_count(input_name: &str, input: &[u8]) -> Result<usize, ConvertError> {
+    if archive_readers::is_rar(input) {
+        return archive_readers::rar_entry_count(input);
+    }
+    if archive_readers::is_seven_zip(input) {
+        return archive_readers::seven_zip_entry_count(input);
+    }
     let lower_name = input_name.to_ascii_lowercase();
     if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
         return count_tar_entries(flate2::read::GzDecoder::new(Cursor::new(input)));
     }
-    if lower_name.ends_with(".tar") {
+    if lower_name.ends_with(".tar") || lower_name.ends_with(".cbt") {
         return count_tar_entries(Cursor::new(input));
     }
-    if lower_name.ends_with(".zip") {
+    if lower_name.ends_with(".zip") || lower_name.ends_with(".cbz") {
         let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
         let mut count = 0;
         for index in 0..archive.len() {
