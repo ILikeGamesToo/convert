@@ -1073,6 +1073,9 @@ impl ConvertApp {
             ui.make_persistent_id("upload-dropzone"),
             egui::Sense::click(),
         );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Click to select a file")
+        });
         let hovering_files = ui.input(|input| {
             !input.raw.hovered_files.is_empty()
                 && input
@@ -1131,11 +1134,18 @@ impl ConvertApp {
                 egui::pos2(first_x + index as f32 * 48.0, top),
                 Vec2::splat(36.0),
             );
+            let tooltip = match *id {
+                "settings" => "App settings",
+                "help" => "Help & Info",
+                _ => "View supported formats",
+            };
             let response = ui.interact(
                 button,
                 ui.make_persistent_id(("upload-action", id)),
                 egui::Sense::click(),
             );
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip));
             let fill = if response.hovered() { SOFT } else { CARD };
             ui.painter()
                 .rect_filled(button, egui::CornerRadius::same(10), fill);
@@ -1164,11 +1174,6 @@ impl ConvertApp {
                     _ => {}
                 }
             }
-            let tooltip = match *id {
-                "settings" => "App settings",
-                "help" => "Help & Info",
-                _ => "View supported formats",
-            };
             response.on_hover_text(tooltip);
         }
     }
@@ -1201,6 +1206,7 @@ impl ConvertApp {
             ui.make_persistent_id("source-link"),
             egui::Sense::click(),
         );
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, true, "Source"));
         let color = if response.hovered() {
             MUTED
         } else {
@@ -2022,6 +2028,13 @@ impl ConvertApp {
             ui.make_persistent_id("back-to-upload-logo"),
             egui::Sense::click(),
         );
+        logo_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                !self.is_converting(),
+                "Back to upload",
+            )
+        });
         logo_response.clone().on_hover_text("Back to upload");
         if logo_response.clicked() && !self.is_converting() {
             self.return_to_upload();
@@ -2040,6 +2053,13 @@ impl ConvertApp {
                 ui.make_persistent_id(("conversion-action", id)),
                 egui::Sense::click(),
             );
+            let label = if *id == "settings" {
+                "App settings"
+            } else {
+                "Conversion settings"
+            };
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
             let active = *id == "conversion-settings" && self.show_conversion_settings;
             painter.rect_filled(
                 button,
@@ -2082,11 +2102,7 @@ impl ConvertApp {
                     _ => {}
                 }
             }
-            response.on_hover_text(if *id == "settings" {
-                "App settings"
-            } else {
-                "Conversion settings"
-            });
+            response.on_hover_text(label);
         }
     }
 
@@ -2138,7 +2154,7 @@ impl ConvertApp {
                 painter.text(
                     egui::pos2(source.left() + 48.0, source.center().y),
                     egui::Align2::LEFT_CENTER,
-                    source_label,
+                    &source_label,
                     bold_font(14.0),
                     TEXT,
                 );
@@ -2158,6 +2174,13 @@ impl ConvertApp {
                         ui.make_persistent_id("input-format-source"),
                         egui::Sense::click(),
                     );
+                    source_response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::ComboBox,
+                            true,
+                            format!("Input format: {source_label}"),
+                        )
+                    });
                     if source_response.hovered() {
                         painter.rect_stroke(
                             source,
@@ -2217,6 +2240,13 @@ impl ConvertApp {
                         })
                         .inner;
                     let search_rect = search_response.rect.expand2(search_margin);
+                    search_response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::TextEdit,
+                            true,
+                            "Search formats",
+                        )
+                    });
                     paint_search_icon(ui.painter(), search_rect, FOOTER_TEXT);
                     if search_response.has_focus() {
                         ui.painter().rect_stroke(
@@ -2281,6 +2311,14 @@ impl ConvertApp {
                             ui.make_persistent_id(("format-category-chip", *index)),
                             egui::Sense::click(),
                         );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Checkbox,
+                                true,
+                                selected,
+                                label,
+                            )
+                        });
                         painter.rect_filled(
                             chip,
                             egui::CornerRadius::same(6),
@@ -2398,6 +2436,18 @@ impl ConvertApp {
                                             egui::Sense::click(),
                                         );
                                         let selected = self.target == Some(*format);
+                                        response.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::WidgetType::RadioButton,
+                                                true,
+                                                selected,
+                                                format!(
+                                                    ".{}, {}",
+                                                    format_extension(*format),
+                                                    format_description(*format)
+                                                ),
+                                            )
+                                        });
                                         ui.painter().rect_filled(
                                             rect,
                                             egui::CornerRadius::same(10),
@@ -2512,6 +2562,10 @@ impl ConvertApp {
                     ui.make_persistent_id(("file-info", index)),
                     egui::Sense::hover(),
                 );
+                let chip_label = format!("{}, {}", file_name(path), file_size(path));
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &chip_label)
+                });
                 file_painter.rect_filled(
                     badge,
                     egui::CornerRadius::same(8),
@@ -2573,6 +2627,13 @@ impl ConvertApp {
                         ui.make_persistent_id(("remove-file", index)),
                         egui::Sense::click(),
                     );
+                    remove.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            !busy,
+                            format!("Remove {}", file_name(path)),
+                        )
+                    });
                     if remove.hovered() {
                         file_painter.rect_filled(remove_rect, egui::CornerRadius::same(4), CARD);
                     }
@@ -2600,6 +2661,9 @@ impl ConvertApp {
                 ui.make_persistent_id("add-files"),
                 egui::Sense::click(),
             );
+            add.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, "Add files")
+            });
             file_painter.rect_filled(
                 add_rect,
                 egui::CornerRadius::same(8),
@@ -2623,6 +2687,7 @@ impl ConvertApp {
             ui.make_persistent_id("back-to-upload"),
             egui::Sense::click(),
         );
+        back.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, "Back"));
         paint_action_button(&painter, back_rect, &back, "", false, !busy);
         paint_arrow_left(
             &painter,
@@ -2649,6 +2714,13 @@ impl ConvertApp {
             ui.make_persistent_id("convert-files"),
             egui::Sense::click(),
         );
+        convert.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                can_convert,
+                if busy { "Converting..." } else { "Convert" },
+            )
+        });
         paint_action_button(
             &painter,
             convert_rect,
