@@ -70,6 +70,12 @@ serde_yaml_ng = "0.10"
 symphonia = { version = "0.5", features = ["aac", "aiff", "alac", "isomp4", "mp3"] }
 tar = "0.4"
 thiserror = "2"
+# TIFF output writes its EXIF tags and ICC profile itself. `image`'s TIFF
+# encoder can attach an ICC profile but writes no EXIF tags at all, while the
+# `tiff` writer it is built on (already in the tree through `image`, pure Rust,
+# MIT) can write arbitrary tags into the image directory. This is a direct
+# dependency for that one call path; it adds no new crate to the lock.
+tiff = "0.11"
 toml = "1.2"
 ttf-parser = "0.25"
 webbrowser = "1.2"

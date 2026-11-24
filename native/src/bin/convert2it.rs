@@ -112,6 +112,13 @@ fn print_format_registry() {
     }
     println!();
     println!(
+        "Metadata: images keep EXIF and ICC profiles into jpg, png, webp and tiff \
+         (orientation is reset to 1 after the pixels are rotated, and targets that \
+         cannot store the blocks drop them); audio keeps title, artist, album, track \
+         and embedded cover art into mp3, flac and opus."
+    );
+    println!();
+    println!(
         "Video: png/jpg/webp are frame thumbnails; mp4/webm use stream copy when compatible. \
          Incompatible codec/container pairs are rejected without re-encoding; all require \
          ffmpeg (PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg)."

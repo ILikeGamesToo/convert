@@ -153,3 +153,65 @@ document Chrome wrote.
 - `pdf-source.html` — the page `sample-chrome.pdf` is printed from, kept so the
   fixture can be regenerated. It loads `abel-regular.ttf` and
   `source-code-pro-regular.otf` from this directory through `@font-face`.
+
+## Metadata fixtures
+
+These carry known bytes so a conversion can be checked for preserving them.
+Everything in them was generated for this project: the pixels are a 32x24
+gradient and the audio is one second of a 440 Hz sine, both written by
+[`make-metadata-fixtures.mjs`](make-metadata-fixtures.mjs); the EXIF block, the
+ICC profile and the ID3v2/FLAC tag blocks were written by the same script; and
+the M4A and Opus containers were muxed by FFmpeg 9.1 from those same sources. No
+third-party media is included.
+
+Regenerate them, with the app built, from this directory:
+
+```sh
+CONVERT2IT=../../target/debug/convert2it node make-metadata-fixtures.mjs .
+```
+
+The JPEG, PNG, MP3 and FLAC fixtures are byte-identical every time. The two
+FFmpeg-muxed files embed the encoder version, so their bytes change with the
+FFmpeg release while their tags do not.
+
+- `metadata-photo.jpg` and `metadata-photo.png` — the same 32x24 gradient in
+  two containers, each carrying the same EXIF TIFF stream and an ICC profile.
+  The EXIF block has IFD0 tags (Make `Convert2it`, Model `Metadata Test`,
+  Software `convert2it`, DateTime `2026:11:24 12:00:00`, Orientation 6,
+  72 dpi), an Exif IFD (DateTimeOriginal, ExposureTime 1/125, FNumber 2.8,
+  ISO 200, FocalLength 35 mm, LensModel `Test Lens`) and a GPS IFD
+  (GPSVersionID, latitude 40°26'46"N). The ICC profile is a minimal v2 RGB
+  matrix profile with `desc` and `wtpt` tags; it is structurally valid but is
+  not a colour-accurate sRGB profile, because the tests compare the bytes
+  rather than render through them. The JPEG stores the EXIF in APP1 and the
+  profile in APP2; the PNG stores them in `eXIf` and `iCCP`.
+- `metadata-tone.mp3` — 1 s of 440 Hz at 192 kbps, with an ID3v2.3 tag
+  (TIT2 `Waves`, TPE1 `Grüße`, TALB `Metadata Album`, TPE2 `Album Artist`,
+  TRCK `3/12`, TCON `Ambient`, TYER `2026`, COMM, and a `front cover` APIC
+  holding an 8x8 PNG).
+- `metadata-tone.flac` — the same tone in FLAC with a Vorbis comment block
+  (TITLE, ARTIST, ALBUM, ALBUMARTIST, TRACKNUMBER 3, TRACKTOTAL 12, GENRE,
+  DATE, COMMENT) and a FLAC `PICTURE` block (front cover, `image/png`, the same
+  8x8 PNG).
+- `metadata-tone.m4a` — AAC in M4A with the same fields in an iTunes `ilst`
+  atom and the cover in `covr`, muxed by FFmpeg 9.1:
+
+  ```sh
+  ffmpeg -i base.wav -i cover.png -map 0:a -map 1:v -c:a aac -b:a 192k \
+    -c:v mjpeg -disposition:v attached_pic \
+    -metadata title=Waves -metadata artist=Grüße \
+    -metadata album="Metadata Album" -metadata album_artist="Album Artist" \
+    -metadata track=3 -metadata genre=Ambient -metadata date=2026-11-24 \
+    -metadata comment="recorded for the metadata test" metadata-tone.m4a
+  ```
+- `metadata-tone.opus` — the same tone as Ogg Opus with the text fields in its
+  `OpusTags` packet (FFmpeg's Ogg muxer does not write `METADATA_BLOCK_PICTURE`
+  for an attached picture, so this one carries no cover):
+
+  ```sh
+  ffmpeg -i base.wav -c:a libopus -b:a 96k \
+    -metadata:s:a:0 title=Waves -metadata:s:a:0 artist=Grüße \
+    -metadata:s:a:0 album="Metadata Album" -metadata:s:a:0 track=3 \
+    -metadata:s:a:0 genre=Ambient -metadata:s:a:0 date=2026-11-24 \
+    metadata-tone.opus
+  ```

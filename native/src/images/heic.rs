@@ -51,10 +51,7 @@ pub(crate) fn exif_orientations(input: &[u8]) -> Vec<u16> {
     let Ok(file) = HeifFile::parse(input) else {
         return Vec::new();
     };
-    let Ok(mut properties) = file.item_properties(file.primary_id) else {
-        return Vec::new();
-    };
-    if properties.any(|property| matches!(property, Property::Rotation(_) | Property::Mirror(_))) {
+    if container_orients_pixels(input) {
         return Vec::new();
     }
     let Ok(Some(exif)) = file.exif(file.primary_id) else {
@@ -64,6 +61,32 @@ pub(crate) fn exif_orientations(input: &[u8]) -> Vec<u16> {
         .and_then(|exif| exif.orientation())
         .map(|orientation| vec![orientation])
         .unwrap_or_default()
+}
+
+/// The EXIF TIFF stream carried by the file's `Exif` item, if any.
+///
+/// `heifer` strips the `ExifDataBlock` offset and an optional `Exif\0\0`
+/// prefix, so the bytes can be handed to another container as-is.
+pub(crate) fn exif_stream(input: &[u8]) -> Option<Vec<u8>> {
+    use heifer::heifer_isobmff::HeifFile;
+
+    let file = HeifFile::parse(input).ok()?;
+    file.exif(file.primary_id).ok()?
+}
+
+/// Whether `heifer` rotated the decoded pixels from an `irot`/`imir` property,
+/// which leaves the EXIF orientation tag describing a rotation that has
+/// already happened.
+pub(crate) fn container_orients_pixels(input: &[u8]) -> bool {
+    use heifer::heifer_isobmff::HeifFile;
+
+    let Ok(file) = HeifFile::parse(input) else {
+        return false;
+    };
+    let Ok(mut properties) = file.item_properties(file.primary_id) else {
+        return false;
+    };
+    properties.any(|property| matches!(property, Property::Rotation(_) | Property::Mirror(_)))
 }
 
 fn heic_error(error: heifer::Error) -> ConvertError {

@@ -14,7 +14,8 @@ use crate::document::{extract_pdf_text, image_to_pdf, text_to_pdf};
 use crate::error::ConvertError;
 use crate::fonts::{convert_font, sniff as sniff_font};
 use crate::format::OutputFormat;
-use crate::images::{encode_image, load_image, preserve_jpeg_exif, rasterize_svg};
+use crate::image_metadata;
+use crate::images::{encode_image, encode_image_with_metadata, load_image, rasterize_svg};
 use crate::options::ConversionOptions;
 use crate::pdf;
 use crate::shared::{
@@ -178,8 +179,17 @@ pub fn convert_bytes_with_video_control(
         } else {
             load_image(input, options)?
         };
-        let bytes = encode_image(image, target, options)?;
-        let bytes = preserve_jpeg_exif(input, bytes, options);
+        let mut metadata = image_metadata::extract(input);
+        // Reset the orientation only when the pixels were actually turned: the
+        // tag has been applied, or the decoder applied a container transform
+        // that the app cannot decline. Otherwise a WebP (whose orientation this
+        // app does not apply) or a disabled option keeps the tag it came with.
+        let applied = options.image_apply_exif_orientation
+            && crate::images::exif_orientation(input).is_some();
+        if applied || image_metadata::container_orients_pixels(input) {
+            metadata.reset_orientation();
+        }
+        let bytes = encode_image_with_metadata(image, target, options, &metadata)?;
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
             bytes,
@@ -198,6 +208,7 @@ pub fn convert_bytes_with_video_control(
         if !is_audio_extension(&extension) {
             return Err(unsupported(&extension, target));
         }
+        let tags = crate::audio_tags::read(input, &extension);
         // Opus only accepts 8/12/16/24/48 kHz. Map the requested rate before
         // the shared audio options resample so it goes straight to the rate the
         // encoder uses instead of resampling twice.
@@ -221,13 +232,17 @@ pub fn convert_bytes_with_video_control(
             OutputFormat::Flac => encode_flac(&audio, options.audio_bit_depth)?,
             OutputFormat::Aiff => encode_aiff(&audio)?,
             OutputFormat::Au => encode_au(&audio)?,
-            OutputFormat::Opus => encode_opus(audio)?,
+            OutputFormat::Opus => encode_opus(audio, crate::audio_tags::opus_tags(&tags))?,
             OutputFormat::Mp3 => encode_mp3(audio, options.mp3_bitrate)?,
             _ => unreachable!("only audio targets reach this branch"),
         };
         let bytes = match target {
-            OutputFormat::Mp3 => preserve_mp3_id3v2(input, bytes),
-            OutputFormat::Flac => preserve_flac_tags(input, bytes),
+            // A same-format re-encode copies the source's own tag verbatim, so
+            // frames this app does not model (ReplayGain, chapters) survive.
+            OutputFormat::Mp3 if extension == "mp3" => preserve_mp3_id3v2(input, bytes),
+            OutputFormat::Mp3 => crate::audio_tags::attach_mp3(bytes, &tags),
+            OutputFormat::Flac if extension == "flac" => preserve_flac_tags(input, bytes),
+            OutputFormat::Flac => crate::audio_tags::attach_flac(bytes, &tags),
             _ => bytes,
         };
         return Ok(vec![ConvertedFile {

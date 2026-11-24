@@ -942,6 +942,7 @@ dependencies = [
  "symphonia",
  "tar",
  "thiserror 2.0.21",
+ "tiff",
  "toml",
  "ttf-parser",
  "webbrowser",

@@ -17,10 +17,10 @@ The same data is available from the library as `native_format_registry()`.
 
 | Area | Inputs | Native outputs | Notes |
 | --- | --- | --- | --- |
-| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. |
+| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. EXIF and ICC profiles are carried between the targets that store them; see [Metadata](#metadata). |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
 | PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, SVG pages, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro` or vectorise through `hayro-svg`, one file per page; see [PDF rasterisation](#pdf-rasterisation) and [PDF page SVGs](#pdf-page-svgs) for the scale, the naming and the limits. |
-| Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. MP3-to-MP3 keeps its ID3v2 tag; FLAC-to-FLAC keeps Vorbis comments and pictures. |
+| Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. Tags are carried between MP3, FLAC and Opus; see [Audio tags](#audio-tags). |
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP | ZIP, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
 
@@ -141,6 +141,59 @@ outlines real glyphs. The committed fixture converts to a valid 388 KB SVG, and
 `native/src/pdf.rs` asserts the viewBox, the vector fill and the absence of a
 raster fallback.
 
+## Metadata
+
+Preserving is the default and there is no setting that turns it off: a
+conversion that dropped a colour profile would change how the output looks on
+another screen with no clue why. `--list-formats` prints the same boundary in
+one line. Metadata is carried per format capability, not by rewriting it:
+
+| Block | Read from | Written to | Notes |
+| --- | --- | --- | --- |
+| EXIF | JPEG (`APP1`), PNG (`eXIf`), WebP (`EXIF`), TIFF (IFD0, ExifIFD, GPS IFD), AVIF (`Exif` item), HEIC (`Exif` item) | JPEG (`APP1`), PNG (`eXIf`), WebP (`EXIF`), TIFF (IFD0 tags plus an Exif IFD) | The raw TIFF stream is copied, so tags this app does not model survive. |
+| ICC profile | JPEG (`APP2`), PNG (`iCCP`), WebP (`ICCP`), TIFF (tag 34675) | JPEG (`APP2`), PNG (`iCCP`), WebP (`ICCP`), TIFF (tag 34675) | Byte for byte; concatenated profile segments are reassembled and split to the target's chunk size. |
+
+**Orientation** is the one tag that is rewritten, because it would otherwise be
+applied twice. When the app rotates the pixels — the default
+`image_apply_exif_orientation`, or a HEIC/AVIF container `irot`/`imir` the
+decoder applies regardless — the carried tag is set to 1. When the app does
+not rotate (WebP input, whose orientation this app does not apply, or the
+option turned off), the tag is carried unchanged and describes the unrotated
+pixels exactly as it did in the source.
+
+**What is dropped, and where:**
+
+- GIF, BMP, ICO, PNM, TGA, QOI, HDR, Farbfeld and PDF have no EXIF or ICC
+  container, so a conversion to them loses both.
+- AVIF and HEIC ICC profiles are not carried: both decoders colour-manage to
+  sRGB, so the source profile no longer describes the pixels and copying it
+  would mis-tag them. A HEIC's EXIF is carried.
+- A CMYK/YCCK JPEG's ICC profile is not carried, for the same reason: the
+  decoder converts to RGB.
+- A TIFF input is rebuilt from its descriptive IFD0 tags, its Exif IFD and its
+  GPS IFD. MakerNote, the Interoperability IFD and any thumbnail IFD are not
+  carried: their values are offsets into the original file and would point at
+  the wrong bytes after relocation. A TIFF *output* carries the IFD0 tags, the
+  orientation, the Exif IFD and the ICC profile; GPS is not written into TIFF
+  because the tag writer has no multi-value RATIONAL form, so a TIFF target
+  loses GPS while JPEG, PNG and WebP targets keep it.
+- XMP, IPTC and MakerNotes are not handled for any target.
+
+## Audio tags
+
+| Block | Read from | Written to | Notes |
+| --- | --- | --- | --- |
+| ID3v2 | MP3 | MP3 | MP3 to MP3 copies the source's whole tag verbatim, so frames this app does not model (ReplayGain, chapters) survive; another input to MP3 builds a 2.3 tag with the fields below. |
+| Vorbis comments | FLAC, Ogg Opus/Vorbis | FLAC, Opus | FLAC to FLAC copies the comment and picture blocks verbatim. |
+| iTunes `ilst` | M4A/AAC | — | There is no M4A output, so these tags can only leave M4A for MP3, FLAC or Opus. |
+| Cover art | ID3v2 `APIC`, FLAC `PICTURE`, iTunes `covr`, `METADATA_BLOCK_PICTURE` | MP3 `APIC`, FLAC `PICTURE`, Opus `METADATA_BLOCK_PICTURE` | One front cover; the picture's MIME type is carried, and sizes are left unknown (`0`) in the FLAC picture block. |
+| Fields | title, artist, album, album artist, track number and total, genre, date, comment | same | |
+
+WAV, AIFF and AU have no tag container this app writes, so a conversion to
+them drops tags by design. Tags are not carried between different audio tracks
+of one container: the file's tags are a file-level property and apply to
+whichever track is decoded.
+
 ## Known blockers
 
 - **Video:** remux and thumbnails require an external `ffmpeg`; none is
@@ -190,10 +243,6 @@ raster fallback.
   hinting in both. Implementing the real conversion is a curve-fitting job
   (quad-to-cubic is exact, cubic-to-quadratic is not) plus CFF charstring
   emission, not a container change.
-- **Metadata:** JPEG-to-JPEG preserves APP1 EXIF segments (and resets the
-  orientation tag after pixels are rotated); MP3-to-MP3 preserves the ID3v2
-  tag; FLAC-to-FLAC preserves Vorbis comments and pictures. EXIF in other image
-  targets and tags in other audio formats are still dropped.
 - **Packaging/auto-update:** the release workflow builds binaries, but installer
   signing and an updater are infrastructure work that needs certificates and a
   release channel.

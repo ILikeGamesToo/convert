@@ -2592,7 +2592,10 @@ impl OpusPcmEncoder {
     }
 }
 
-pub(crate) fn encode_opus(mut audio: DecodedAudio) -> Result<Vec<u8>, ConvertError> {
+pub(crate) fn encode_opus(
+    mut audio: DecodedAudio,
+    tags: opus_pure::OpusTags,
+) -> Result<Vec<u8>, ConvertError> {
     use opus_pure::{OggOpusWriter, MAX_PACKET_BYTES};
 
     if audio.channels == 0 || audio.sample_rate == 0 || audio.samples.is_empty() {
@@ -2610,7 +2613,7 @@ pub(crate) fn encode_opus(mut audio: DecodedAudio) -> Result<Vec<u8>, ConvertErr
     }
     let head = encoder.head(sample_rate);
     let pre_skip = u64::from(head.pre_skip);
-    let mut writer = OggOpusWriter::new(Vec::new(), head).map_err(|error| {
+    let mut writer = OggOpusWriter::with_tags(Vec::new(), head, tags).map_err(|error| {
         ConvertError::Audio(format!("could not start the Opus stream: {error}"))
     })?;
 

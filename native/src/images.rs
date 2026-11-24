@@ -4,6 +4,7 @@
 
 use crate::error::ConvertError;
 use crate::format::OutputFormat;
+use crate::image_metadata::{ExifField, ExifValue, ImageMetadata};
 use crate::options::ConversionOptions;
 use image::ImageEncoder;
 use std::io::Cursor;
@@ -182,74 +183,6 @@ pub(crate) fn tiff_orientations(tiff: &[u8]) -> Vec<u16> {
     orientations
 }
 
-/// Copies JPEG APP1 EXIF segments into a JPEG result. The pixels have already
-/// been rotated when `image_apply_exif_orientation` is enabled, so the copied
-/// orientation tag is reset to 1 to avoid rotating the result twice.
-pub(crate) fn preserve_jpeg_exif(
-    input: &[u8],
-    output: Vec<u8>,
-    options: ConversionOptions,
-) -> Vec<u8> {
-    if !input.starts_with(&[0xFF, 0xD8]) || !output.starts_with(&[0xFF, 0xD8]) {
-        return output;
-    }
-    let segments = jpeg_exif_segments(input);
-    if segments.is_empty() {
-        return output;
-    }
-    let mut result =
-        Vec::with_capacity(output.len() + segments.iter().map(Vec::len).sum::<usize>());
-    result.extend_from_slice(&output[..2]);
-    for mut segment in segments {
-        if options.image_apply_exif_orientation && segment.len() > 6 {
-            set_tiff_orientation(&mut segment[6..], 1);
-        }
-        if segment.len() + 2 > usize::from(u16::MAX) {
-            continue;
-        }
-        result.extend_from_slice(&[0xFF, 0xE1]);
-        result.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
-        result.extend_from_slice(&segment);
-    }
-    result.extend_from_slice(&output[2..]);
-    result
-}
-
-pub(crate) fn jpeg_exif_segments(input: &[u8]) -> Vec<Vec<u8>> {
-    let mut segments = Vec::new();
-    let mut position = 2;
-    while position + 4 <= input.len() {
-        if input[position] != 0xFF {
-            position += 1;
-            continue;
-        }
-        let marker = input[position + 1];
-        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
-            position += 2;
-            continue;
-        }
-        if marker == 0xDA || marker == 0xD9 {
-            break;
-        }
-        let length = u16::from_be_bytes([input[position + 2], input[position + 3]]) as usize;
-        if length < 2 {
-            break;
-        }
-        if marker == 0xE1 {
-            if let Some(segment) = input.get(position + 4..position + 2 + length) {
-                if segment.starts_with(b"Exif\0\0") {
-                    segments.push(segment.to_vec());
-                }
-            }
-        }
-        position = match position.checked_add(2 + length) {
-            Some(next) => next,
-            None => break,
-        };
-    }
-    segments
-}
-
 pub(crate) fn set_tiff_orientation(tiff: &mut [u8], orientation: u16) {
     let little = tiff.starts_with(b"II");
     if !little && !tiff.starts_with(b"MM") {
@@ -341,6 +274,18 @@ pub(crate) fn encode_image(
     target: OutputFormat,
     options: ConversionOptions,
 ) -> Result<Vec<u8>, ConvertError> {
+    encode_image_with_metadata(image, target, options, &ImageMetadata::default())
+}
+
+/// Encodes an image, carrying the source's EXIF and ICC profile into the
+/// targets that can hold them. Targets without a metadata container ignore
+/// the blocks: the caller has nothing extra to do for them.
+pub(crate) fn encode_image_with_metadata(
+    image: image::DynamicImage,
+    target: OutputFormat,
+    options: ConversionOptions,
+    metadata: &ImageMetadata,
+) -> Result<Vec<u8>, ConvertError> {
     let format = target
         .image_format()
         .expect("encode_image is only called for image targets");
@@ -380,29 +325,313 @@ pub(crate) fn encode_image(
         }
     };
 
+    if target == OutputFormat::Tiff {
+        return encode_tiff_with_metadata(&image, metadata);
+    }
+    let capped;
+    let metadata = if format == image::ImageFormat::Jpeg && !metadata.is_empty() {
+        capped = metadata.capped_for_jpeg();
+        &capped
+    } else {
+        metadata
+    };
+
     let mut output = Cursor::new(Vec::new());
     if format == image::ImageFormat::Jpeg {
         let quality = options
             .jpeg_quality
             .unwrap_or(ConversionOptions::DEFAULT_JPEG_QUALITY)
             .clamp(1, 100);
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
+        set_encoder_metadata(&mut encoder, metadata)?;
         image.write_with_encoder(encoder)?;
     } else if format == image::ImageFormat::Png {
         let compression = match options.png_compression {
             Some(level) => image::codecs::png::CompressionType::Level(level.clamp(1, 9)),
             None => image::codecs::png::CompressionType::Fast,
         };
-        let encoder = image::codecs::png::PngEncoder::new_with_quality(
+        let mut encoder = image::codecs::png::PngEncoder::new_with_quality(
             &mut output,
             compression,
             image::codecs::png::FilterType::Adaptive,
         );
+        set_encoder_metadata(&mut encoder, metadata)?;
+        image.write_with_encoder(encoder)?;
+    } else if format == image::ImageFormat::WebP {
+        let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut output);
+        set_encoder_metadata(&mut encoder, metadata)?;
         image.write_with_encoder(encoder)?;
     } else {
         image.write_to(&mut output, format)?;
     }
     Ok(output.into_inner())
+}
+
+/// Hands the encoder the blocks this target can carry. Every encoder used here
+/// supports both, so an error means an internal mistake rather than user input.
+fn set_encoder_metadata(
+    encoder: &mut impl ImageEncoder,
+    metadata: &ImageMetadata,
+) -> Result<(), ConvertError> {
+    if metadata.is_empty() {
+        return Ok(());
+    }
+    if let Some(icc) = metadata.icc.clone() {
+        encoder
+            .set_icc_profile(icc)
+            .map_err(|error| ConvertError::Image(image::ImageError::Unsupported(error)))?;
+    }
+    if let Some(exif) = metadata.exif.clone() {
+        encoder
+            .set_exif_metadata(exif)
+            .map_err(|error| ConvertError::Image(image::ImageError::Unsupported(error)))?;
+    }
+    Ok(())
+}
+
+/// Encodes a TIFF with its EXIF tags and ICC profile.
+///
+/// TIFF keeps metadata as tags in the image's own directory, so it cannot be
+/// spliced into an encoded file the way JPEG/PNG/WebP segments can; this writes
+/// the directory itself. The Exif IFD becomes an extra directory that the image
+/// directory points at, and the GPS IFD is not carried because a GPS block is
+/// mostly arrays of RATIONAL, which the writer has no multi-value form for.
+fn encode_tiff_with_metadata(
+    image: &image::DynamicImage,
+    metadata: &ImageMetadata,
+) -> Result<Vec<u8>, ConvertError> {
+    use tiff::encoder::colortype::{
+        Gray16, Gray8, RGB32Float, RGBA32Float, RGB16, RGB8, RGBA16, RGBA8,
+    };
+
+    let parsed = metadata
+        .exif
+        .as_deref()
+        .and_then(crate::image_metadata::parse_exif);
+    let mut output = Cursor::new(Vec::new());
+    {
+        let mut encoder = tiff::encoder::TiffEncoder::new(&mut output).map_err(tiff_error)?;
+        let exif_offset = match parsed.as_ref() {
+            Some(directories) if !directories.exif.is_empty() => {
+                let mut directory = encoder.extra_directory().map_err(tiff_error)?;
+                for field in &directories.exif {
+                    write_tiff_field(&mut directory, field);
+                }
+                let offset = directory.finish_with_offsets().map_err(tiff_error)?;
+                Some(offset.offset)
+            }
+            _ => None,
+        };
+        let ifd0 = parsed
+            .as_ref()
+            .map(|directories| directories.ifd0.as_slice())
+            .unwrap_or(&[]);
+        match image {
+            image::DynamicImage::ImageLuma8(buffer) => write_tiff_image::<Gray8>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageLuma16(buffer) => write_tiff_image::<Gray16>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageRgb8(buffer) => write_tiff_image::<RGB8>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageRgb16(buffer) => write_tiff_image::<RGB16>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageRgba8(buffer) => write_tiff_image::<RGBA8>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageRgba16(buffer) => write_tiff_image::<RGBA16>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageRgb32F(buffer) => write_tiff_image::<RGB32Float>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            image::DynamicImage::ImageRgba32F(buffer) => write_tiff_image::<RGBA32Float>(
+                encoder,
+                buffer.width(),
+                buffer.height(),
+                buffer.as_raw(),
+                ifd0,
+                metadata,
+                exif_offset,
+            ),
+            other => {
+                let rgba = other.to_rgba8();
+                write_tiff_image::<RGBA8>(
+                    encoder,
+                    rgba.width(),
+                    rgba.height(),
+                    rgba.as_raw(),
+                    ifd0,
+                    metadata,
+                    exif_offset,
+                )
+            }
+        }?;
+    }
+    Ok(output.into_inner())
+}
+
+fn write_tiff_image<C>(
+    mut encoder: tiff::encoder::TiffEncoder<&mut Cursor<Vec<u8>>>,
+    width: u32,
+    height: u32,
+    data: &[C::Inner],
+    ifd0: &[ExifField],
+    metadata: &ImageMetadata,
+    exif_offset: Option<u32>,
+) -> Result<(), ConvertError>
+where
+    C: tiff::encoder::colortype::ColorType,
+    [C::Inner]: tiff::encoder::TiffValue,
+{
+    let mut image = encoder.new_image::<C>(width, height).map_err(tiff_error)?;
+    {
+        let directory = image.encoder();
+        for field in crate::image_metadata::carried_ifd0(ifd0) {
+            write_tiff_field(directory, field);
+        }
+        if let Some(offset) = exif_offset {
+            let _ = directory.write_tag(tiff::tags::Tag::Unknown(0x8769), offset);
+        }
+        if let Some(icc) = metadata.icc.as_ref() {
+            let _ = directory.write_tag(tiff::tags::Tag::Unknown(0x8773), icc.as_slice());
+        }
+    }
+    image.write_data(data).map_err(tiff_error)
+}
+
+/// Writes one EXIF field into a TIFF directory. A value the writer cannot
+/// express in its declared type (a multi-value RATIONAL, a non-ASCII text tag
+/// falls back to BYTE) is skipped rather than written under the wrong type.
+fn write_tiff_field(
+    directory: &mut tiff::encoder::DirectoryEncoder<
+        '_,
+        &mut Cursor<Vec<u8>>,
+        tiff::encoder::TiffKindStandard,
+    >,
+    field: &ExifField,
+) {
+    use tiff::encoder::{Rational, SRational};
+    use tiff::tags::Tag;
+
+    let tag = Tag::Unknown(field.tag);
+    match &field.value {
+        ExifValue::Ascii(bytes) => {
+            let text = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+            match std::str::from_utf8(text) {
+                Ok(text) if text.is_ascii() && !text.contains('\0') => {
+                    let _ = directory.write_tag(tag, text);
+                }
+                _ => {
+                    let _ = directory.write_tag(tag, bytes.as_slice());
+                }
+            }
+        }
+        ExifValue::Bytes(bytes) => {
+            let _ = directory.write_tag(tag, bytes.as_slice());
+        }
+        ExifValue::Short(values) if values.len() == 1 => {
+            let _ = directory.write_tag(tag, values[0]);
+        }
+        ExifValue::Short(values) => {
+            let _ = directory.write_tag(tag, values.as_slice());
+        }
+        ExifValue::Long(values) if values.len() == 1 => {
+            let _ = directory.write_tag(tag, values[0]);
+        }
+        ExifValue::Long(values) => {
+            let _ = directory.write_tag(tag, values.as_slice());
+        }
+        ExifValue::SShort(values) if values.len() == 1 => {
+            let _ = directory.write_tag(tag, values[0]);
+        }
+        ExifValue::SShort(values) => {
+            let _ = directory.write_tag(tag, values.as_slice());
+        }
+        ExifValue::SLong(values) if values.len() == 1 => {
+            let _ = directory.write_tag(tag, values[0]);
+        }
+        ExifValue::SLong(values) => {
+            let _ = directory.write_tag(tag, values.as_slice());
+        }
+        ExifValue::Rational(values) if values.len() == 1 => {
+            let _ = directory.write_tag(
+                tag,
+                Rational {
+                    n: values[0].0,
+                    d: values[0].1,
+                },
+            );
+        }
+        ExifValue::SRational(values) if values.len() == 1 => {
+            let _ = directory.write_tag(
+                tag,
+                SRational {
+                    n: values[0].0,
+                    d: values[0].1,
+                },
+            );
+        }
+        ExifValue::Float(values) if values.len() == 1 => {
+            let _ = directory.write_tag(tag, values[0]);
+        }
+        ExifValue::Double(values) if values.len() == 1 => {
+            let _ = directory.write_tag(tag, values[0]);
+        }
+        ExifValue::Rational(_)
+        | ExifValue::SRational(_)
+        | ExifValue::Float(_)
+        | ExifValue::Double(_) => {}
+    }
+}
+
+fn tiff_error(error: tiff::TiffError) -> ConvertError {
+    ConvertError::Image(image::ImageError::IoError(std::io::Error::other(error)))
 }
 
 pub(crate) fn encode_pnm_image(

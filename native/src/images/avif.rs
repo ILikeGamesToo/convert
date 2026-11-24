@@ -76,28 +76,42 @@ pub(crate) fn decode(input: &[u8]) -> Result<image::DynamicImage, ConvertError> 
 /// offset, at the offset, or at the offset counted from the block start; the
 /// writers disagree, so every position that carries a TIFF signature is tried.
 pub(crate) fn exif_orientations(input: &[u8]) -> Vec<u16> {
-    let Ok(container) = AvifContainer::parse(input) else {
-        return Vec::new();
-    };
-    let Some(exif) = container.image().exif() else {
-        return Vec::new();
-    };
-    let payload = &exif.as_isobmff_item().payload;
-    let Some(offset) = payload
-        .get(0..4)
-        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four bytes")) as usize)
-    else {
-        return Vec::new();
-    };
-    [4 + offset, offset, 4]
-        .into_iter()
-        .find_map(|start| {
-            let tiff = payload.get(start..)?;
-            let magic = tiff.starts_with(b"II*\0") || tiff.starts_with(b"MM\0*");
-            magic.then_some(tiff)
-        })
-        .map(crate::images::tiff_orientations)
+    exif_tiff(input)
+        .map(|tiff| crate::images::tiff_orientations(&tiff))
         .unwrap_or_default()
+}
+
+/// The EXIF TIFF stream from the `Exif` metadata item, prefix stripped.
+///
+/// The item payload starts with the `ExifDataBlock` offset, then the TIFF
+/// stream; the same offset variants that [`exif_orientations`] tries are tried
+/// here, because carrying the bytes is what lets a conversion keep the tags.
+pub(crate) fn exif_stream(input: &[u8]) -> Option<Vec<u8>> {
+    exif_tiff(input)
+}
+
+fn exif_tiff(input: &[u8]) -> Option<Vec<u8>> {
+    let container = AvifContainer::parse(input).ok()?;
+    let payload = &container.image().exif()?.as_isobmff_item().payload;
+    let offset = payload
+        .get(0..4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four bytes")) as usize)?;
+    [4 + offset, offset, 4].into_iter().find_map(|start| {
+        let tiff = payload.get(start..)?;
+        let magic = tiff.starts_with(b"II*\0") || tiff.starts_with(b"MM\0*");
+        magic.then(|| tiff.to_vec())
+    })
+}
+
+/// Whether `gamut-avif` rotates the decoded pixels from an `irot`/`imir`
+/// property, which leaves the EXIF orientation tag describing a rotation that
+/// has already happened.
+pub(crate) fn container_orients_pixels(input: &[u8]) -> bool {
+    let Ok(container) = AvifContainer::parse(input) else {
+        return false;
+    };
+    let item = container.image().primary_item();
+    item.rotation().is_some() || item.mirror().is_some()
 }
 
 /// The coded bit depth of the primary image, from its `av1C` record.
@@ -480,6 +494,19 @@ mod tests {
             crate::images::exif_orientation(&avif_with_orientation(1)),
             Some(1)
         );
+    }
+
+    #[test]
+    fn hands_the_exif_item_to_the_metadata_extractor() {
+        let input = avif_with_orientation(6);
+        let metadata = crate::image_metadata::extract(&input);
+        let exif = metadata.exif.expect("the Exif item is carried");
+        assert_eq!(crate::images::exif_orientation(&exif), Some(6));
+        assert!(
+            !crate::image_metadata::container_orients_pixels(&input),
+            "this fixture rotates through EXIF, not through irot/imir"
+        );
+        assert_eq!(metadata.icc, None, "the decoder colour-manages to sRGB");
     }
 
     #[test]

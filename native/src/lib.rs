@@ -2,6 +2,7 @@
 
 mod archive;
 mod audio;
+mod audio_tags;
 mod container;
 mod convert;
 mod data;
@@ -10,6 +11,7 @@ mod error;
 mod ffmpeg;
 mod fonts;
 mod format;
+mod image_metadata;
 mod images;
 pub mod input_extensions;
 pub mod input_format;
