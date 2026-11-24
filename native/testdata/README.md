@@ -256,3 +256,65 @@ FFmpeg release while their tags do not.
     -metadata:s:a:0 genre=Ambient -metadata:s:a:0 date=2026-11-24 \
     metadata-tone.opus
   ```
+
+## Office document fixtures
+
+Six of these containers are the formats the office reader accepts and five are
+the ways it refuses one. Every byte was written for this project by
+[`make-office-fixtures.mjs`](make-office-fixtures.mjs): a docx, xlsx or pptx is a
+ZIP of XML parts the script writes, an odt or ods is the same with the
+OpenDocument `mimetype` entry first and uncompressed, and the xls is a BIFF8
+workbook in an OLE2 compound file. No third-party document, template or library
+output is included, so there is no licence attached to these files beyond the
+repository's own.
+
+Regenerate them from this directory with Node:
+
+```sh
+node make-office-fixtures.mjs .
+```
+
+The output is deterministic — one fixed 1980-01-01 timestamp per ZIP entry, no
+extra fields, no container randomisation — so regenerating leaves the working
+tree clean.
+
+- `sample-office.docx` — one heading, one paragraph containing a tab, a line
+  break, a deleted run, a field instruction and a text box, a nested bullet
+  list, a three-column table with a spanning cell, and a closing paragraph with
+  an escaped ampersand. It is the document fixture for the whole text shape:
+  headings, list indentation, tables in reading order, and the three things that
+  must *not* appear in the output (deleted text, field instructions, text-box
+  text).
+- `sample-office-empty.docx` — a document part whose body holds nothing but its
+  section properties. The reader must report a document with no extractable body
+  rather than write an empty file.
+- `sample-office-corrupt.docx` — a valid ZIP with none of a docx's parts. The
+  package says it is not a document, whatever the file is called.
+- `sample-office-plain.zip` — a ZIP of two text files, which is an archive and
+  not an office document. It pins that the office sniff does not claim every
+  package.
+- `sample-office-encrypted.docx` — an OLE2 container with the
+  `EncryptedPackage` stream name, which is how Word stores a password-protected
+  document. The reader must report it as encrypted, not as corrupt.
+- `sample-office.pptx` — two slides whose part names are in the opposite order
+  to the presentation: `slide2.xml` is first in `ppt/presentation.xml` and
+  `slide1.xml` second. Reading the parts in name order would produce the wrong
+  deck, so the text says which order is right.
+- `sample-office.odt` — an OpenDocument text with a heading, a paragraph using
+  `text:s` and `text:tab`, a list, a table whose last row repeats a cell twice,
+  and the million-row empty remainder LibreOffice writes for the rest of the
+  sheet.
+- `sample-office-encrypted.odt` — an OpenDocument text whose manifest records
+  `encryption-data`. OpenDocument encryption is declared in the manifest rather
+  than by changing the container, so the package still looks readable.
+- `sample-office.xlsx` — two sheets: `Inventory`, with shared strings, an
+  integer, a fractional number, two booleans and two date-formatted serials
+  (a date and a date with a time), and `Notes`, with one cell. Covers the
+  one-file-per-sheet CSV shape, the typed JSON shape and the empty-second-sheet
+  case.
+- `sample-office.xls` — the same idea in the legacy binary format: a BIFF8
+  workbook with one sheet, a shared-string table, two numbers and two booleans,
+  inside an OLE2 compound file whose `Workbook` stream is padded past the
+  4096-byte mini-stream cutoff so it lives in ordinary sectors.
+- `sample-office.ods` — an OpenDocument spreadsheet with one sheet of two
+  columns, read through the same path as the xlsx.

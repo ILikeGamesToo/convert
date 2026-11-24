@@ -23,7 +23,11 @@ fn list_formats_reports_the_metadata_carried_by_each_target() {
     // The registry rows stay three tab-separated fields, so tooling that reads
     // them keeps working; the metadata note is a separate paragraph.
     for line in stdout.lines() {
-        if line.starts_with("Metadata:") || line.is_empty() || line.starts_with("Video:") {
+        if line.starts_with("Metadata:")
+            || line.starts_with("Video:")
+            || line.starts_with("Office:")
+            || line.is_empty()
+        {
             continue;
         }
         assert_eq!(

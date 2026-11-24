@@ -112,6 +112,21 @@ pub enum ConvertError {
     Avif(String),
     #[error("could not decode the HEIC image: {0}")]
     Heic(String),
+    #[error("the document is encrypted or password-protected; this app cannot ask for a password")]
+    OfficeEncrypted,
+    #[error("the {format} document's container is corrupt: {message}")]
+    OfficeCorrupt {
+        format: &'static str,
+        message: String,
+    },
+    #[error("the {format} document has no extractable body")]
+    OfficeEmptyBody { format: &'static str },
+    #[error("the {format} document part {part:?} is larger than the {max}-byte limit")]
+    OfficePartTooLarge {
+        format: &'static str,
+        part: String,
+        max: u64,
+    },
     #[error(transparent)]
     Csv(#[from] csv::Error),
     #[error(transparent)]

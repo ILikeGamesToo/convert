@@ -19,6 +19,7 @@ The same data is available from the library as `native_format_registry()`.
 | --- | --- | --- | --- |
 | Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. EXIF and ICC profiles are carried between the targets that store them; see [Metadata](#metadata). |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
+| Office documents | DOCX, XLSX/XLS, PPTX, ODT, ODS | Text and the text encodings, CSV, JSON | Content is extracted, never rendered. A document becomes Markdown-shaped text with its headings, lists and tables in reading order, a presentation becomes its slides' text in presentation order, and a workbook becomes one CSV per sheet or one JSON document. The container's own parts decide which format a file is, before its extension does. See [Office documents as data](#office-documents-as-data). |
 | PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, SVG pages, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro` or vectorise through `hayro-svg`, one file per page; see [PDF rasterisation](#pdf-rasterisation) and [PDF page SVGs](#pdf-page-svgs) for the scale, the naming and the limits. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. Tags are carried between MP3, FLAC and Opus; see [Audio tags](#audio-tags). |
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP, RAR 4/5, 7z | ZIP, CBZ, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. RAR and 7z are read-only and decoded in-process by pure-Rust crates, so nothing external is installed. An archive input re-packs into the target container instead of being nested, which is what turns a CBR or CB7 into a readable CBZ. Encrypted archives are refused with a typed error, and a decode is bounded by a 120 s deadline and a 512 MiB dictionary cap. |
@@ -29,11 +30,20 @@ The same data is available from the library as `native_format_registry()`.
 ## Web-only handlers not yet ported
 
 The web app (`src/handlers/index.ts`) also has dedicated handlers for vector
-tracing, EPUB/AZW3/MOBI, office documents, Typst/Pandoc, 3D models,
+tracing, EPUB/AZW3/MOBI, Typst/Pandoc, 3D models,
 SQLite, LZH, the comic packer that builds a CBZ/CBT/CBR/CB7 from loose images, game
 formats, and MIDI/module music. Those handlers depend on
 JavaScript/WASM libraries or
 external tools that do not have a verified native equivalent in this crate.
+
+Office documents used to be in that list and are not any more, but the native
+handler is narrower than the web app's two paths. The web app converts *between*
+office formats — docx ↔ odt ↔ html ↔ markdown and the rest of `pandoc`, which is
+a WASM build of a document converter — and `pptxRenderer` draws slides. The
+native handler reads the same containers and extracts their content into text
+and data only: it writes no docx, xlsx, pptx or odt, and it renders nothing. A
+docx → odt, docx → pdf or pptx → png request is the web app's path and stays
+there.
 
 ## AVIF and HEIC
 
@@ -142,6 +152,76 @@ outlines real glyphs. The committed fixture converts to a valid 388 KB SVG, and
 `native/src/pdf.rs` asserts the viewBox, the vector fill and the absence of a
 raster fallback.
 
+## Office documents as data
+
+A docx, xlsx, pptx, odt or ods is a ZIP package of XML parts, and a legacy xls
+is a BIFF8 workbook inside an OLE2 compound file. Nothing here is rendered:
+there is no layout engine in this app, so an office document becomes its
+content. That is the whole of the feature, and it is deliberately not a
+smaller version of docx → PDF — that pair is 110,000 conversions a month on the
+web app and would need a layout engine this app does not have.
+
+**Which format a file is comes from the container, not the name.** A package is
+identified by its parts — `word/document.xml`, `xl/workbook.xml`,
+`ppt/presentation.xml`, or an OpenDocument `mimetype` entry naming text or
+spreadsheet — and the extension is consulted only when the container says
+nothing. A `.docx` that is really an OpenDocument text is read as one, a `.bin`
+that is a docx is read as a docx, and a ZIP with none of those parts is left to
+the archive path. The format picker's first-kilobyte sniff sees the same part
+names, so a renamed file is classified before any conversion starts.
+
+| Input | Becomes |
+| --- | --- |
+| DOCX | Text with `#` headings, `-` list items indented by level, and pipe tables in reading order. A table's first row becomes the markdown header, which is what every docx → markdown converter does. |
+| ODT | The same text shape, from `content.xml`: `text:h` headings by `text:outline-level`, `text:list-item` bullets, and `table:table` tables. |
+| PPTX | `# Slide N` for each slide in presentation order — the order is the one `ppt/presentation.xml` names through its relationships, so a deck whose slides were reordered still comes out in the order a reader sees. Blank slides are skipped. |
+| XLSX, XLS, ODS | One CSV per sheet named `<stem>_<sheet>.csv`, or one JSON document, or one text file with `## <sheet>` sections of tab-separated rows. |
+
+For a document or a presentation the JSON target holds the extracted text as a
+JSON string, exactly the value a `.txt` input gives, and the CSV target holds
+the one-column `text` table a `.txt` input gives. For a workbook the JSON shape
+is `{"sheets": [{"name": …, "rows": [[…]]}]}` with cells typed where the format
+has a type — numbers as numbers, booleans as booleans, an empty cell as `null`,
+a date as an ISO 8601 string — and the CSV shape is the sheet's own values as
+text.
+
+**Dates.** Excel stores a date, a time and a duration as one serial number plus a
+number format, and the format is not on the cell as calamine hands it over. A
+serial with a whole-day part is written as `YYYY-MM-DD`, with the time appended
+as `Thh:mm:ss` once it is not midnight; a bare fraction of a day is a time of
+day; a cell whose format is a duration is written as hours, minutes and seconds,
+with hours unbounded so `[hh]:mm` survives. A cell formatted as a *date* whose
+value is a bare fraction is indistinguishable from a time of day without reading
+its number format, and is written as a time.
+
+**Limits**, matching the archive reader: a package may hold at most 10,000
+entries, a part is read through a 256 MiB cap, and an OpenDocument table is
+capped at 4096 columns with repeats of empty cells and rows collapsed rather than
+materialised — LibreOffice pads every sheet out to a million empty rows.
+
+**What is not preserved, and why:**
+
+- Numbering schemes. List items keep their level and become `-` bullets; whether
+  the source was `1.` or `a.` lives in `word/numbering.xml`, which this slice
+  does not read.
+- Text boxes, images and drawings. `w:txbxContent`, `w:drawing` and ODF
+  `draw:frame` are skipped: their text is not in the paragraph flow, and an
+  image cannot become text.
+- Footnotes, endnotes and comments. They are separate parts
+  (`word/footnotes.xml`, `office:annotation`), not body content.
+- Character formatting (bold, italic, colour) and paragraph alignment. The text
+  targets carry no attributes to put it in.
+- Merged table cells are kept rectangular: a `w:gridSpan` of two writes the cell
+  and an empty cell beside it, and a vertically merged continuation is empty.
+- Headings deeper than six levels are written as level six, because that is as
+  far as Markdown goes.
+
+**What is deliberately not built:** writing an office format, converting between
+office formats, rendering a page to an image or a PDF, and mixed or multi-input
+output. Each of those needs either a layout engine or an office writer, and the
+one-format-in-one-format-out rule means a docx can become text but not a docx
+plus a PDF.
+
 ## Metadata
 
 Preserving is the default and there is no setting that turns it off: a
@@ -244,6 +324,12 @@ whichever track is decoded.
   hinting in both. Implementing the real conversion is a curve-fitting job
   (quad-to-cubic is exact, cubic-to-quadratic is not) plus CFF charstring
   emission, not a container change.
+- **Office documents:** extracting content is done, but *rendering* one is not,
+  and will not be without a layout engine — a docx → PDF or docx → PNG request is
+  the biggest office pair on the web app and is a different project. Legacy
+  binary `.doc` and `.ppt`, and the OpenDocument presentation and graphics
+  formats (`.odp`, `.odg`), are not inputs at all: the same reader for each is a
+  document writer's worth of work, and none of them is in the top office pairs.
 - **Packaging/auto-update:** the release workflow builds binaries, but installer
   signing and an updater are infrastructure work that needs certificates and a
   release channel.

@@ -5,7 +5,7 @@
 use crate::input_format;
 use crate::shared::{
     file_extension, is_archive_name, is_audio_extension, is_data_extension, is_font_extension,
-    is_image_input_extension, is_pdf_extension, is_video_input_extension,
+    is_image_input_extension, is_office_extension, is_pdf_extension, is_video_input_extension,
 };
 use crate::video::{native_video_routes, VideoRouteInfo};
 use serde::{Deserialize, Serialize};
@@ -319,14 +319,23 @@ impl OutputFormat {
                 is_image_input_extension(&extension) || is_pdf_extension(&extension)
             }
             Self::Pdf => extension == "txt" || is_image_input_extension(&extension),
-            Self::Text => is_data_extension(&extension) || extension == "pdf",
-            Self::Csv | Self::Json | Self::Yaml | Self::Toml => is_data_extension(&extension),
+            Self::Text => {
+                is_data_extension(&extension)
+                    || extension == "pdf"
+                    || is_office_extension(&extension)
+            }
+            Self::Csv | Self::Json => {
+                is_data_extension(&extension) || is_office_extension(&extension)
+            }
+            Self::Yaml | Self::Toml => is_data_extension(&extension),
             Self::TextUtf8NoBom
             | Self::TextUtf8Bom
             | Self::TextUtf16Le
             | Self::TextUtf16Be
             | Self::TextUtf32Le
-            | Self::TextUtf32Be => extension == "txt" || extension == "pdf",
+            | Self::TextUtf32Be => {
+                extension == "txt" || extension == "pdf" || is_office_extension(&extension)
+            }
             Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus | Self::Mp3 => {
                 is_audio_extension(&extension)
             }

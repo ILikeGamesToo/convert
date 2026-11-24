@@ -31,6 +31,11 @@ pub const ARCHIVE_INPUT_EXTENSIONS: &[&str] = &[
     "zip", "tar", "gz", "tgz", "rar", "cbr", "7z", "cb7", "cbz", "cbt",
 ];
 
+/// Office documents. DOCX, XLSX and PPTX are ZIP packages of XML parts, XLS is
+/// the legacy OLE2 workbook, and ODT and ODS are OpenDocument packages. Their
+/// content is extracted into the text and data targets; nothing is rendered.
+pub const OFFICE_INPUT_EXTENSIONS: &[&str] = &["docx", "xlsx", "xls", "pptx", "odt", "ods"];
+
 /// Every extension accepted by the conversion engine, for the default
 /// "Supported files" filter. Archive inputs are included so ZIP/TAR/GZIP can be
 /// extracted with the `files` target.
@@ -42,6 +47,7 @@ pub fn supported_input_extensions() -> Vec<&'static str> {
         .chain(AUDIO_INPUT_EXTENSIONS)
         .chain(ARCHIVE_INPUT_EXTENSIONS)
         .chain(FONT_INPUT_EXTENSIONS)
+        .chain(OFFICE_INPUT_EXTENSIONS)
         .copied()
         .collect()
 }

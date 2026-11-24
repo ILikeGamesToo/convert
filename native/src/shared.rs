@@ -94,6 +94,10 @@ pub(crate) fn is_font_extension(extension: &str) -> bool {
     input_extensions::FONT_INPUT_EXTENSIONS.contains(&extension)
 }
 
+pub(crate) fn is_office_extension(extension: &str) -> bool {
+    input_extensions::OFFICE_INPUT_EXTENSIONS.contains(&extension)
+}
+
 /// Whether `bytes` begin with an ISO BMFF `ftyp` box naming the AVIF still
 /// image brand (`avif`) or the AVIF image sequence brand (`avis`), as either
 /// the major brand or one of the compatible brands.

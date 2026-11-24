@@ -17,6 +17,7 @@ use crate::fonts::{convert_font, sniff as sniff_font};
 use crate::format::OutputFormat;
 use crate::image_metadata;
 use crate::images::{encode_image, encode_image_with_metadata, load_image, rasterize_svg};
+use crate::office;
 use crate::options::ConversionOptions;
 use crate::pdf;
 use crate::shared::{
@@ -274,6 +275,13 @@ pub fn convert_bytes_with_video_control(
         }]);
     }
 
+    // An office document is extracted, never rendered: its content goes to the
+    // text and data targets, and the container rather than the name decides
+    // which office format it is.
+    if let Some(kind) = office::detect(input_name, input)? {
+        return office::convert(input_name, input, kind, target);
+    }
+
     convert_text(input_name, input, target)
 }
 
@@ -319,7 +327,9 @@ fn render_pdf_svg_pages(
 /// How many output files converting `path` to `target` will produce, when that
 /// can be counted without converting. A PDF page target gives one file per
 /// page, which is why a progress bar cannot assume one file per input; archive
-/// extraction gives one file per entry. Every other target gives one file.
+/// extraction gives one file per entry. Every other target gives one file,
+/// except a workbook written to CSV, which gives one file per sheet and is not
+/// counted here: the sheet list is only known once the workbook is read.
 ///
 /// Counting a PDF reads and parses the document, and counting an archive reads
 /// its index, so this costs a second read of the input. It is meant for sizing

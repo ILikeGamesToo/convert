@@ -123,6 +123,13 @@ fn print_format_registry() {
          Incompatible codec/container pairs are rejected without re-encoding; all require \
          ffmpeg (PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg)."
     );
+    println!();
+    println!(
+        "Office: docx, pptx and odt become Markdown-shaped text (headings, list items and \
+         pipe tables in reading order); xlsx, xls and ods become one CSV per sheet, one JSON \
+         document, or one text file of tab-separated rows per sheet. Nothing is rendered: a \
+         document is read for its content, never for its layout."
+    );
 }
 
 fn print_video_routes() {

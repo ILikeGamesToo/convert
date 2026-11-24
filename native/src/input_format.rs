@@ -48,12 +48,22 @@ pub enum InputFormat {
     Otf,
     Woff,
     Woff2,
+    /// Word, Excel, PowerPoint and OpenDocument files, read as data: their
+    /// text, structure and cells go to the text, CSV and JSON targets.
+    Docx,
+    Xlsx,
+    /// The legacy BIFF8 workbook, which is an OLE2 compound file rather than a
+    /// ZIP package.
+    Xls,
+    Pptx,
+    Odt,
+    Ods,
     Any,
     Mixed,
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 40] = [
+    pub const SELECTABLE: [Self; 46] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -94,6 +104,12 @@ impl InputFormat {
         Self::Otf,
         Self::Woff,
         Self::Woff2,
+        Self::Docx,
+        Self::Xlsx,
+        Self::Xls,
+        Self::Pptx,
+        Self::Odt,
+        Self::Ods,
     ];
 
     pub fn label(self) -> &'static str {
@@ -137,6 +153,12 @@ impl InputFormat {
             Self::Otf => "OpenType font",
             Self::Woff => "WOFF font",
             Self::Woff2 => "WOFF2 font",
+            Self::Docx => "Word document",
+            Self::Xlsx => "Excel workbook",
+            Self::Xls => "Excel 97 workbook",
+            Self::Pptx => "PowerPoint presentation",
+            Self::Odt => "OpenDocument text",
+            Self::Ods => "OpenDocument spreadsheet",
             Self::Any => "Any file",
             Self::Mixed => "Mixed formats",
         }
@@ -183,6 +205,12 @@ impl InputFormat {
             Self::Otf => "CFF outlines in an OpenType container",
             Self::Woff => "Web Open Font Format 1.0",
             Self::Woff2 => "Web Open Font Format 2.0",
+            Self::Docx => "Office Open XML word processing document",
+            Self::Xlsx => "Office Open XML workbook",
+            Self::Xls => "Binary Excel workbook (BIFF8)",
+            Self::Pptx => "Office Open XML presentation",
+            Self::Odt => "OpenDocument text document",
+            Self::Ods => "OpenDocument spreadsheet",
             Self::Any | Self::Mixed => "Archive creation only",
         }
     }
@@ -228,6 +256,12 @@ impl InputFormat {
             Self::Otf => "OTF",
             Self::Woff => "WOFF",
             Self::Woff2 => "WOFF2",
+            Self::Docx => "DOCX",
+            Self::Xlsx => "XLSX",
+            Self::Xls => "XLS",
+            Self::Pptx => "PPTX",
+            Self::Odt => "ODT",
+            Self::Ods => "ODS",
             Self::Any => "ANY",
             Self::Mixed => "MIXED",
         }
@@ -274,6 +308,12 @@ impl InputFormat {
             Self::Otf => "otf",
             Self::Woff => "woff",
             Self::Woff2 => "woff2",
+            Self::Docx => "docx",
+            Self::Xlsx => "xlsx",
+            Self::Xls => "xls",
+            Self::Pptx => "pptx",
+            Self::Odt => "odt",
+            Self::Ods => "ods",
             Self::Any | Self::Mixed => return None,
         })
     }
@@ -393,6 +433,12 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "otf" => InputFormat::Otf,
         "woff" => InputFormat::Woff,
         "woff2" => InputFormat::Woff2,
+        "docx" => InputFormat::Docx,
+        "xlsx" => InputFormat::Xlsx,
+        "xls" => InputFormat::Xls,
+        "pptx" => InputFormat::Pptx,
+        "odt" => InputFormat::Odt,
+        "ods" => InputFormat::Ods,
         "ttc" | "otc" => InputFormat::Ttf,
         _ => return None,
     })
@@ -503,6 +549,18 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
         || bytes.starts_with(b"PK\x05\x06")
         || bytes.starts_with(b"PK\x07\x08")
     {
+        // An office document is a ZIP package, so the part names in its local
+        // headers decide the format before the archive fallback claims it.
+        if let Some(kind) = crate::office::sniff_prefix(bytes) {
+            return Some(match kind {
+                crate::office::OfficeKind::Docx => InputFormat::Docx,
+                crate::office::OfficeKind::Xlsx => InputFormat::Xlsx,
+                crate::office::OfficeKind::Xls => InputFormat::Xls,
+                crate::office::OfficeKind::Pptx => InputFormat::Pptx,
+                crate::office::OfficeKind::Odt => InputFormat::Odt,
+                crate::office::OfficeKind::Ods => InputFormat::Ods,
+            });
+        }
         return Some(InputFormat::Archive);
     }
     if bytes.len() >= 262 && &bytes[257..262] == b"ustar" {
