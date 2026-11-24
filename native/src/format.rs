@@ -5,7 +5,7 @@
 use crate::input_format;
 use crate::shared::{
     file_extension, is_archive_name, is_audio_extension, is_data_extension, is_font_extension,
-    is_image_input_extension, is_video_input_extension,
+    is_image_input_extension, is_pdf_extension, is_video_input_extension,
 };
 use crate::video::{native_video_routes, VideoRouteInfo};
 use serde::{Deserialize, Serialize};
@@ -283,7 +283,9 @@ impl OutputFormat {
         let extension = file_extension(file_name);
         match self {
             Self::Png | Self::Jpeg | Self::Webp => {
-                is_image_input_extension(&extension) || is_video_input_extension(&extension)
+                is_image_input_extension(&extension)
+                    || is_video_input_extension(&extension)
+                    || is_pdf_extension(&extension)
             }
             Self::Gif
             | Self::Bmp
@@ -296,7 +298,9 @@ impl OutputFormat {
             | Self::Tga
             | Self::Qoi
             | Self::Hdr
-            | Self::Farbfeld => is_image_input_extension(&extension),
+            | Self::Farbfeld => {
+                is_image_input_extension(&extension) || is_pdf_extension(&extension)
+            }
             Self::Pdf => extension == "txt" || is_image_input_extension(&extension),
             Self::Text => is_data_extension(&extension) || extension == "pdf",
             Self::Csv | Self::Json | Self::Yaml | Self::Toml => is_data_extension(&extension),
@@ -395,7 +399,10 @@ mod tests {
             .unwrap();
         assert!(pdf.outputs.contains(&OutputFormat::Text));
         assert!(pdf.outputs.contains(&OutputFormat::TextUtf16Le));
-        assert!(!pdf.outputs.contains(&OutputFormat::Png));
+        assert!(pdf.outputs.contains(&OutputFormat::Png));
+        assert!(pdf.outputs.contains(&OutputFormat::Jpeg));
+        assert!(pdf.outputs.contains(&OutputFormat::Webp));
+        assert!(!pdf.outputs.contains(&OutputFormat::Svg));
 
         let archive = registry
             .iter()

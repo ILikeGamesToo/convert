@@ -31,12 +31,30 @@ pub(crate) fn is_archive_name(name: &str) -> bool {
         || name.ends_with(".gz")
 }
 
-pub(crate) fn output_name(input_name: &str, extension: &str) -> PathBuf {
-    let stem = Path::new(input_name)
+fn output_stem(input_name: &str) -> &std::ffi::OsStr {
+    Path::new(input_name)
         .file_stem()
         .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| std::ffi::OsStr::new("converted"));
-    PathBuf::from(format!("{}.{}", stem.to_string_lossy(), extension))
+        .unwrap_or_else(|| std::ffi::OsStr::new("converted"))
+}
+
+pub(crate) fn output_name(input_name: &str, extension: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.{}",
+        output_stem(input_name).to_string_lossy(),
+        extension
+    ))
+}
+
+/// The name of one page's output file for a multi-page input. The web app names
+/// a PDF's pages `<stem>_<page>.<ext>` with a zero-based page index, so this
+/// matches it: a two-page `report.pdf` becomes `report_0.png` and
+/// `report_1.png`.
+pub(crate) fn page_output_name(input_name: &str, extension: &str, page: usize) -> PathBuf {
+    PathBuf::from(format!(
+        "{}_{page}.{extension}",
+        output_stem(input_name).to_string_lossy()
+    ))
 }
 
 pub(crate) fn unsupported(extension: &str, target: OutputFormat) -> ConvertError {

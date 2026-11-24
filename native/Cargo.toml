@@ -24,6 +24,11 @@ flate2 = "1"
 # without its default `encoder` feature because only decoding is needed.
 gamut-avif = "2.0.0"
 gamut-core = "3.0.0"
+# PDF page rasterisation. `hayro` is a pure-Rust PDF interpreter and CPU
+# rasteriser (Apache-2.0 OR MIT) whose default features bundle permissively
+# licensed substitutes for the 14 standard fonts and the predefined CMaps,
+# so a PDF that embeds nothing still draws real glyphs.
+hayro = "0.9.0"
 heifer = { version = "0.5.1", default-features = false }
 image = { version = "0.25", default-features = false, features = [
     "bmp",

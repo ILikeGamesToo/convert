@@ -4221,10 +4221,25 @@ fn main() {
     }
 
     #[test]
-    fn pdf_files_offer_text_and_archive_outputs() {
+    fn pdf_files_offer_raster_and_text_outputs() {
         assert_eq!(
             available_targets(Some(InputFormat::Pdf)),
             [
+                OutputFormat::Png,
+                OutputFormat::Jpeg,
+                OutputFormat::Webp,
+                OutputFormat::Gif,
+                OutputFormat::Bmp,
+                OutputFormat::Tiff,
+                OutputFormat::Ico,
+                OutputFormat::Ppm,
+                OutputFormat::Pbm,
+                OutputFormat::Pgm,
+                OutputFormat::Pam,
+                OutputFormat::Tga,
+                OutputFormat::Qoi,
+                OutputFormat::Hdr,
+                OutputFormat::Farbfeld,
                 OutputFormat::Text,
                 OutputFormat::TextUtf8NoBom,
                 OutputFormat::TextUtf8Bom,

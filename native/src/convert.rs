@@ -14,9 +14,11 @@ use crate::fonts::{convert_font, sniff as sniff_font};
 use crate::format::OutputFormat;
 use crate::images::{encode_image, load_image, preserve_jpeg_exif, rasterize_svg};
 use crate::options::ConversionOptions;
+use crate::pdf;
 use crate::shared::{
     file_extension, is_audio_extension, is_font_extension, is_image_input_extension,
-    is_pdf_extension, is_video_input_extension, output_name, safe_file_name, unsupported,
+    is_pdf_extension, is_video_input_extension, output_name, page_output_name, safe_file_name,
+    unsupported,
 };
 use crate::text::{convert_text, encode_text};
 use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
@@ -114,6 +116,9 @@ pub fn convert_bytes_with_video_control(
     }
 
     if is_pdf_extension(&extension) {
+        if target.image_format().is_some() {
+            return render_pdf_pages(input_name, input, target, options);
+        }
         let text = extract_pdf_text(input)?;
         let bytes = match target {
             OutputFormat::Text
@@ -224,6 +229,27 @@ pub fn convert_bytes_with_video_control(
     }
 
     convert_text(input_name, input, target)
+}
+
+/// Renders every page of a PDF and encodes each one, giving one output file per
+/// page with a zero-based page suffix, which is what the web app's pdf handler
+/// does. Encoding happens inside the render callback so a long document is
+/// encoded and released page by page rather than held in memory as a whole.
+fn render_pdf_pages(
+    input_name: &str,
+    input: &[u8],
+    target: OutputFormat,
+    options: ConversionOptions,
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    let mut pages = Vec::new();
+    pdf::render_pages(input, |index, image| {
+        pages.push(ConvertedFile {
+            name: page_output_name(input_name, target.extension(), index),
+            bytes: encode_image(image, target, options)?,
+        });
+        Ok(())
+    })?;
+    Ok(pages)
 }
 
 pub fn convert_batch(

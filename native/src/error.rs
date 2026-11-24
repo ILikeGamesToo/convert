@@ -25,6 +25,14 @@ pub enum ConvertError {
     NoInputFiles,
     #[error("could not render the SVG: {0}")]
     Svg(String),
+    #[error("the PDF is encrypted and cannot be rendered without its password")]
+    PdfEncrypted,
+    #[error("could not render PDF page {page}: {width} x {height} pixels is too large")]
+    PdfPageTooLarge {
+        page: usize,
+        width: f32,
+        height: f32,
+    },
     #[error("the SVG is too large to render")]
     SvgTooLarge,
     #[error("could not read or write the font: {0}")]

@@ -14,6 +14,7 @@ mod images;
 pub mod input_extensions;
 pub mod input_format;
 mod options;
+mod pdf;
 mod shared;
 mod streaming;
 #[cfg(test)]

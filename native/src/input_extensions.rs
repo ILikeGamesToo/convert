@@ -9,8 +9,8 @@ pub const IMAGE_INPUT_EXTENSIONS: &[&str] = &[
 /// Text and data extensions accepted by the conversion engine.
 pub const DATA_INPUT_EXTENSIONS: &[&str] = &["txt", "csv", "json", "yaml", "yml", "toml"];
 
-/// PDF documents are read as text. Rendering PDF pages to images requires a
-/// separate PDF rasterizer and is not part of the native handler yet.
+/// PDF documents. Their text is extracted for the text targets, and their pages
+/// are rasterised in-process for the image targets.
 pub const PDF_INPUT_EXTENSIONS: &[&str] = &["pdf"];
 
 /// Audio extensions accepted by the conversion engine, including video

@@ -559,10 +559,11 @@ mod tests {
         let utf16 = convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::TextUtf16Le).unwrap();
         assert_eq!(&utf16[0].bytes[..2], &[0xff, 0xfe]);
 
-        assert!(matches!(
-            convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::Png),
-            Err(ConvertError::Unsupported { .. })
-        ));
+        // A PDF is also a raster input now, so the same bytes render a page.
+        let png = convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::Png).unwrap();
+        assert_eq!(png.len(), 1);
+        assert_eq!(png[0].name.to_string_lossy(), "notes_0.png");
+        assert!(png[0].bytes.starts_with(&[0x89, b'P', b'N', b'G']));
         assert!(matches!(
             convert_bytes(
                 "broken.pdf",
