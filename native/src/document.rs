@@ -2,10 +2,10 @@
 
 //! PDF writing and PDF text extraction.
 
-use crate::decode_text;
 use crate::error::ConvertError;
 use crate::images::{composite_channel, exif_orientation, load_image, rasterize_svg};
 use crate::options::ConversionOptions;
+use crate::text::decode_text;
 use pdf_writer::{Content, Filter, Name, Pdf, Rect, Ref, Str};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
