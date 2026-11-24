@@ -3,14 +3,21 @@
 //! Font conversion: sfnt (TTF/OTF) repackaging, the WOFF and WOFF2 containers,
 //! and the SVG specimen the web handler emits.
 //!
-//! The web handler parses a font and re-emits it, which keeps the outline
-//! flavour it read: a TrueType font stays `glyf`-based and a CFF font stays
-//! `CFF `-based. This module works one level lower and copies every font table
-//! verbatim while it rewrites the container, so glyph outlines, advance widths,
-//! units-per-em, the cmap and the name table survive a conversion untouched.
-//! `TTF` and `OTF` name the same sfnt container with different outline
-//! flavours, so converting between them renames the container instead of
-//! re-drawing the outlines, exactly like the web handler.
+//! The web handler parses a font and re-emits it through `opentype.js`. This
+//! module works one level lower and copies every font table verbatim while it
+//! rewrites the container, so glyph outlines, advance widths, units-per-em, the
+//! cmap and the name table survive a conversion untouched.
+//!
+//! `TTF` and `OTF` output both relabel the container and keep the source
+//! outline format: a TrueType font stays `glyf`-based and a CFF font stays
+//! `CFF `-based, and the two outputs differ only in their file name, not in
+//! their bytes. There is no `glyf`-to-CFF or CFF-to-`glyf` conversion here. A
+//! `.otf` made from a TrueType font is therefore a valid OpenType font carrying
+//! TrueType outlines, which is a deliberate trade: copying the `glyf`/`CFF `
+//! table preserves every outline exactly, where redrawing outlines loses
+//! quadratic-curve fidelity in one direction (cubic-to-quadratic is a fitting
+//! problem) and TrueType hinting instructions in both
+//! directions.
 //!
 //! WOFF2 output uses the null `glyf`/`loca` transform the container format
 //! defines: the tables are Brotli-compressed as they are rather than run

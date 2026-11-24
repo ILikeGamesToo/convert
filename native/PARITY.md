@@ -24,7 +24,7 @@ The same data is available from the library as `native_format_registry()`.
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP | ZIP, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
 
-| Fonts | TTF, OTF, WOFF, WOFF2, TTC/OTC | TTF, OTF, WOFF, WOFF2, SVG | Every font table is copied verbatim and only the container is rewritten, so outlines, advance widths, units-per-em, the cmap and the name table survive a conversion. TTF and OTF name the same sfnt container with different outline flavours, so converting between them renames the container instead of redrawing outlines, exactly like the web handler. A `.ttc`/`.otc` collection is converted from its first face. WOFF2 input reverses the `glyf`/`loca` transform; WOFF2 output uses the null transform the format allows. SVG output is the web handler's font specimen (one `<glyph>` per mapped codepoint), not a rasterisable text document. |
+| Fonts | TTF, OTF, WOFF, WOFF2, TTC/OTC | TTF, OTF, WOFF, WOFF2, SVG | Every font table is copied verbatim and only the container is rewritten, so outlines, advance widths, units-per-em, the cmap and the name table survive a conversion. TTF and OTF output relabel the container and keep the source outline format, so they differ only in file name; there is no `glyf`↔`CFF ` outline conversion (see Known gaps). A `.ttc`/`.otc` collection is converted from its first face. WOFF2 input reverses the `glyf`/`loca` transform; WOFF2 output uses the null transform the format allows. SVG output is the web handler's font specimen (one `<glyph>` per mapped codepoint), not a rasterisable text document. |
 
 ## Web-only handlers not yet ported
 
@@ -66,6 +66,18 @@ external tools that do not have a verified native equivalent in this crate.
   pre-compression: the 35,220-byte Abel TTF becomes a 13,824-byte WOFF2 and a
   15,836-byte WOFF. Adding the encoder side of the glyph transform is the
   obvious next slice; nothing else depends on it.
+- **Font flavour conversion:** `TTF` and `OTF` output relabel the container and
+  keep the source outline format — no `glyf`↔`CFF ` conversion. A TTF converted
+  to `.otf` still carries TrueType outlines, and an OTF converted to `.ttf`
+  still carries CFF outlines. Both files are valid OpenType and render
+  identically; the extension names the container, not the outline flavour. This
+  is intended, and the web handler's OTF output differs here: it re-serialises
+  through `opentype.js`, which rewrites the outlines. Copying the `glyf`/`CFF `
+  table instead preserves every outline exactly, where converting loses
+  quadratic-curve fidelity in the cubic-to-quadratic direction and TrueType
+  hinting in both. Implementing the real conversion is a curve-fitting job
+  (quad-to-cubic is exact, cubic-to-quadratic is not) plus CFF charstring
+  emission, not a container change.
 - **Metadata:** JPEG-to-JPEG preserves APP1 EXIF segments (and resets the
   orientation tag after pixels are rotated); MP3-to-MP3 preserves the ID3v2
   tag; FLAC-to-FLAC preserves Vorbis comments and pictures. EXIF in other image
