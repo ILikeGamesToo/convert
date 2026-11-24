@@ -19,7 +19,7 @@ The same data is available from the library as `native_format_registry()`.
 | --- | --- | --- | --- |
 | Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
-| PDF | PDF | text encodings | Text extraction uses `pdf-extract`. PDF page rasterization is not implemented. |
+| PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro`, one file per page; see [PDF rasterisation](#pdf-rasterisation) for the scale, the naming and the limits. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. MP3-to-MP3 keeps its ID3v2 tag; FLAC-to-FLAC keeps Vorbis comments and pictures. |
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP | ZIP, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
@@ -30,8 +30,8 @@ The same data is available from the library as `native_format_registry()`.
 
 The web app (`src/handlers/index.ts`) also has dedicated handlers for vector
 tracing, EPUB/AZW3/MOBI, office documents, Typst/Pandoc, 3D models,
-SQLite, 7z/RAR/LZH, comic archives, game formats, MIDI/module music, and
-PDF rasterization. Those handlers depend on JavaScript/WASM libraries or
+SQLite, 7z/RAR/LZH, comic archives, game formats, and MIDI/module music. Those handlers depend on
+JavaScript/WASM libraries or
 external tools that do not have a verified native equivalent in this crate.
 
 ## AVIF and HEIC
@@ -75,6 +75,55 @@ redistributing a decoder walks into, and a permissive copyright licence from the
 decoder author grants no patent rights. That decision is recorded here
 deliberately. Do not re-open it as though it were an oversight, and do not add a
 second HEVC implementation without the same decision.
+
+## PDF rasterisation
+
+Pages are rasterised in-process by `hayro` 0.9 (Apache-2.0 OR MIT, pure Rust,
+`#![forbid(unsafe_code)]`): no C library, no external binary, nothing to
+install, and no network access. Its default features bundle permissively
+licensed substitutes for the 14 standard fonts and the predefined CMaps, so a
+document that embeds no font still draws real glyphs rather than boxes, and a
+document that embeds a subset uses the embedded one. Rasterising the committed
+Chrome fixture reproduces its source colours exactly and its text as
+anti-aliased glyphs (`native/src/pdf.rs` asserts both).
+
+The contract copies the web app's pdfjs handler, because PDF is the one input
+where one file in does not mean one file out:
+
+- **One output file per page**, named `<stem>_<page>.<ext>` with a zero-based
+  page number, so a three-page `report.pdf` becomes `report_0.png`,
+  `report_1.png` and `report_2.png`. The user keeps the pages they want.
+- **One pixel per point** (72 dpi). pdfjs renders `getViewport({scale: 1})`,
+  which is the page's own point size, and floors it to whole pixels; this module
+  does the same. There is no size option to expose that scale, because the
+  native app has no equivalent of the web app's width/height options.
+- **Opaque white background**, matching pdfjs's `background:
+  "rgb(255,255,255)"`, so a page whose content leans on transparency is backed
+  by paper instead of coming out with a cut-out.
+
+Each page is handed to the encoder as soon as it is drawn, so a long document
+never exists in memory as a whole. Two limits are enforced per page instead of
+per document: 8192 pixels on either edge, because the rasteriser addresses a
+page with 16-bit coordinates, and 4096 x 4096 pixels of area, which is 64 MiB as
+RGBA. A page over either limit returns `PdfPageTooLarge` naming its page number
+and size rather than being rendered badly; A0 and a 2 m poster both fit.
+
+What does not render: an encrypted document returns `PdfEncrypted`, because
+`hayro` cannot decrypt; a document it cannot parse returns `Pdf` with the
+reason, and a panic inside the renderer is caught at the page boundary and
+reported the same way rather than taking the app down. The gaps `hayro`
+documents for every viewer that is not Acrobat — knockout groups, CMYK blending,
+3D content — come with it.
+
+PDF→SVG is deliberately not wired up, although the capability is proved:
+`hayro-svg` (same version and licence) converted the same fixture to a valid
+388 KB SVG. It is deferred because the app's only SVG target is the font
+specimen — `OutputFormat::Svg`, labelled "SVG font" and filed under the GUI's
+Font category — so granting PDF that target would offer "SVG font" for a PDF and
+produce a page. Doing it honestly needs a page-SVG target or a split of that
+variant's label and category, which is a registry change, not a renderer one. No
+`hayro-svg` dependency ships until then, because an unused backend is dead
+weight in the binary.
 
 ## Known blockers
 
@@ -132,5 +181,3 @@ second HEVC implementation without the same decision.
 - **Packaging/auto-update:** the release workflow builds binaries, but installer
   signing and an updater are infrastructure work that needs certificates and a
   release channel.
-- **PDF images:** PDF text extraction is available; PDF→image requires a PDF
-  renderer (MuPDF/Poppler-class dependency), which is not bundled.
