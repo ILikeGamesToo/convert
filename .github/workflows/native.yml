@@ -25,16 +25,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # macOS hosted arm64 runners are starved on this fork: the job is
+      # cancelled without ever being assigned a runner, so it takes the whole
+      # run down without testing anything. `continue-on-error` does not help —
+      # it covers a job that failed, not one that was cancelled. The canonical
+      # repository does get a runner, so its matrix keeps all three platforms;
+      # a fork runs the two it can actually run. `github.repository` is the
+      # repository the workflow runs in, so a pull request from a fork still
+      # resolves to the base repository and gets the full matrix.
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-
-    # GitHub's arm64 macOS pool intermittently cannot supply a runner: the job
-    # sits queued for about fifteen minutes and is then cancelled without
-    # running a step, annotated "The job was not acquired by Runner of type
-    # hosted even after multiple attempts". A cancelled job is not covered by
-    # continue-on-error, so a starved run stays red. macOS stays in the matrix
-    # anyway: a job that never started is a pool problem, not a reason to drop
-    # a platform the project supports.
+        os: ${{ fromJSON(github.repository == 'p2r3/convert' && '["windows-latest", "macos-latest", "ubuntu-latest"]' || '["windows-latest", "ubuntu-latest"]') }}
 
     defaults:
       run:
