@@ -1,6 +1,6 @@
 # Native test fixtures
 
-These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, and H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies.
+These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies, and font container conversions for TrueType (glyf) and OpenType (CFF) fonts.
 
 - `piano.ogg` — Ogg Vorbis, CC0 1.0. Source: [`themankindproject/audiofp`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/piano.ogg); its [`CREDITS.md`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/CREDITS.md) marks it CC0 and generated for that project.
 - `sample.m4a` — AAC in an audio-only M4A, 22 KB. Remuxed from the audio track of WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4) with the video track removed and the `esds` SLConfigDescriptor set to the MP4 predefined value. WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
@@ -85,4 +85,13 @@ These files are used only by the `native` conversion tests to verify OGG, Opus, 
   ```sh
   ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
     -af "pan=5.1|FC=c0" -c:a ac3 -b:a 192k sample-ac3-center.ac3
+  ```
+- `abel-regular.ttf` — Abel Regular, 35 KB, TrueType (`glyf`) outlines. Used as the main font fixture: every container conversion is round-tripped and the result is rendered back with `resvg`, comparing ink against the source font. Copied from Google Fonts' [`ofl/abel/Abel-Regular.ttf`](https://github.com/google/fonts/blob/main/ofl/abel/Abel-Regular.ttf), which is licensed under the [SIL Open Font License 1.1](https://github.com/google/fonts/blob/main/ofl/abel/OFL.txt):
+- `source-code-pro-regular.otf` — Source Code Pro Regular, 128 KB, CFF (`OTTO`) outlines. The CFF counterpart of the fixture above, so both sfnt flavours are exercised. Copied from Adobe's [`adobe-fonts/source-code-pro`](https://github.com/adobe-fonts/source-code-pro/blob/release/OTF/SourceCodePro-Regular.otf), licensed under the [SIL Open Font License 1.1](https://github.com/adobe-fonts/source-code-pro/blob/release/LICENSE.md):
+- `abel-regular.woff2` — 9 KB, Abel's latin subset exactly as Google Fonts serves it, including the WOFF2 `glyf`/`loca` transform. This is the only fixture whose glyph data has been pre-compressed by someone else's encoder, so it proves the decoder reverses the transform rather than only reading files this crate wrote. Downloaded from the `src` URL in the Google Fonts CSS response for `family=Abel`; same SIL Open Font License 1.1 as the TTF. It is a subset, so its cmap covers U+0000-00FF, not the full character set of `abel-regular.ttf`.
+
+  ```sh
+  curl -L -o abel-regular.ttf https://raw.githubusercontent.com/google/fonts/main/ofl/abel/Abel-Regular.ttf
+  curl -L -o source-code-pro-regular.otf https://raw.githubusercontent.com/adobe-fonts/source-code-pro/release/OTF/SourceCodePro-Regular.otf
+  curl -L -o abel-regular.woff2 https://fonts.gstatic.com/s/abel/v18/MwQ5bhbm2POE2V9BPQ.woff2
   ```

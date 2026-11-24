@@ -8,6 +8,7 @@ mod data;
 mod document;
 mod error;
 mod ffmpeg;
+mod fonts;
 mod format;
 mod images;
 pub mod input_extensions;

@@ -37,12 +37,16 @@ pub enum InputFormat {
     Ac3,
     Video,
     Archive,
+    Ttf,
+    Otf,
+    Woff,
+    Woff2,
     Any,
     Mixed,
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 32] = [
+    pub const SELECTABLE: [Self; 36] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -75,6 +79,10 @@ impl InputFormat {
         Self::Ac3,
         Self::Video,
         Self::Archive,
+        Self::Ttf,
+        Self::Otf,
+        Self::Woff,
+        Self::Woff2,
     ];
 
     pub fn label(self) -> &'static str {
@@ -110,6 +118,10 @@ impl InputFormat {
             Self::Ac3 => "Dolby audio",
             Self::Video => "Video",
             Self::Archive => "Archive file",
+            Self::Ttf => "TrueType font",
+            Self::Otf => "OpenType font",
+            Self::Woff => "WOFF font",
+            Self::Woff2 => "WOFF2 font",
             Self::Any => "Any file",
             Self::Mixed => "Mixed formats",
         }
@@ -148,6 +160,10 @@ impl InputFormat {
             Self::Ac3 => "AC-3 or E-AC-3 audio",
             Self::Video => "MP4, MOV, MKV, or WebM with an audio track",
             Self::Archive => "ZIP, TAR, TAR.GZ, or GZIP; archive creation only",
+            Self::Ttf => "TrueType outlines in an sfnt container",
+            Self::Otf => "CFF outlines in an OpenType container",
+            Self::Woff => "Web Open Font Format 1.0",
+            Self::Woff2 => "Web Open Font Format 2.0",
             Self::Any | Self::Mixed => "Archive creation only",
         }
     }
@@ -185,6 +201,10 @@ impl InputFormat {
             Self::Ac3 => "AC3",
             Self::Video => "VIDEO",
             Self::Archive => "ARCHIVE",
+            Self::Ttf => "TTF",
+            Self::Otf => "OTF",
+            Self::Woff => "WOFF",
+            Self::Woff2 => "WOFF2",
             Self::Any => "ANY",
             Self::Mixed => "MIXED",
         }
@@ -223,6 +243,10 @@ impl InputFormat {
             Self::Ac3 => "ac3",
             Self::Video => "mp4",
             Self::Archive => "zip",
+            Self::Ttf => "ttf",
+            Self::Otf => "otf",
+            Self::Woff => "woff",
+            Self::Woff2 => "woff2",
             Self::Any | Self::Mixed => return None,
         })
     }
@@ -332,6 +356,11 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "ac3" | "eac3" | "ec3" => InputFormat::Ac3,
         "mp4" | "m4v" | "mov" | "mkv" | "webm" => InputFormat::Video,
         "zip" | "tar" | "gz" | "tgz" => InputFormat::Archive,
+        "ttf" => InputFormat::Ttf,
+        "otf" => InputFormat::Otf,
+        "woff" => InputFormat::Woff,
+        "woff2" => InputFormat::Woff2,
+        "ttc" | "otc" => InputFormat::Ttf,
         _ => return None,
     })
 }
@@ -341,6 +370,16 @@ fn is_ogg_opus(bytes: &[u8]) -> bool {
 }
 
 fn sniff(bytes: &[u8]) -> Option<InputFormat> {
+    if let Some(font) = crate::fonts::sniff(bytes) {
+        return Some(match font {
+            crate::fonts::FontContainer::TrueType | crate::fonts::FontContainer::Collection => {
+                InputFormat::Ttf
+            }
+            crate::fonts::FontContainer::Cff => InputFormat::Otf,
+            crate::fonts::FontContainer::Woff => InputFormat::Woff,
+            crate::fonts::FontContainer::Woff2 => InputFormat::Woff2,
+        });
+    }
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
         return Some(InputFormat::Png);
     }

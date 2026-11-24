@@ -20,6 +20,10 @@ pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
     "alac", "aiff", "aif", "ac3", "eac3", "ec3",
 ];
 
+/// Font extensions accepted by the conversion engine. Collections are listed
+/// because their first face is converted.
+pub const FONT_INPUT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2", "ttc", "otc"];
+
 /// Archive extensions accepted for extraction and re-packing.
 pub const ARCHIVE_INPUT_EXTENSIONS: &[&str] = &["zip", "tar", "gz", "tgz"];
 
@@ -33,6 +37,7 @@ pub fn supported_input_extensions() -> Vec<&'static str> {
         .chain(PDF_INPUT_EXTENSIONS)
         .chain(AUDIO_INPUT_EXTENSIONS)
         .chain(ARCHIVE_INPUT_EXTENSIONS)
+        .chain(FONT_INPUT_EXTENSIONS)
         .copied()
         .collect()
 }

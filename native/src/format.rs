@@ -4,7 +4,7 @@
 
 use crate::input_format;
 use crate::shared::{
-    file_extension, is_archive_name, is_audio_extension, is_data_extension,
+    file_extension, is_archive_name, is_audio_extension, is_data_extension, is_font_extension,
     is_image_input_extension, is_video_input_extension,
 };
 use crate::video::{native_video_routes, VideoRouteInfo};
@@ -56,10 +56,16 @@ pub enum OutputFormat {
     Gzip,
     /// Extract an archive into separate files instead of creating one.
     Files,
+    Ttf,
+    Otf,
+    Woff,
+    Woff2,
+    /// Write the font's glyphs as an SVG font specimen.
+    Svg,
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 45] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -100,6 +106,11 @@ impl OutputFormat {
         Self::TarGz,
         Self::Gzip,
         Self::Files,
+        Self::Ttf,
+        Self::Otf,
+        Self::Woff,
+        Self::Woff2,
+        Self::Svg,
     ];
 
     pub fn label(self) -> &'static str {
@@ -144,6 +155,11 @@ impl OutputFormat {
             Self::TarGz => "TAR.GZ archive",
             Self::Gzip => "GZIP compressed file",
             Self::Files => "Extracted files",
+            Self::Ttf => "TrueType font",
+            Self::Otf => "OpenType font",
+            Self::Woff => "WOFF font",
+            Self::Woff2 => "WOFF2 font",
+            Self::Svg => "SVG font",
         }
     }
 
@@ -163,6 +179,14 @@ impl OutputFormat {
             Self::Farbfeld => Some(image::ImageFormat::Farbfeld),
             _ => None,
         }
+    }
+
+    /// Whether this target is a font container or an SVG font specimen.
+    pub fn is_font_target(self) -> bool {
+        matches!(
+            self,
+            Self::Ttf | Self::Otf | Self::Woff | Self::Woff2 | Self::Svg
+        )
     }
 
     /// Whether this target is a video container handled by the external
@@ -222,6 +246,11 @@ impl OutputFormat {
             Self::TarGz => "tar.gz",
             Self::Gzip => "gz",
             Self::Files => "files",
+            Self::Ttf => "ttf",
+            Self::Otf => "otf",
+            Self::Woff => "woff",
+            Self::Woff2 => "woff2",
+            Self::Svg => "svg",
         }
     }
 
@@ -283,6 +312,9 @@ impl OutputFormat {
             Self::Mp4 | Self::Webm => is_video_input_extension(&extension),
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
             Self::Files => is_archive_name(file_name),
+            Self::Ttf | Self::Otf | Self::Woff | Self::Woff2 | Self::Svg => {
+                is_font_extension(&extension)
+            }
         }
     }
 }

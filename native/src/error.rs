@@ -27,6 +27,8 @@ pub enum ConvertError {
     Svg(String),
     #[error("the SVG is too large to render")]
     SvgTooLarge,
+    #[error("could not read or write the font: {0}")]
+    Font(String),
     #[error("the text needs {pages} PDF pages, more than the {max}-page limit")]
     PdfTooManyPages { pages: usize, max: usize },
     #[error("the audio file has no decodable audio track")]

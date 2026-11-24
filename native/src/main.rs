@@ -311,10 +311,11 @@ enum FormatCategory {
     Audio,
     Video,
     Archive,
+    Font,
 }
 
 impl FormatCategory {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Image,
         Self::Document,
         Self::Text,
@@ -322,6 +323,7 @@ impl FormatCategory {
         Self::Audio,
         Self::Video,
         Self::Archive,
+        Self::Font,
     ];
 
     fn label(self) -> &'static str {
@@ -333,6 +335,7 @@ impl FormatCategory {
             Self::Audio => "Audio",
             Self::Video => "Video",
             Self::Archive => "Archive",
+            Self::Font => "Font",
         }
     }
 }
@@ -377,6 +380,11 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::TarGz
         | OutputFormat::Gzip
         | OutputFormat::Files => FormatCategory::Archive,
+        OutputFormat::Ttf
+        | OutputFormat::Otf
+        | OutputFormat::Woff
+        | OutputFormat::Woff2
+        | OutputFormat::Svg => FormatCategory::Font,
     }
 }
 
@@ -422,6 +430,11 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Mp4 => "MP4",
         OutputFormat::Webm => "WEBM",
         OutputFormat::Files => "FILES",
+        OutputFormat::Ttf => "TTF",
+        OutputFormat::Otf => "OTF",
+        OutputFormat::Woff => "WOFF",
+        OutputFormat::Woff2 => "WOFF2",
+        OutputFormat::Svg => "SVG",
     }
 }
 
@@ -467,6 +480,11 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Mp4 => "MP4 video (stream copy)",
         OutputFormat::Webm => "WebM video (stream copy)",
         OutputFormat::Files => "Extract archive into files",
+        OutputFormat::Ttf => "TrueType font",
+        OutputFormat::Otf => "OpenType font",
+        OutputFormat::Woff => "WOFF font",
+        OutputFormat::Woff2 => "WOFF2 font",
+        OutputFormat::Svg => "SVG font specimen",
     }
 }
 
@@ -3349,6 +3367,7 @@ fn paint_category_icon(
         FormatCategory::Audio => paint_audio_icon(painter, rect, color),
         FormatCategory::Video => paint_image_icon(painter, rect, color),
         FormatCategory::Archive => paint_archive_icon(painter, rect, color),
+        FormatCategory::Font => paint_text_category_icon(painter, rect, color),
     }
 }
 
@@ -3383,6 +3402,15 @@ fn paint_format_icon(painter: &egui::Painter, rect: egui::Rect, format: OutputFo
         FormatCategory::Audio => paint_audio_icon(painter, rect, GREEN),
         FormatCategory::Video => paint_image_icon(painter, rect, GREEN),
         FormatCategory::Archive => paint_archive_icon(painter, rect, GREEN),
+        FormatCategory::Font => {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Aa",
+                FontId::proportional(11.0),
+                GREEN,
+            );
+        }
     }
 }
 

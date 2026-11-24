@@ -24,10 +24,12 @@ The same data is available from the library as `native_format_registry()`.
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP | ZIP, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
 
+| Fonts | TTF, OTF, WOFF, WOFF2, TTC/OTC | TTF, OTF, WOFF, WOFF2, SVG | Every font table is copied verbatim and only the container is rewritten, so outlines, advance widths, units-per-em, the cmap and the name table survive a conversion. TTF and OTF name the same sfnt container with different outline flavours, so converting between them renames the container instead of redrawing outlines, exactly like the web handler. A `.ttc`/`.otc` collection is converted from its first face. WOFF2 input reverses the `glyf`/`loca` transform; WOFF2 output uses the null transform the format allows. SVG output is the web handler's font specimen (one `<glyph>` per mapped codepoint), not a rasterisable text document. |
+
 ## Web-only handlers not yet ported
 
 The web app (`src/handlers/index.ts`) also has dedicated handlers for vector
-tracing, fonts, EPUB/AZW3/MOBI, office documents, Typst/Pandoc, 3D models,
+tracing, EPUB/AZW3/MOBI, office documents, Typst/Pandoc, 3D models,
 SQLite, 7z/RAR/LZH, comic archives, game formats, MIDI/module music, and
 PDF rasterization. Those handlers depend on JavaScript/WASM libraries or
 external tools that do not have a verified native equivalent in this crate.
@@ -59,6 +61,11 @@ external tools that do not have a verified native equivalent in this crate.
 - **AVIF/HEIC input:** `image` 0.25 can encode AVIF through `ravif`, but decoding
   needs a native AV1 decoder (`dav1d`/`mp4parse`). HEIC also needs an HEVC
   decoder and a licence review. Neither is enabled.
+- **WOFF2 encoding:** output keeps the null `glyf`/`loca` transform, so it is
+  valid and decodes everywhere, but it does not get the format's glyph
+  pre-compression: the 35,220-byte Abel TTF becomes a 13,824-byte WOFF2 and a
+  15,836-byte WOFF. Adding the encoder side of the glyph transform is the
+  obvious next slice; nothing else depends on it.
 - **Metadata:** JPEG-to-JPEG preserves APP1 EXIF segments (and resets the
   orientation tag after pixels are rotated); MP3-to-MP3 preserves the ID3v2
   tag; FLAC-to-FLAC preserves Vorbis comments and pictures. EXIF in other image

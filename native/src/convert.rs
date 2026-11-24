@@ -10,12 +10,13 @@ use crate::audio::{
 };
 use crate::document::{extract_pdf_text, image_to_pdf, text_to_pdf};
 use crate::error::ConvertError;
+use crate::fonts::{convert_font, sniff as sniff_font};
 use crate::format::OutputFormat;
 use crate::images::{encode_image, load_image, preserve_jpeg_exif, rasterize_svg};
 use crate::options::ConversionOptions;
 use crate::shared::{
-    file_extension, is_audio_extension, is_image_input_extension, is_pdf_extension,
-    is_video_input_extension, output_name, safe_file_name, unsupported,
+    file_extension, is_audio_extension, is_font_extension, is_image_input_extension,
+    is_pdf_extension, is_video_input_extension, output_name, safe_file_name, unsupported,
 };
 use crate::text::{convert_text, encode_text};
 use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
@@ -102,6 +103,16 @@ pub fn convert_bytes_with_video_control(
             bytes: gzip_bytes(input, options.archive_compression)?,
         }]);
     }
+    if target.is_font_target() {
+        if !is_font_extension(&extension) && sniff_font(input).is_none() {
+            return Err(unsupported(&extension, target));
+        }
+        return Ok(vec![ConvertedFile {
+            name: output_name(input_name, target.extension()),
+            bytes: convert_font(input, target)?,
+        }]);
+    }
+
     if is_pdf_extension(&extension) {
         let text = extract_pdf_text(input)?;
         let bytes = match target {

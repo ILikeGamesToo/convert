@@ -10,6 +10,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Abel, an OFL text font with TrueType outlines.
+pub(crate) fn ttf_font_fixture() -> Vec<u8> {
+    include_bytes!("../testdata/abel-regular.ttf").to_vec()
+}
+
+/// Source Code Pro, an OFL text font with CFF outlines.
+pub(crate) fn otf_font_fixture() -> Vec<u8> {
+    include_bytes!("../testdata/source-code-pro-regular.otf").to_vec()
+}
+
+/// Abel's latin subset as Google Fonts serves it: a WOFF2 with the `glyf`
+/// transform applied, not just a recompressed TTF.
+pub(crate) fn woff2_font_fixture() -> Vec<u8> {
+    include_bytes!("../testdata/abel-regular.woff2").to_vec()
+}
+
 pub(crate) fn png_fixture() -> Vec<u8> {
     let image =
         image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([20, 40, 60])));

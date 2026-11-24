@@ -65,3 +65,7 @@ pub(crate) fn is_pdf_extension(extension: &str) -> bool {
 pub(crate) fn is_video_input_extension(extension: &str) -> bool {
     matches!(extension, "mp4" | "m4v" | "mov" | "mkv" | "webm")
 }
+
+pub(crate) fn is_font_extension(extension: &str) -> bool {
+    input_extensions::FONT_INPUT_EXTENSIONS.contains(&extension)
+}
