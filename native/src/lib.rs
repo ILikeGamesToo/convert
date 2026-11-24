@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+mod archive;
 mod audio;
 mod container;
 mod data;
@@ -30,6 +31,7 @@ mod streaming;
 mod text;
 mod video;
 
+use crate::archive::*;
 use crate::audio::*;
 use crate::container::*;
 use crate::document::*;
@@ -37,6 +39,7 @@ use crate::images::*;
 use crate::shared::*;
 use crate::text::*;
 use crate::video::*;
+pub use archive::extract_archive;
 pub use audio::{
     audio_output_name, audio_tracks, audio_tracks_from_path, convert_audio_to_wav_writer,
     wav_output_name, AudioBitDepth, AudioChannels, AudioTrackInfo, Mp3Bitrate,
@@ -50,12 +53,6 @@ pub use streaming::{convert_audio_file_to_writer, convert_audio_file_to_writer_w
 pub use video::{
     native_video_routes, VideoControl, VideoProgress, VideoRoute, VideoRouteInfo, VideoToolConfig,
 };
-
-const MAX_ARCHIVE_ENTRIES: usize = 10_000;
-
-const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
-
-const MAX_ARCHIVE_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ConvertedFile {
@@ -346,214 +343,6 @@ pub fn convert_batch_with_video_config(
         )?);
     }
     Ok(converted)
-}
-
-fn create_zip(
-    entries: &[(PathBuf, Vec<u8>)],
-    compression: Option<u8>,
-) -> Result<Vec<u8>, ConvertError> {
-    let cursor = Cursor::new(Vec::new());
-    let mut archive = zip::ZipWriter::new(cursor);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(compression.map(|level| i64::from(level.clamp(1, 9))));
-
-    for (name, bytes) in entries {
-        let name = name.to_string_lossy().replace('\\', "/");
-        archive.start_file(name, options)?;
-        archive.write_all(bytes)?;
-    }
-
-    Ok(archive.finish()?.into_inner())
-}
-
-fn create_tar(
-    entries: &[(PathBuf, Vec<u8>)],
-    gzip: bool,
-    compression: Option<u8>,
-) -> Result<Vec<u8>, ConvertError> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for (name, bytes) in entries {
-        let name = name.to_string_lossy().replace('\\', "/");
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_cksum();
-        builder.append_data(&mut header, name, bytes.as_slice())?;
-    }
-    let bytes = builder.into_inner()?;
-    if gzip {
-        gzip_bytes(&bytes, compression)
-    } else {
-        Ok(bytes)
-    }
-}
-
-fn gzip_bytes(input: &[u8], compression: Option<u8>) -> Result<Vec<u8>, ConvertError> {
-    let level = compression
-        .unwrap_or(ConversionOptions::DEFAULT_COMPRESSION_LEVEL)
-        .clamp(1, 9);
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level.into()));
-    encoder.write_all(input)?;
-    Ok(encoder.finish()?)
-}
-
-/// Extracts a ZIP, TAR, TAR.GZ or GZIP archive into independent files.
-/// Entry names are normalized to safe relative paths; absolute paths and
-/// parent-directory components are rejected instead of being written outside
-/// the output directory.
-pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFile>, ConvertError> {
-    let lower_name = input_name.to_ascii_lowercase();
-    let mut outputs = Vec::new();
-    let mut names = HashSet::new();
-    let mut total_bytes = 0_u64;
-
-    if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
-        let decoder = flate2::read::GzDecoder::new(Cursor::new(input));
-        extract_tar_entries(decoder, &mut outputs, &mut names, &mut total_bytes)?;
-    } else if lower_name.ends_with(".tar") {
-        extract_tar_entries(
-            Cursor::new(input),
-            &mut outputs,
-            &mut names,
-            &mut total_bytes,
-        )?;
-    } else if lower_name.ends_with(".zip") {
-        extract_zip_entries(input, &mut outputs, &mut names, &mut total_bytes)?;
-    } else if lower_name.ends_with(".gz") {
-        let name = Path::new(input_name)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_suffix(".gz"))
-            .filter(|name| !name.is_empty())
-            .unwrap_or("extracted");
-        let mut decoder = flate2::read::GzDecoder::new(Cursor::new(input));
-        let data = read_archive_entry(&mut decoder, MAX_ARCHIVE_ENTRY_BYTES)?;
-        push_archive_entry(&mut outputs, &mut names, &mut total_bytes, name, data)?;
-    } else {
-        return Err(unsupported(
-            &file_extension(input_name),
-            OutputFormat::Files,
-        ));
-    }
-
-    if outputs.is_empty() {
-        return Err(ConvertError::NoArchiveEntries);
-    }
-    Ok(outputs)
-}
-
-fn extract_zip_entries(
-    input: &[u8],
-    outputs: &mut Vec<ConvertedFile>,
-    names: &mut HashSet<PathBuf>,
-    total_bytes: &mut u64,
-) -> Result<(), ConvertError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
-    if archive.len() > MAX_ARCHIVE_ENTRIES {
-        return Err(ConvertError::ArchiveTooManyEntries {
-            count: archive.len(),
-            max: MAX_ARCHIVE_ENTRIES,
-        });
-    }
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().to_owned();
-        let data = read_archive_entry(&mut entry, MAX_ARCHIVE_ENTRY_BYTES)?;
-        push_archive_entry(outputs, names, total_bytes, &name, data)?;
-    }
-    Ok(())
-}
-
-fn extract_tar_entries<R: Read>(
-    reader: R,
-    outputs: &mut Vec<ConvertedFile>,
-    names: &mut HashSet<PathBuf>,
-    total_bytes: &mut u64,
-) -> Result<(), ConvertError> {
-    let mut archive = tar::Archive::new(reader);
-    let mut count = 0_usize;
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        count += 1;
-        if count > MAX_ARCHIVE_ENTRIES {
-            return Err(ConvertError::ArchiveTooManyEntries {
-                count,
-                max: MAX_ARCHIVE_ENTRIES,
-            });
-        }
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let path = entry.path()?.to_string_lossy().into_owned();
-        let data = read_archive_entry(&mut entry, MAX_ARCHIVE_ENTRY_BYTES)?;
-        push_archive_entry(outputs, names, total_bytes, &path, data)?;
-    }
-    Ok(())
-}
-
-fn read_archive_entry<R: Read>(reader: &mut R, limit: u64) -> Result<Vec<u8>, ConvertError> {
-    let mut data = Vec::new();
-    reader.take(limit + 1).read_to_end(&mut data)?;
-    if data.len() as u64 > limit {
-        return Err(ConvertError::ArchiveTooLarge {
-            max: MAX_ARCHIVE_BYTES,
-        });
-    }
-    Ok(data)
-}
-
-fn push_archive_entry(
-    outputs: &mut Vec<ConvertedFile>,
-    names: &mut HashSet<PathBuf>,
-    total_bytes: &mut u64,
-    name: &str,
-    data: Vec<u8>,
-) -> Result<(), ConvertError> {
-    let path = safe_archive_path(name)?;
-    if !names.insert(path.clone()) {
-        return Err(ConvertError::DuplicateArchiveEntryName(
-            path.display().to_string(),
-        ));
-    }
-    *total_bytes = total_bytes.saturating_add(data.len() as u64);
-    if *total_bytes > MAX_ARCHIVE_BYTES {
-        return Err(ConvertError::ArchiveTooLarge {
-            max: MAX_ARCHIVE_BYTES,
-        });
-    }
-    outputs.push(ConvertedFile {
-        name: path,
-        bytes: data,
-    });
-    Ok(())
-}
-
-fn safe_archive_path(name: &str) -> Result<PathBuf, ConvertError> {
-    let normalized = name.replace('\\', "/");
-    if normalized.is_empty() || normalized.contains('\0') || normalized.starts_with('/') {
-        return Err(ConvertError::UnsafeArchivePath(name.to_owned()));
-    }
-    let mut safe = PathBuf::new();
-    for part in normalized.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        if part == ".." || part.contains(':') {
-            return Err(ConvertError::UnsafeArchivePath(name.to_owned()));
-        }
-        safe.push(part);
-    }
-    if safe.as_os_str().is_empty() {
-        return Err(ConvertError::UnsafeArchivePath(name.to_owned()));
-    }
-    Ok(safe)
 }
 
 #[cfg(test)]
