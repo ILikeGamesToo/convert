@@ -29,6 +29,11 @@ gamut-core = "3.0.0"
 # licensed substitutes for the 14 standard fonts and the predefined CMaps,
 # so a PDF that embeds nothing still draws real glyphs.
 hayro = "0.9.0"
+# PDF page vectorisation. `hayro-svg` is the same project's SVG backend
+# (Apache-2.0 OR MIT): it walks the interpreted page and writes an SVG document
+# instead of a bitmap. Its `embed-fonts`/`embed-cmaps` defaults mirror `hayro`'s,
+# so a page that embeds nothing still outlines real glyphs.
+hayro-svg = "0.9.0"
 heifer = { version = "0.5.1", default-features = false }
 image = { version = "0.25", default-features = false, features = [
     "bmp",

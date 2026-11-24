@@ -24,6 +24,7 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::peniko::ImageAlphaType;
 use hayro::vello_cpu::Pixmap;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
+use hayro_svg::{RenderCache as SvgRenderCache, SvgRenderSettings};
 use image::DynamicImage;
 
 /// The largest page edge this app will rasterise, in pixels. The rasteriser
@@ -76,6 +77,57 @@ where
         Ok(result) => result,
         Err(_) => Err(ConvertError::Pdf(
             "the PDF renderer stopped on a malformed document".to_owned(),
+        )),
+    }
+}
+
+/// The number of pages in a PDF, without rendering any of them.
+///
+/// Reading the page tree costs far less than drawing a page, so a caller can
+/// size a progress bar before the first page is rendered. An encrypted or
+/// unreadable document reports the same error `render_pages` would.
+pub(crate) fn page_count(bytes: &[u8]) -> Result<usize, ConvertError> {
+    Ok(open(bytes)?.pages().len())
+}
+
+/// Writes every page of a PDF as a standalone SVG document, one page at a time.
+///
+/// `emit` receives the zero-based page index and the SVG text, in page order.
+/// Returning an error from `emit` stops the conversion and propagates that
+/// error. The page is drawn on an opaque white background, matching the raster
+/// path, so a page that leans on transparency still reads as paper.
+pub(crate) fn render_svg_pages<F>(bytes: &[u8], mut emit: F) -> Result<(), ConvertError>
+where
+    F: FnMut(usize, String) -> Result<(), ConvertError>,
+{
+    let render = || {
+        let document = open(bytes)?;
+        let cache = SvgRenderCache::new();
+        let settings = InterpreterSettings::default();
+        let render_settings = SvgRenderSettings {
+            bg_color: [255, 255, 255, 255],
+        };
+        for (index, page) in document.pages().iter().enumerate() {
+            let (width, height) = page.render_dimensions();
+            if !(width.is_finite() && height.is_finite()) || width < 1.0 || height < 1.0 {
+                return Err(ConvertError::Pdf(format!(
+                    "page {} has no usable size ({width} x {height})",
+                    index + 1
+                )));
+            }
+            emit(
+                index,
+                hayro_svg::convert(page, &cache, &settings, &render_settings),
+            )?;
+        }
+        Ok(())
+    };
+    // The SVG backend documents panics on malformed input as a known gap, the
+    // same as the rasteriser, so it is caught at the same boundary.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)) {
+        Ok(result) => result,
+        Err(_) => Err(ConvertError::Pdf(
+            "the SVG renderer stopped on a malformed document".to_owned(),
         )),
     }
 }
@@ -309,6 +361,57 @@ mod tests {
             .collect();
         assert_eq!(names, ["report_0.png", "report_1.png"]);
         assert!(files.iter().all(|file| file.bytes.starts_with(b"\x89PNG")));
+    }
+
+    fn render_svg_all(bytes: &[u8]) -> Result<Vec<String>, ConvertError> {
+        let mut pages = Vec::new();
+        render_svg_pages(bytes, |_, svg| {
+            pages.push(svg);
+            Ok(())
+        })?;
+        Ok(pages)
+    }
+
+    #[test]
+    fn counts_the_pages_of_a_multi_page_pdf() {
+        let bytes = sample_pdf(&[(200.0, 100.0), (100.0, 50.0)]);
+        assert_eq!(page_count(&bytes).unwrap(), 2);
+        assert!(matches!(
+            page_count(&encrypted_pdf()),
+            Err(ConvertError::PdfEncrypted)
+        ));
+    }
+
+    #[test]
+    fn writes_an_svg_page_per_pdf_page() {
+        let bytes = sample_pdf(&[(200.0, 100.0), (100.0, 50.0)]);
+        let files =
+            crate::convert::convert_bytes("report.pdf", &bytes, OutputFormat::SvgPage).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|file| file.name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["report_0.svg", "report_1.svg"]);
+
+        let pages = render_svg_all(&bytes).unwrap();
+        assert_eq!(pages.len(), 2);
+        for (page, expected) in pages.iter().zip(["0 0 200 100", "0 0 100 50"]) {
+            assert!(page.starts_with("<svg"), "expected an SVG document: {page}");
+            assert!(
+                page.contains(&format!("viewBox=\"{expected}\"")),
+                "expected the page's own point size as the viewBox: {page}"
+            );
+            // The rectangle stays geometry: the source's black fill is written
+            // as a colour, not sampled into a bitmap.
+            assert!(
+                page.contains("fill=\"#000000\""),
+                "expected vector ink: {page}"
+            );
+            assert!(
+                !page.contains("<image"),
+                "expected no raster fallback: {page}"
+            );
+        }
     }
 
     #[test]

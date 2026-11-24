@@ -117,6 +117,47 @@ pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFi
     Ok(outputs)
 }
 
+/// How many files an archive holds, without extracting them. Directory entries
+/// are skipped, matching what `extract_archive` returns. Counting a compressed
+/// tarball decompresses it, so this costs about as much as listing it.
+pub fn archive_entry_count(input_name: &str, input: &[u8]) -> Result<usize, ConvertError> {
+    let lower_name = input_name.to_ascii_lowercase();
+    if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
+        return count_tar_entries(flate2::read::GzDecoder::new(Cursor::new(input)));
+    }
+    if lower_name.ends_with(".tar") {
+        return count_tar_entries(Cursor::new(input));
+    }
+    if lower_name.ends_with(".zip") {
+        let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
+        let mut count = 0;
+        for index in 0..archive.len() {
+            if !archive.by_index(index)?.is_dir() {
+                count += 1;
+            }
+        }
+        return Ok(count);
+    }
+    if lower_name.ends_with(".gz") {
+        return Ok(1);
+    }
+    Err(unsupported(
+        &file_extension(input_name),
+        OutputFormat::Files,
+    ))
+}
+
+fn count_tar_entries<R: Read>(reader: R) -> Result<usize, ConvertError> {
+    let mut archive = tar::Archive::new(reader);
+    let mut count = 0;
+    for entry in archive.entries()? {
+        if entry?.header().entry_type().is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 pub(crate) fn extract_zip_entries(
     input: &[u8],
     outputs: &mut Vec<ConvertedFile>,

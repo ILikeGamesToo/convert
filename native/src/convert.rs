@@ -2,7 +2,9 @@
 
 //! Conversion entry points that route an input to the per-medium handlers.
 
-use crate::archive::{create_tar, create_zip, extract_archive, gzip_bytes, MAX_ARCHIVE_ENTRIES};
+use crate::archive::{
+    archive_entry_count, create_tar, create_zip, extract_archive, gzip_bytes, MAX_ARCHIVE_ENTRIES,
+};
 use crate::audio::{
     apply_audio_options, decode_audio, encode_aiff, encode_au, encode_flac, encode_mp3,
     encode_opus, encode_wav, mp3_sample_rate, opus_sample_rate, preserve_flac_tags,
@@ -22,7 +24,10 @@ use crate::shared::{
 };
 use crate::text::{convert_text, encode_text};
 use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug)]
 pub struct ConvertedFile {
@@ -116,6 +121,9 @@ pub fn convert_bytes_with_video_control(
     }
 
     if is_pdf_extension(&extension) {
+        if target == OutputFormat::SvgPage {
+            return render_pdf_svg_pages(input_name, input);
+        }
         if target.image_format().is_some() {
             return render_pdf_pages(input_name, input, target, options);
         }
@@ -250,6 +258,46 @@ fn render_pdf_pages(
         Ok(())
     })?;
     Ok(pages)
+}
+
+/// Writes every page of a PDF as a standalone SVG document, one output file per
+/// page with the same zero-based suffix the raster path uses. The document is
+/// vector, so nothing is rasterised and nothing is encoded.
+fn render_pdf_svg_pages(
+    input_name: &str,
+    input: &[u8],
+) -> Result<Vec<ConvertedFile>, ConvertError> {
+    let mut pages = Vec::new();
+    pdf::render_svg_pages(input, |index, svg| {
+        pages.push(ConvertedFile {
+            name: page_output_name(input_name, OutputFormat::SvgPage.extension(), index),
+            bytes: svg.into_bytes(),
+        });
+        Ok(())
+    })?;
+    Ok(pages)
+}
+
+/// How many output files converting `path` to `target` will produce, when that
+/// can be counted without converting. A PDF page target gives one file per
+/// page, which is why a progress bar cannot assume one file per input; archive
+/// extraction gives one file per entry. Every other target gives one file.
+///
+/// Counting a PDF reads and parses the document, and counting an archive reads
+/// its index, so this costs a second read of the input. It is meant for sizing
+/// a progress bar before the conversion starts, not for hot paths.
+pub fn planned_output_count(path: &Path, target: OutputFormat) -> Option<usize> {
+    let file_name = path.to_string_lossy();
+    let extension = file_extension(&file_name);
+    if (target == OutputFormat::SvgPage || target.image_format().is_some())
+        && is_pdf_extension(&extension)
+    {
+        return pdf::page_count(&std::fs::read(path).ok()?).ok();
+    }
+    if target == OutputFormat::Files {
+        return archive_entry_count(&file_name, &std::fs::read(path).ok()?).ok();
+    }
+    Some(1)
 }
 
 pub fn convert_batch(

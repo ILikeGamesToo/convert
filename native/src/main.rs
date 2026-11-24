@@ -17,9 +17,9 @@ use std::{
 use convert_to_it_native::{
     audio_output_name, audio_tracks_from_path, convert_audio_file_to_writer_with_cancel,
     convert_batch_with_options, convert_bytes_with_video_config, input_format,
-    input_format::InputFormat, supported_input_extensions, AudioBitDepth, AudioChannels,
-    AudioTrackInfo, ConversionOptions, ConvertError, Mp3Bitrate, OutputFormat, PdfImageFit,
-    PdfOrientation, PdfPageSize, VideoToolConfig,
+    input_format::InputFormat, planned_output_count, supported_input_extensions, AudioBitDepth,
+    AudioChannels, AudioTrackInfo, ConversionOptions, ConvertError, Mp3Bitrate, OutputFormat,
+    PdfImageFit, PdfOrientation, PdfPageSize, VideoToolConfig,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect};
@@ -280,7 +280,11 @@ struct ConvertApp {
 }
 
 enum ConversionEvent {
-    Progress { completed: usize, message: String },
+    Progress {
+        completed: usize,
+        total: usize,
+        message: String,
+    },
     Finished(Result<String, String>),
     Cancelled,
 }
@@ -357,6 +361,10 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Qoi
         | OutputFormat::Hdr
         | OutputFormat::Farbfeld => FormatCategory::Image,
+        // A PDF page rendered as SVG is a page you can look at or drop into a
+        // layout, so it belongs beside the raster targets rather than with the
+        // documents the app reads.
+        OutputFormat::SvgPage => FormatCategory::Image,
         OutputFormat::Pdf => FormatCategory::Document,
         OutputFormat::Text
         | OutputFormat::TextUtf8NoBom
@@ -435,6 +443,7 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Woff => "WOFF",
         OutputFormat::Woff2 => "WOFF2",
         OutputFormat::Svg => "SVG",
+        OutputFormat::SvgPage => "SVG PAGE",
     }
 }
 
@@ -485,6 +494,7 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Woff => "WOFF font",
         OutputFormat::Woff2 => "WOFF2 font",
         OutputFormat::Svg => "SVG font specimen",
+        OutputFormat::SvgPage => "SVG page",
     }
 }
 
@@ -2877,7 +2887,6 @@ impl ConvertApp {
             .extension_label()
             .to_owned();
         let target_label = format!(".{}", format_extension(target));
-        let total = conversion_step_total(inputs.len(), target);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (sender, receiver) = mpsc::channel();
@@ -2885,7 +2894,9 @@ impl ConvertApp {
             receiver,
             cancel,
             completed: 0,
-            total,
+            // The worker counts the real work before it reports the first
+            // step, so the bar starts empty rather than at a guessed total.
+            total: 0,
             message: "Preparing...".to_owned(),
             source_label,
             target_label,
@@ -2902,8 +2913,12 @@ impl ConvertApp {
                 options,
                 &output_directory,
                 worker_cancel.as_ref(),
-                |completed, message| {
-                    let _ = progress_sender.send(ConversionEvent::Progress { completed, message });
+                |completed, total, message| {
+                    let _ = progress_sender.send(ConversionEvent::Progress {
+                        completed,
+                        total,
+                        message,
+                    });
                 },
             );
             let event = match result {
@@ -2928,9 +2943,14 @@ impl ConvertApp {
                 None => return,
             };
             match received {
-                Ok(ConversionEvent::Progress { completed, message }) => {
+                Ok(ConversionEvent::Progress {
+                    completed,
+                    total,
+                    message,
+                }) => {
                     if let Some(job) = self.conversion_job.as_mut() {
                         job.completed = completed;
+                        job.total = total;
                         if !job.cancel.load(Ordering::Relaxed) {
                             job.message = message;
                         }
@@ -3475,17 +3495,32 @@ enum ConversionFailure {
     Message(String),
 }
 
-fn conversion_step_total(input_count: usize, target: OutputFormat) -> usize {
+/// The number of steps a directory conversion will take, so the progress bar
+/// counts work that actually happens.
+///
+/// Every step the loop below reports is one unit: reading an input, converting
+/// it, and saving each file it produced. A fixed multiplier per input cannot
+/// express that, because a PDF rasterised to images writes one file per page
+/// and the page count is only known by asking the converter. Archives build one
+/// file from the whole batch, so they count differently.
+fn planned_step_total(inputs: &[PathBuf], target: OutputFormat) -> usize {
     if matches!(
         target,
         OutputFormat::Zip | OutputFormat::Tar | OutputFormat::TarGz
     ) {
-        input_count.saturating_add(2)
-    } else if format_category(target) == FormatCategory::Audio {
-        input_count.saturating_mul(2)
-    } else {
-        input_count.saturating_mul(3)
+        return inputs.len().saturating_add(2);
     }
+    if format_category(target) == FormatCategory::Audio {
+        return inputs.len().saturating_mul(2);
+    }
+    inputs
+        .iter()
+        .map(|input| {
+            // A count that cannot be taken falls back to the smallest possible
+            // output count; the conversion itself then reports the real error.
+            2usize.saturating_add(planned_output_count(input, target).unwrap_or(1))
+        })
+        .sum()
 }
 
 fn convert_to_directory(
@@ -3494,8 +3529,12 @@ fn convert_to_directory(
     options: ConversionOptions,
     output_directory: &Path,
     cancel: &AtomicBool,
-    mut report: impl FnMut(usize, String),
+    mut report: impl FnMut(usize, usize, String),
 ) -> Result<String, ConversionFailure> {
+    // Count the work before the first step so every report carries the same
+    // total. The bar then reaches 100% exactly when the last file is saved.
+    let total = planned_step_total(inputs, target);
+    let mut report = |completed: usize, message: String| report(completed, total, message);
     let mut completed = 0;
     let mut written = Vec::new();
     let video = VideoToolConfig::default();
@@ -4250,7 +4289,8 @@ fn main() {
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
-                OutputFormat::Gzip
+                OutputFormat::Gzip,
+                OutputFormat::SvgPage
             ]
         );
     }
@@ -4605,7 +4645,7 @@ fn main() {
             ConversionOptions::default(),
             &output_directory,
             &AtomicBool::new(false),
-            |completed, message| messages.push((completed, message)),
+            |completed, _total, message| messages.push((completed, message)),
         )
         .unwrap();
         let written = output_directory.join("sample-vp9-opus.webm");
@@ -4624,6 +4664,78 @@ fn main() {
             .iter()
             .any(|(_, message)| message.starts_with("Saved")));
         assert_eq!(messages.last().unwrap().0, 3);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A PDF with one page per size, each carrying a filled rectangle. Built
+    /// here so the progress test does not depend on a committed multi-page
+    /// fixture.
+    fn multi_page_pdf(pages: &[(f32, f32)]) -> Vec<u8> {
+        use pdf_writer::{Content, Pdf, Rect, Ref};
+        let mut pdf = Pdf::new();
+        let catalog_id = Ref::new(1);
+        let pages_id = Ref::new(2);
+        pdf.catalog(catalog_id).pages(pages_id);
+        let kids: Vec<Ref> = (0..pages.len())
+            .map(|index| Ref::new(3 + index as i32 * 2))
+            .collect();
+        pdf.pages(pages_id).kids(kids).count(pages.len() as i32);
+        for (index, (width, height)) in pages.iter().copied().enumerate() {
+            let page_id = Ref::new(3 + index as i32 * 2);
+            let content_id = Ref::new(4 + index as i32 * 2);
+            let mut content = Content::new();
+            content.set_fill_color([0.0, 0.0, 0.0]);
+            content.rect(20.0, 20.0, 40.0, 40.0);
+            content.fill_nonzero();
+            let content = content.finish();
+            {
+                let mut page = pdf.page(page_id);
+                page.parent(pages_id)
+                    .media_box(Rect::new(0.0, 0.0, width, height))
+                    .contents(content_id);
+            }
+            pdf.stream(content_id, &content);
+        }
+        pdf.finish()
+    }
+
+    #[test]
+    fn multi_page_pdf_reports_a_total_that_matches_the_work() {
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-gui-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let output_directory = directory.join("out");
+        std::fs::create_dir_all(&output_directory).unwrap();
+        let input = directory.join("report.pdf");
+        std::fs::write(
+            &input,
+            multi_page_pdf(&[(200.0, 100.0), (100.0, 50.0), (80.0, 80.0)]),
+        )
+        .unwrap();
+
+        let mut messages = Vec::new();
+        let summary = convert_to_directory(
+            &[input],
+            OutputFormat::Png,
+            ConversionOptions::default(),
+            &output_directory,
+            &AtomicBool::new(false),
+            |completed, total, message| messages.push((completed, total, message)),
+        )
+        .unwrap();
+
+        // Three pages means three output files: a read step and a convert step
+        // on top of one save per page, so five steps and never three.
+        let totals: std::collections::BTreeSet<usize> =
+            messages.iter().map(|(_, total, _)| *total).collect();
+        assert_eq!(totals, std::iter::once(5).collect());
+        assert_eq!(messages.last().unwrap().0, 5);
+        assert!(summary.contains("Created 3 file(s)"));
+        for page in 0..3 {
+            assert!(output_directory
+                .join(format!("report_{page}.png"))
+                .is_file());
+        }
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -4651,7 +4763,7 @@ fn main() {
             ConversionOptions::default(),
             &output_directory,
             &AtomicBool::new(false),
-            |completed, message| messages.push((completed, message)),
+            |completed, _total, message| messages.push((completed, message)),
         )
         .unwrap();
         let webm = std::fs::read(output_directory.join("synthetic.webm")).unwrap();
@@ -4670,7 +4782,7 @@ fn main() {
             ConversionOptions::default(),
             &back_directory,
             &AtomicBool::new(false),
-            |_, _| {},
+            |_, _, _| {},
         )
         .unwrap();
         assert!(back_summary.contains("synthetic.mp4"));
@@ -4692,7 +4804,7 @@ fn main() {
                 },
                 &output_directory,
                 &AtomicBool::new(false),
-                |_, _| {},
+                |_, _, _| {},
             )
             .unwrap();
             assert!(summary.contains(&format!("synthetic.{extension}")));
@@ -4715,7 +4827,7 @@ fn main() {
             },
             &empty_output,
             &AtomicBool::new(false),
-            |_, _| {},
+            |_, _, _| {},
         )
         .unwrap_err();
         match error {
@@ -4862,6 +4974,7 @@ fn main() {
         sender
             .send(ConversionEvent::Progress {
                 completed: 2,
+                total: 5,
                 message: "Saving output.png...".to_owned(),
             })
             .unwrap();
@@ -4874,6 +4987,7 @@ fn main() {
 
         let job = app.conversion_job.as_ref().unwrap();
         assert_eq!(job.completed, 2);
+        assert_eq!(job.total, 5);
         assert_eq!(job.message, "Saving output.png...");
     }
 
@@ -4975,7 +5089,7 @@ fn main() {
             ConversionOptions::default(),
             &output_directory,
             &AtomicBool::new(false),
-            |completed, _| last_step = completed,
+            |completed, _total, _message| last_step = completed,
         )
         .unwrap();
 
@@ -4996,7 +5110,7 @@ fn main() {
             ConversionOptions::default(),
             Path::new("unused"),
             &cancel,
-            |_, _| {},
+            |_, _, _| {},
         );
 
         assert!(matches!(result, Err(ConversionFailure::Cancelled)));

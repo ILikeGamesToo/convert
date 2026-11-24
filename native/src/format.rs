@@ -62,10 +62,12 @@ pub enum OutputFormat {
     Woff2,
     /// Write the font's glyphs as an SVG font specimen.
     Svg,
+    /// Write each PDF page as a standalone SVG vector document.
+    SvgPage,
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -111,6 +113,7 @@ impl OutputFormat {
         Self::Woff,
         Self::Woff2,
         Self::Svg,
+        Self::SvgPage,
     ];
 
     pub fn label(self) -> &'static str {
@@ -160,6 +163,7 @@ impl OutputFormat {
             Self::Woff => "WOFF font",
             Self::Woff2 => "WOFF2 font",
             Self::Svg => "SVG font",
+            Self::SvgPage => "SVG page",
         }
     }
 
@@ -250,7 +254,7 @@ impl OutputFormat {
             Self::Otf => "otf",
             Self::Woff => "woff",
             Self::Woff2 => "woff2",
-            Self::Svg => "svg",
+            Self::Svg | Self::SvgPage => "svg",
         }
     }
 
@@ -262,6 +266,12 @@ impl OutputFormat {
             .trim()
             .trim_start_matches('.')
             .to_ascii_lowercase();
+        // `svg` stays the font specimen so an existing font workflow keeps
+        // resolving as it did; the PDF page target needs its own name because
+        // both write the same `.svg` extension.
+        if extension == "svg-page" || extension == "svgpage" {
+            return Some(Self::SvgPage);
+        }
         let normalized = match extension.as_str() {
             "jpeg" => "jpg",
             "tif" => "tiff",
@@ -319,6 +329,7 @@ impl OutputFormat {
             Self::Ttf | Self::Otf | Self::Woff | Self::Woff2 | Self::Svg => {
                 is_font_extension(&extension)
             }
+            Self::SvgPage => is_pdf_extension(&extension),
         }
     }
 }
@@ -403,6 +414,7 @@ mod tests {
         assert!(pdf.outputs.contains(&OutputFormat::Jpeg));
         assert!(pdf.outputs.contains(&OutputFormat::Webp));
         assert!(!pdf.outputs.contains(&OutputFormat::Svg));
+        assert!(pdf.outputs.contains(&OutputFormat::SvgPage));
 
         let archive = registry
             .iter()

@@ -30,7 +30,7 @@ pub use audio::{
 pub use convert::{
     convert_batch, convert_batch_with_options, convert_batch_with_video_config, convert_bytes,
     convert_bytes_with_options, convert_bytes_with_video_config, convert_bytes_with_video_control,
-    ConvertedFile,
+    planned_output_count, ConvertedFile,
 };
 pub use document::{PdfImageFit, PdfOrientation, PdfPageSize};
 pub use error::ConvertError;
