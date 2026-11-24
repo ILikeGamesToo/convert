@@ -33,11 +33,18 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # `libgtk-3-dev` drags in everything the window links against, but the
+      # X11 keymap bridge is dlopened at startup rather than linked, so it is
+      # invisible to the linker and to `cargo build`. `libxkbcommon-dev` ships
+      # the headers and `libxkbcommon.so`; the library the app actually asks
+      # for is `libxkbcommon-x11.so.0`, which only `libxkbcommon-x11-0`
+      # provides. Without it the release binary panics on first launch on a
+      # machine that has exactly this list installed.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libx11-dev libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libxcursor-dev
+          sudo apt-get install -y libgtk-3-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxrandr-dev libxi-dev libxcursor-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
