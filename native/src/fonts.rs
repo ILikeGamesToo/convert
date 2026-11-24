@@ -681,6 +681,22 @@ mod tests {
     }
 
     #[test]
+    fn ttf_and_otf_output_relabel_the_same_container() {
+        // TTF and OTF name the same sfnt container and this module copies every
+        // outline table verbatim, so both targets must produce identical bytes.
+        // A difference here would mean outlines had been rewritten, which is the
+        // lossy path this module deliberately avoids: converting loses
+        // cubic-to-quadratic fidelity in one direction and TrueType hinting in
+        // both, so a TTF named as OTF keeps its `glyf` outlines on purpose.
+        for source in [ttf_font_fixture(), otf_font_fixture()] {
+            assert_eq!(
+                convert_font(&source, OutputFormat::Ttf).unwrap(),
+                convert_font(&source, OutputFormat::Otf).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn converted_fonts_still_render_glyphs() {
         for (source, family) in [
             (ttf_font_fixture(), "Abel"),
