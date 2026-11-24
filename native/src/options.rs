@@ -2,8 +2,8 @@
 
 //! User-selected encoding options.
 
+use crate::document::{PdfImageFit, PdfOrientation, PdfPageSize};
 use crate::{AudioBitDepth, AudioChannels, Mp3Bitrate};
-use crate::{PdfImageFit, PdfOrientation, PdfPageSize};
 use serde::{Deserialize, Serialize};
 
 /// User-selected encoding options. `None` keeps the encoder's default.
