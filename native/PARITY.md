@@ -19,7 +19,7 @@ The same data is available from the library as `native_format_registry()`.
 | --- | --- | --- | --- |
 | Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
-| PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro`, one file per page; see [PDF rasterisation](#pdf-rasterisation) for the scale, the naming and the limits. |
+| PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, SVG pages, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro` or vectorise through `hayro-svg`, one file per page; see [PDF rasterisation](#pdf-rasterisation) and [PDF page SVGs](#pdf-page-svgs) for the scale, the naming and the limits. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. MP3-to-MP3 keeps its ID3v2 tag; FLAC-to-FLAC keeps Vorbis comments and pictures. |
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP | ZIP, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
@@ -115,15 +115,31 @@ reported the same way rather than taking the app down. The gaps `hayro`
 documents for every viewer that is not Acrobat — knockout groups, CMYK blending,
 3D content — come with it.
 
-PDF→SVG is deliberately not wired up, although the capability is proved:
-`hayro-svg` (same version and licence) converted the same fixture to a valid
-388 KB SVG. It is deferred because the app's only SVG target is the font
-specimen — `OutputFormat::Svg`, labelled "SVG font" and filed under the GUI's
-Font category — so granting PDF that target would offer "SVG font" for a PDF and
-produce a page. Doing it honestly needs a page-SVG target or a split of that
-variant's label and category, which is a registry change, not a renderer one. No
-`hayro-svg` dependency ships until then, because an unused backend is dead
-weight in the binary.
+## PDF page SVGs
+
+`hayro-svg` 0.9 (same project and licence, pure Rust) walks the same
+interpreted page and writes a vector document instead of a bitmap. It ships as
+its own target rather than as a second meaning for `svg`, because `svg` is
+already the font specimen: `OutputFormat::Svg` stays labelled "SVG font" so an
+existing font workflow resolves as it did, and `OutputFormat::SvgPage` is the
+one the PDF row offers — "SVG page" under the GUI's Image category, `--format
+svg-page` on the CLI, and `.svg` as the file extension for both. The two names
+are the whole of the split, and `--list-formats` prints extensions, so both rows
+end in `svg` while only `svg-page` selects a page from the CLI.
+
+Everything about page handling is shared with rasterisation: one output file per
+page named `<stem>_<page>.svg`, a zero-based page number, and each page written
+as soon as it is converted. Nothing is sampled, so the 8192-pixel edge and
+4096 x 4096 area limits do not apply. The document is sized in points — the
+`viewBox` is the page's own size (`0 0 594.96 841.92` for A4) — and an opaque
+white background matches the raster path. Shapes stay geometry and text becomes
+glyph outlines (`<path>`/`<use>`), so the fixture's rules are `<rect>` elements,
+there is no `<image>` fallback, and the text is not selectable in the SVG.
+`hayro-svg`'s default `embed-fonts`/`embed-cmaps` features carry the same
+permissive substitutes as the rasteriser, so a page that embeds no font still
+outlines real glyphs. The committed fixture converts to a valid 388 KB SVG, and
+`native/src/pdf.rs` asserts the viewBox, the vector fill and the absence of a
+raster fallback.
 
 ## Known blockers
 
