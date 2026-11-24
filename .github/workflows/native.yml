@@ -46,6 +46,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxrandr-dev libxi-dev libxcursor-dev
 
+      # The four real-ffmpeg tests skip when no ffmpeg is on PATH. Installing
+      # it here means they run instead of skip, and CONVERT2IT_REQUIRE_FFMPEG
+      # below turns a missing one into a failure rather than a green run that
+      # exercised nothing.
+      - name: Install ffmpeg
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ffmpeg
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -59,6 +67,10 @@ jobs:
 
       - name: Run tests
         run: cargo test
+        env:
+          # Only the Linux job is guaranteed an ffmpeg, because it installs one
+          # above. On the other two platforms a missing ffmpeg is a skip.
+          CONVERT2IT_REQUIRE_FFMPEG: ${{ runner.os == 'Linux' && '1' || '' }}
 
       - name: Build release
         run: cargo build --release
