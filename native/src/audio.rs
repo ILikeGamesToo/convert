@@ -2792,3 +2792,2754 @@ pub(crate) fn encode_flac(
         .map_err(|error| ConvertError::Audio(error.to_string()))?;
     Ok(sink.as_slice().to_vec())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::convert::{convert_bytes, convert_bytes_with_options};
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    use crate::options::ConversionOptions;
+
+    use crate::test_support::{
+        assert_audible, assert_mp3_tone, fixture_path, mp3_first_frame_bitrate, parse_wav, rms,
+        stream_temp_dir, stream_wav, wav_24_bit_at, wav_24_bit_samples, wav_channels_at,
+        wav_fixture, wav_fixture_at, wav_float_samples, wav_layout, wav_tone_at, ParsedWav,
+    };
+    use std::{io::Cursor, path::PathBuf};
+    fn flac_24_bit_samples(bytes: &[u8]) -> Vec<i32> {
+        let mut reader = claxon::FlacReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 24);
+        reader.samples().map(Result::unwrap).collect()
+    }
+    fn flac_16_bit_samples(bytes: &[u8]) -> Vec<i32> {
+        let mut reader = claxon::FlacReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 16);
+        reader.samples().map(Result::unwrap).collect()
+    }
+    /// The deterministic 16-bit truncation the old bypass produced: no dither,
+    /// just the same f32 samples rounded and clamped.
+    fn undithered_i16(samples: &[f32]) -> Vec<i16> {
+        samples
+            .iter()
+            .map(|&sample| sample_to_i16(sample))
+            .collect()
+    }
+    /// Encodes a 5.1 Ogg Opus stream with the Vorbis channel order the Opus
+    /// mapping family expects: FL, FC, FR, RL, RR, LFE.
+    fn opus_surround_fixture(channels: [f32; 6]) -> Vec<u8> {
+        use opus_pure::{Application, OggOpusWriter, OpusHead, OpusMSEncoder, MAX_PACKET_BYTES};
+
+        let frame_size = 960;
+        let mut encoder = OpusMSEncoder::new(48_000, 6, 1, Application::Audio).unwrap();
+        let head = OpusHead::for_ms_encoder(&encoder, 48_000);
+        let mut writer = OggOpusWriter::new(Vec::new(), head).unwrap();
+        let mut block = vec![0.0_f32; frame_size * 6];
+        let mut packet = vec![0_u8; MAX_PACKET_BYTES];
+        for _ in 0..12 {
+            for frame in 0..frame_size {
+                block[frame * 6..(frame + 1) * 6].copy_from_slice(&channels);
+            }
+            let len = encoder.encode(&block, frame_size, &mut packet).unwrap();
+            writer.write_packet(&packet[..len]).unwrap();
+        }
+        writer.finish().unwrap()
+    }
+    fn decoded_tone_frequency(parsed: &ParsedWav) -> f64 {
+        let channels = usize::from(parsed.channels);
+        let frames = parsed.samples.len() / channels;
+        assert!(frames > 4, "not enough samples to measure a tone");
+        let start = frames / 4 * channels;
+        let end = frames * 3 / 4 * channels;
+        let first_channel: Vec<i16> = parsed.samples[start..end]
+            .iter()
+            .step_by(channels)
+            .copied()
+            .collect();
+        let crossings = first_channel
+            .windows(2)
+            .filter(|pair| (pair[0] < 0) != (pair[1] < 0))
+            .count();
+        crossings as f64 * f64::from(parsed.sample_rate) / (2.0 * first_channel.len() as f64)
+    }
+    fn decoded_rms(parsed: &ParsedWav) -> f64 {
+        (parsed
+            .samples
+            .iter()
+            .map(|sample| f64::from(*sample) * f64::from(*sample))
+            .sum::<f64>()
+            / parsed.samples.len() as f64)
+            .sqrt()
+    }
+    #[test]
+    fn converts_wav_audio_to_flac_and_back() {
+        let wav = wav_fixture();
+        let original = parse_wav(&wav);
+        assert_eq!(original.sample_rate, 8_000);
+        assert_eq!(original.channels, 2);
+        assert_eq!(original.bits_per_sample, 16);
+        assert_eq!(original.samples.len(), 16_000);
+
+        let same_format = convert_bytes("tone.wav", &wav, OutputFormat::Wav).unwrap();
+        let reencoded = parse_wav(&same_format[0].bytes);
+        assert_eq!(reencoded.sample_rate, original.sample_rate);
+        assert_eq!(reencoded.channels, original.channels);
+        assert_eq!(reencoded.samples, original.samples);
+        assert_audible(&reencoded.samples);
+
+        let flac = convert_bytes("tone.wav", &wav, OutputFormat::Flac).unwrap();
+        assert_eq!(flac[0].name, PathBuf::from("tone.flac"));
+        assert_eq!(&flac[0].bytes[0..4], b"fLaC");
+
+        let back = convert_bytes("tone.flac", &flac[0].bytes, OutputFormat::Wav).unwrap();
+        assert_eq!(back[0].name, PathBuf::from("tone.wav"));
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.sample_rate, original.sample_rate);
+        assert_eq!(decoded.channels, original.channels);
+        assert_eq!(decoded.samples.len(), original.samples.len());
+        assert_eq!(decoded.samples, original.samples);
+        assert_audible(&decoded.samples);
+    }
+    #[test]
+    fn converts_wav_audio_to_aiff_and_au() {
+        let wav = wav_fixture();
+        let original = parse_wav(&wav);
+
+        let aiff = convert_bytes("tone.wav", &wav, OutputFormat::Aiff).unwrap();
+        assert_eq!(aiff[0].name, PathBuf::from("tone.aiff"));
+        assert_eq!(&aiff[0].bytes[0..4], b"FORM");
+        assert_eq!(&aiff[0].bytes[8..12], b"AIFF");
+        let back = convert_bytes("tone.aiff", &aiff[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.sample_rate, original.sample_rate);
+        assert_eq!(decoded.channels, original.channels);
+        assert_eq!(decoded.samples, original.samples);
+        assert_audible(&decoded.samples);
+
+        let au = convert_bytes("tone.wav", &wav, OutputFormat::Au).unwrap();
+        assert_eq!(au[0].name, PathBuf::from("tone.au"));
+        assert_eq!(&au[0].bytes[0..4], b".snd");
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[4..8].try_into().unwrap()),
+            24
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[8..12].try_into().unwrap()) as usize,
+            au[0].bytes.len() - 24
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[12..16].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[16..20].try_into().unwrap()),
+            original.sample_rate
+        );
+        assert_eq!(
+            u32::from_be_bytes(au[0].bytes[20..24].try_into().unwrap()),
+            u32::from(original.channels)
+        );
+        let au_samples: Vec<i16> = au[0].bytes[24..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_be_bytes(*bytes))
+            .collect();
+        assert_eq!(au_samples, original.samples);
+    }
+    #[test]
+    fn converts_wav_audio_to_opus_and_back() {
+        let wav = wav_fixture();
+
+        let opus = convert_bytes("tone.wav", &wav, OutputFormat::Opus).unwrap();
+        assert_eq!(opus[0].name, PathBuf::from("tone.opus"));
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+        let back = convert_bytes("tone.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples.len(), 96_000);
+        assert_audible(&decoded.samples);
+
+        let mono = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mono_back = convert_bytes("tone.opus", &mono[0].bytes, OutputFormat::Wav).unwrap();
+        let mono_decoded = parse_wav(&mono_back[0].bytes);
+        assert_eq!(mono_decoded.sample_rate, 48_000);
+        assert_eq!(mono_decoded.channels, 1);
+        assert_eq!(mono_decoded.samples.len(), 48_000);
+        assert_audible(&mono_decoded.samples);
+
+        let sixteen_k = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let sixteen_k_back =
+            convert_bytes("tone.opus", &sixteen_k[0].bytes, OutputFormat::Wav).unwrap();
+        let sixteen_k_decoded = parse_wav(&sixteen_k_back[0].bytes);
+        assert_eq!(sixteen_k_decoded.sample_rate, 48_000);
+        assert_eq!(sixteen_k_decoded.samples.len(), 96_000);
+        assert_audible(&sixteen_k_decoded.samples);
+
+        // 44.1 kHz is the app's default sample-rate setting, but Opus encodes
+        // at 48 kHz, so this covers the default-rate resampling path.
+        let default_rate = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let default_rate_back =
+            convert_bytes("tone.opus", &default_rate[0].bytes, OutputFormat::Wav).unwrap();
+        let default_rate_decoded = parse_wav(&default_rate_back[0].bytes);
+        assert_eq!(default_rate_decoded.sample_rate, 48_000);
+        assert_eq!(default_rate_decoded.channels, 2);
+        assert_eq!(default_rate_decoded.samples.len(), 96_000);
+        assert_audible(&default_rate_decoded.samples);
+
+        // Default options keep the source rate, so this exercises the Opus
+        // encoder's own 44.1 kHz -> 48 kHz fallback instead of the shared
+        // resampler.
+        let wav_44_1 = wav_fixture_at(44_100, 44_100);
+        let source_44_1 = parse_wav(&wav_44_1);
+        assert_eq!(source_44_1.sample_rate, 44_100);
+        assert_eq!(source_44_1.samples.len(), 88_200);
+        let fallback = convert_bytes("tone-44.1k.wav", &wav_44_1, OutputFormat::Opus).unwrap();
+        let fallback_back =
+            convert_bytes("tone.opus", &fallback[0].bytes, OutputFormat::Wav).unwrap();
+        let fallback_decoded = parse_wav(&fallback_back[0].bytes);
+        assert_eq!(fallback_decoded.sample_rate, 48_000);
+        assert_eq!(fallback_decoded.channels, 2);
+        assert_eq!(fallback_decoded.samples.len(), 96_000);
+        assert_audible(&fallback_decoded.samples);
+    }
+    #[test]
+    fn writes_the_aiff_extended_sample_rate() {
+        assert_eq!(
+            super::extended_sample_rate(44_100),
+            [0x40, 0x0e, 0xac, 0x44, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(super::extended_sample_rate(0), [0; 10]);
+    }
+    #[test]
+    fn applies_audio_sample_rate_and_channel_options() {
+        let wav = wav_fixture();
+
+        let upsampled = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&upsampled[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.samples.len(), 32_000);
+        assert_audible(&parsed.samples);
+
+        let mono = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&mono[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+
+        let stereo = convert_bytes_with_options(
+            "tone.wav",
+            &mono[0].bytes,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&stereo[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.samples.len(), 32_000);
+        assert_audible(&parsed.samples);
+
+        let flac = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_sample_rate: Some(16_000),
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let flac_wav = convert_bytes("tone.flac", &flac[0].bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&flac_wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.channels, 1);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+
+        let clamped = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_sample_rate: Some(384_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let clamped_wav = convert_bytes("tone.flac", &clamped[0].bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&clamped_wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 96_000);
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn converts_real_mp3_audio_to_wav_and_flac() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test/resources/gaster.mp3");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("gaster.mp3", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert!(parsed.sample_rate >= 8_000);
+        assert!(parsed.channels >= 1);
+        assert!(parsed.samples.len() > 1_000);
+        assert_audible(&parsed.samples);
+
+        let flac = convert_bytes("gaster.mp3", &input, OutputFormat::Flac).unwrap();
+        assert_eq!(&flac[0].bytes[0..4], b"fLaC");
+
+        let flac_wav = convert_bytes("gaster.flac", &flac[0].bytes, OutputFormat::Wav).unwrap();
+        let flac_parsed = parse_wav(&flac_wav[0].bytes);
+        assert_eq!(flac_parsed.sample_rate, parsed.sample_rate);
+        assert_eq!(flac_parsed.channels, parsed.channels);
+        assert_eq!(flac_parsed.samples.len(), parsed.samples.len());
+        let max_difference = flac_parsed
+            .samples
+            .iter()
+            .zip(&parsed.samples)
+            .map(|(flac_sample, wav_sample)| {
+                (i32::from(*flac_sample) - i32::from(*wav_sample)).unsigned_abs()
+            })
+            .max()
+            .unwrap();
+        assert!(
+            max_difference <= 1,
+            "the FLAC round-trip changed a sample by {max_difference}"
+        );
+        assert_audible(&flac_parsed.samples);
+    }
+    #[test]
+    fn converts_real_ogg_audio_to_wav() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/piano.ogg");
+        let input = std::fs::read(path).unwrap();
+        assert_eq!(&input[0..4], b"OggS");
+
+        let wav = convert_bytes("piano.ogg", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 1);
+        assert!(
+            parsed.samples.len() >= 384_854,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn converts_real_m4a_audio_to_wav() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample.m4a");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.channels, 1);
+        assert!(
+            parsed.samples.len() >= 100_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn extracts_audio_from_a_video_container() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-video.mp4");
+        let input = std::fs::read(path).unwrap();
+
+        let tracks = super::audio_tracks(&input, "mp4").unwrap();
+        assert_eq!(tracks.len(), 1, "the video track must not be listed");
+        assert_eq!(tracks[0].codec, "AAC");
+        assert_eq!(tracks[0].channels, 1);
+
+        let wav = convert_bytes("sample-video.mp4", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.channels, 1);
+        assert!(
+            parsed.samples.len() >= 100_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn extracts_audio_from_a_video_with_opus() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-opus.webm");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("sample-opus.webm", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            parsed.samples.len() >= 200_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn extracts_audio_from_an_mp4_with_opus() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/sample-opus.mp4");
+        let input = std::fs::read(path).unwrap();
+
+        let wav = convert_bytes("sample-opus.mp4", &input, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            parsed.samples.len() >= 200_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn extracts_audio_from_vp9_opus_webm_mp4_webm_round_trip() {
+        for (name, expected) in [
+            // The source WebM carries 13.5 ms of DiscardPadding after the
+            // 2 s tone, so the precise trim is 96,000 samples.
+            ("sample-vp9-opus.webm", 96_000),
+            // The MP4 edit list starts 336 samples into the media and presents
+            // 2,001 ms. The Opus header's 312-sample pre-skip is already
+            // removed by the decoder, leaving a 24-sample additional skip.
+            ("sample-vp9-opus.mp4", 96_048),
+            // The remux dropped DiscardPadding. The final Opus block starts at
+            // 2,001 ms, which is the per-track end bound, so the final packet's
+            // padding must not be emitted.
+            ("sample-vp9-opus-roundtrip.webm", 96_048),
+        ] {
+            let path = fixture_path(name);
+            let input = std::fs::read(&path).unwrap();
+
+            let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&wav[0].bytes);
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.channels, 1, "{name}");
+            assert_eq!(parsed.samples.len(), expected, "{name} buffered");
+            assert_audible(&parsed.samples);
+
+            let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+            assert_eq!(streamed.sample_rate, 48_000, "{name}");
+            assert_eq!(streamed.channels, 1, "{name}");
+            assert_eq!(streamed.samples.len(), expected, "{name} streaming");
+            assert_eq!(streamed.samples, parsed.samples, "{name} differs");
+        }
+
+        let source = fixture("sample-vp9-opus.webm");
+        let source_timing = super::matroska_audio_timing(&source, 2);
+        assert_eq!(source_timing.discard_padding_ns, Some(13_500_000));
+        assert_eq!(source_timing.last_block_timestamp_ns, Some(2_001_000_000));
+
+        let remux = fixture("sample-vp9-opus-roundtrip.webm");
+        let remux_timing = super::matroska_audio_timing(&remux, 2);
+        assert_eq!(remux_timing.discard_padding_ns, None);
+        assert_eq!(remux_timing.last_block_timestamp_ns, Some(2_001_000_000));
+    }
+    #[test]
+    fn converts_vp9_opus_webm_directly_to_opus_and_back() {
+        for (name, expected) in [
+            // The source WebM carries the exact DiscardPadding trim.
+            ("sample-vp9-opus.webm", 96_000),
+            // The remuxed WebM has no DiscardPadding, so its final block
+            // timestamp supplies the 2,001 ms presentation length.
+            ("sample-vp9-opus-roundtrip.webm", 96_048),
+        ] {
+            let input = fixture(name);
+            let opus = convert_bytes(name, &input, OutputFormat::Opus).unwrap();
+            assert_eq!(
+                opus[0].name,
+                PathBuf::from(name).with_extension("opus"),
+                "{name}"
+            );
+            assert!(opus[0].bytes.starts_with(b"OggS"), "{name}");
+
+            let back = convert_bytes("tone.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+            let decoded = parse_wav(&back[0].bytes);
+            assert_eq!(decoded.sample_rate, 48_000, "{name}");
+            assert_eq!(decoded.channels, 1, "{name}");
+            // The end trim survives the decode and re-encode; no final-packet
+            // padding may reappear on the round trip.
+            assert_eq!(decoded.samples.len(), expected, "{name}");
+            assert_audible(&decoded.samples);
+        }
+    }
+    #[test]
+    fn trims_discard_padding_for_the_selected_audio_track() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/sample-two-opus-tracks.webm");
+        let input = std::fs::read(path).unwrap();
+
+        // The tracks hold 1 s and 1.01 s of audio and carry different end
+        // padding, so using the wrong track's value changes the decoded length.
+        assert_eq!(super::matroska_discard_padding(&input, 1), Some(13_500_000));
+        assert_eq!(super::matroska_discard_padding(&input, 2), Some(3_500_000));
+
+        let wav = convert_bytes("sample-two-opus-tracks.webm", &input, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&wav[0].bytes);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples.len(), 48_000);
+        assert_audible(&decoded.samples);
+    }
+    #[test]
+    fn decodes_ogg_opus_audio() {
+        use opus_pure::{Application, OggOpusWriter, OpusEncoder, OpusHead, MAX_PACKET_BYTES};
+
+        let sample_rate = 48_000;
+        let frame_size = 960;
+        let mut encoder = OpusEncoder::new(sample_rate, 1, Application::Audio).unwrap();
+        let head = OpusHead::for_encoder(&encoder, sample_rate as u32);
+        let mut writer = OggOpusWriter::new(Vec::new(), head).unwrap();
+        let mut packet = vec![0_u8; MAX_PACKET_BYTES];
+        for frame in 0..50 {
+            let pcm: Vec<f32> = (0..frame_size)
+                .map(|index| {
+                    let time = (frame * frame_size + index) as f32 / sample_rate as f32;
+                    (time * 440.0 * std::f32::consts::TAU).sin() * 0.5
+                })
+                .collect();
+            let len = encoder.encode(&pcm, frame_size, &mut packet).unwrap();
+            writer.write_packet(&packet[..len]).unwrap();
+        }
+        let bytes = writer.finish().unwrap();
+
+        let wav = convert_bytes("tone.opus", &bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&wav[0].bytes);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.channels, 1);
+        assert!(
+            parsed.samples.len() >= 40_000,
+            "decoded only {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn decodes_flac_with_an_id3_tag() {
+        let wav = wav_fixture();
+        let flac = convert_bytes("tone.wav", &wav, OutputFormat::Flac).unwrap();
+
+        let mut tagged = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+        tagged.extend_from_slice(&flac[0].bytes);
+        let back = convert_bytes("tone.flac", &tagged, OutputFormat::Wav).unwrap();
+        assert_eq!(&back[0].bytes[0..4], b"RIFF");
+    }
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(fixture_path(name)).unwrap()
+    }
+    #[test]
+    fn writes_wav_directly_to_a_writer() {
+        let input = wav_fixture();
+        let mut output = Vec::new();
+        convert_audio_to_wav_writer(
+            "tone.wav",
+            &input,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.bits_per_sample, 16);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+        assert_eq!(
+            wav_output_name("tone.wav"),
+            std::path::PathBuf::from("tone.wav")
+        );
+    }
+    #[test]
+    fn lists_tracks_from_a_file_without_loading_it() {
+        let tracks =
+            super::audio_tracks_from_path(&fixture_path("sample-two-opus-tracks.webm")).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].codec, "Opus");
+        assert_eq!(tracks[1].id, 2);
+
+        let tracks = super::audio_tracks_from_path(&fixture_path("sample-video.mp4")).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AAC");
+        assert_eq!(tracks[0].channels, 1);
+
+        let tracks = super::audio_tracks_from_path(&fixture_path("sample-ac3.mkv")).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AC-3");
+        assert_eq!(tracks[0].channels, 6);
+    }
+    #[test]
+    fn lists_tracks_from_a_padded_mp4() {
+        let directory = stream_temp_dir("padded-probe");
+        let input = directory.join("padded.mp4");
+        let mut padded = std::fs::read(fixture_path("sample-ac3.mp4")).unwrap();
+        padded.resize(padded.len() + 16 * 1024 * 1024, 0);
+        std::fs::write(&input, padded).unwrap();
+
+        let tracks = super::audio_tracks_from_path(&input).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AC-3");
+        assert_eq!(tracks[0].channels, 6);
+        assert_eq!(tracks[0].sample_rate, 48_000);
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn lists_and_selects_audio_tracks() {
+        let input = fixture("sample-two-opus-tracks.webm");
+        let tracks = super::audio_tracks(&input, "webm").unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, 1);
+        assert_eq!(tracks[1].id, 2);
+        assert_eq!(tracks[0].codec, "Opus");
+        assert_eq!(tracks[0].channels, 1);
+        assert_eq!(tracks[0].sample_rate, 48_000);
+        assert!(tracks[0].default);
+        assert!(!tracks[1].default);
+        assert!(tracks[1].label().starts_with("#2"));
+
+        let first =
+            convert_bytes("sample-two-opus-tracks.webm", &input, OutputFormat::Wav).unwrap();
+        assert_eq!(parse_wav(&first[0].bytes).samples.len(), 48_000);
+
+        let second = convert_bytes_with_options(
+            "sample-two-opus-tracks.webm",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = parse_wav(&second[0].bytes);
+        assert_eq!(second.samples.len(), 48_480);
+        assert_audible(&second.samples);
+
+        let error = convert_bytes_with_options(
+            "sample-two-opus-tracks.webm",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+    }
+    #[test]
+    fn path_and_memory_track_lists_agree() {
+        for (name, extension) in [
+            ("sample-two-opus-tracks.webm", "webm"),
+            ("sample-interleaved-tracks.mkv", "mkv"),
+            ("sample-video.mp4", "mp4"),
+        ] {
+            let input = fixture(name);
+            let path = fixture_path(name);
+            assert_eq!(
+                super::audio_tracks(&input, extension).unwrap(),
+                super::audio_tracks_from_path(&path).unwrap(),
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn default_track_matches_explicit_first_in_buffered_and_streaming_paths() {
+        let name = "sample-two-opus-tracks.webm";
+        let input = fixture(name);
+        let path = fixture_path(name);
+
+        let default = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+        let first = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(default[0].bytes, first[0].bytes);
+        assert_ne!(default[0].bytes, second[0].bytes);
+        assert_eq!(parse_wav(&default[0].bytes).samples.len(), 48_000);
+        assert_eq!(parse_wav(&second[0].bytes).samples.len(), 48_480);
+
+        let default_stream = stream_wav(&path, ConversionOptions::default());
+        let first_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        );
+        let second_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(default_stream, first_stream);
+        assert_ne!(default_stream, second_stream);
+        assert_eq!(parse_wav(&default_stream).samples.len(), 48_000);
+        assert_eq!(parse_wav(&second_stream).samples.len(), 48_480);
+    }
+    #[test]
+    fn selected_audio_track_changes_the_decoded_tone() {
+        let name = "sample-two-opus-tracks.webm";
+        let input = fixture(name);
+        let path = fixture_path(name);
+
+        let default = parse_wav(&convert_bytes(name, &input, OutputFormat::Wav).unwrap()[0].bytes);
+        let first = parse_wav(
+            &convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_track: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap()[0]
+                .bytes,
+        );
+        let second = parse_wav(
+            &convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_track: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap()[0]
+                .bytes,
+        );
+
+        for parsed in [&default, &first, &second] {
+            assert_eq!(parsed.channels, 1);
+            assert_eq!(parsed.sample_rate, 48_000);
+        }
+        assert_eq!(default.samples.len(), 48_000);
+        assert_eq!(first.samples.len(), 48_000);
+        assert_eq!(second.samples.len(), 48_480);
+        assert_eq!(default.samples, first.samples);
+        assert_ne!(first.samples, second.samples);
+        assert!((decoded_tone_frequency(&default) - 440.0).abs() < 5.0);
+        assert!((decoded_tone_frequency(&first) - 440.0).abs() < 5.0);
+        assert!((decoded_tone_frequency(&second) - 880.0).abs() < 5.0);
+        for parsed in [&default, &first, &second] {
+            let rms = decoded_rms(parsed);
+            assert!(
+                (1_000.0..5_000.0).contains(&rms),
+                "decoded tone RMS is {rms:.1}"
+            );
+            assert_audible(&parsed.samples);
+        }
+
+        let default_stream = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+        let second_stream = parse_wav(&stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        ));
+        assert!((decoded_tone_frequency(&default_stream) - 440.0).abs() < 5.0);
+        assert!((decoded_tone_frequency(&second_stream) - 880.0).abs() < 5.0);
+        assert_eq!(second_stream.samples.len(), 48_480);
+
+        let mut output = Cursor::new(Vec::new());
+        let error = crate::streaming::convert_audio_file_to_writer(
+            &path,
+            name,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+        assert!(
+            output.get_ref().is_empty(),
+            "an invalid track selection wrote audio before returning an error"
+        );
+    }
+    #[test]
+    fn selects_the_audio_track_in_an_mp4_video() {
+        let name = "sample-video.mp4";
+        let input = fixture(name);
+        let tracks = super::audio_tracks(&input, "mp4").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, "AAC");
+        assert_eq!(tracks[0].channels, 1);
+        assert_eq!(tracks[0].sample_rate, 44_100);
+
+        let selected = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse_wav(&selected[0].bytes);
+        assert_eq!(parsed.channels, 1);
+        assert_audible(&parsed.samples);
+
+        let error = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 2,
+                available: 1
+            }
+        ));
+    }
+    #[test]
+    fn selected_audio_track_reaches_every_audio_encoder() {
+        let name = "sample-two-opus-tracks.webm";
+        let input = fixture(name);
+        for target in [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Aiff,
+            OutputFormat::Au,
+            OutputFormat::Opus,
+            OutputFormat::Mp3,
+        ] {
+            let encoded = convert_bytes_with_options(
+                name,
+                &input,
+                target,
+                ConversionOptions {
+                    audio_track: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let parsed = if target == OutputFormat::Au {
+                // AU is an output-only format here, so inspect its PCM payload
+                // directly instead of asking the decoder to read it back.
+                assert_eq!(&encoded[0].bytes[0..4], b".snd", "{target:?}");
+                let channels =
+                    u32::from_be_bytes(encoded[0].bytes[20..24].try_into().unwrap()) as u16;
+                let sample_rate = u32::from_be_bytes(encoded[0].bytes[16..20].try_into().unwrap());
+                let samples = encoded[0].bytes[24..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| i16::from_be_bytes(*bytes))
+                    .collect();
+                ParsedWav {
+                    channels,
+                    sample_rate,
+                    bits_per_sample: 16,
+                    samples,
+                }
+            } else {
+                let decoded = convert_bytes(
+                    encoded[0].name.to_string_lossy().as_ref(),
+                    &encoded[0].bytes,
+                    OutputFormat::Wav,
+                )
+                .unwrap();
+                parse_wav(&decoded[0].bytes)
+            };
+            assert_eq!(parsed.channels, 1, "{target:?}");
+            assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+            assert!(
+                (decoded_tone_frequency(&parsed) - 880.0).abs() < 20.0,
+                "{target:?} did not encode the second track: {} Hz",
+                decoded_tone_frequency(&parsed)
+            );
+            assert_audible(&parsed.samples);
+        }
+    }
+    #[test]
+    fn selects_audio_tracks_after_non_audio_and_unsupported_streams() {
+        let name = "sample-interleaved-tracks.mkv";
+        let path = fixture_path(name);
+        let input = fixture(name);
+
+        let tracks = super::audio_tracks_from_path(&path).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].index, 0);
+        assert_eq!(tracks[0].id, 3);
+        assert_eq!(tracks[0].language.as_deref(), Some("eng"));
+        assert_eq!(tracks[0].codec, "AC-3");
+        assert_eq!(tracks[0].channels, 6);
+        assert_eq!(tracks[0].sample_rate, 48_000);
+        assert!(tracks[0].label().starts_with("#1 · stream 3 · eng · AC-3"));
+        assert_eq!(tracks[1].index, 1);
+        assert_eq!(tracks[1].id, 4);
+        assert_eq!(tracks[1].language.as_deref(), Some("fra"));
+        assert_eq!(tracks[1].codec, "AC-3");
+        assert_eq!(tracks[1].channels, 6);
+        assert_eq!(tracks[1].sample_rate, 48_000);
+        assert!(tracks[1].label().starts_with("#2 · stream 4 · fra · AC-3"));
+
+        let default = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+        let first = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(default[0].bytes, first[0].bytes);
+        assert_ne!(default[0].bytes, second[0].bytes);
+        let first_wav = parse_wav(&default[0].bytes);
+        let second_wav = parse_wav(&second[0].bytes);
+        assert_eq!(first_wav.channels, 6);
+        assert_eq!(first_wav.sample_rate, 48_000);
+        assert_eq!(first_wav.samples.len(), 96_768 * 6);
+        assert_eq!(second_wav.channels, 6);
+        assert_eq!(second_wav.sample_rate, 48_000);
+        assert_eq!(second_wav.samples.len(), 153_600 * 6);
+
+        let default_stream = stream_wav(&path, ConversionOptions::default());
+        let first_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(0),
+                ..Default::default()
+            },
+        );
+        let second_stream = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(default_stream, default[0].bytes);
+        assert_eq!(first_stream, first[0].bytes);
+        assert_eq!(second_stream, second[0].bytes);
+        assert_eq!(parse_wav(&second_stream).samples.len(), 153_600 * 6);
+
+        let error = convert_bytes_with_options(
+            name,
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+
+        let mut output = Cursor::new(Vec::new());
+        let error = crate::streaming::convert_audio_file_to_writer(
+            &path,
+            name,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_track: Some(2),
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::AudioTrackNotFound {
+                requested: 3,
+                available: 2
+            }
+        ));
+    }
+    #[test]
+    fn decodes_ac3_and_eac3_audio() {
+        for (name, codec) in [
+            ("sample-ac3.ac3", "AC-3"),
+            ("sample-ac3.mkv", "AC-3"),
+            ("sample-ac3.mp4", "AC-3"),
+            ("sample-eac3.mkv", "E-AC-3"),
+        ] {
+            let input = fixture(name);
+            let extension = std::path::Path::new(name)
+                .extension()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let tracks = super::audio_tracks(&input, extension).unwrap();
+            assert_eq!(tracks.len(), 1, "{name}");
+            assert_eq!(tracks[0].codec, codec, "{name}");
+            assert_eq!(tracks[0].channels, 6, "{name}");
+            assert_eq!(tracks[0].sample_rate, 48_000, "{name}");
+
+            let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&wav[0].bytes);
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.channels, 6, "{name}");
+            let expected_frames = if name == "sample-ac3.mp4" {
+                // The MP4 edit list skips 256 samples and presents 2 s.
+                96_000
+            } else {
+                // The elementary stream and Matroska fixture have no edit list.
+                96_768
+            };
+            assert_eq!(parsed.samples.len(), expected_frames * 6, "{name}");
+            assert_audible(&parsed.samples);
+
+            let stereo = convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_channels: Some(AudioChannels::Stereo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let stereo = parse_wav(&stereo[0].bytes);
+            assert_eq!(stereo.channels, 2, "{name}");
+            assert_eq!(stereo.samples.len(), expected_frames * 2, "{name}");
+            assert_audible(&stereo.samples);
+        }
+    }
+    #[test]
+    fn downmixes_centre_and_surround_channels() {
+        // Only the centre channel carries audio. Keeping the first two channels
+        // would produce silence, which is the bug this test guards against.
+        let input = fixture("sample-ac3-center.ac3");
+        let decoded = convert_bytes("sample-ac3-center.ac3", &input, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 6);
+        assert_eq!(decoded.sample_rate, 48_000);
+        let centre_peak = decoded
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(centre_peak > 1_000, "the AC-3 centre channel is silent");
+
+        let stereo = convert_bytes_with_options(
+            "sample-ac3-center.ac3",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stereo = parse_wav(&stereo[0].bytes);
+        assert_eq!(stereo.channels, 2);
+        assert_eq!(stereo.sample_rate, 48_000);
+        assert_eq!(stereo.samples.len(), decoded.samples.len() / 3);
+        let left_peak = stereo
+            .samples
+            .iter()
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        let right_peak = stereo
+            .samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(left_peak > 1_000, "the centre tone was lost from the left");
+        assert!(
+            right_peak > 1_000,
+            "the centre tone was lost from the right"
+        );
+        assert!(
+            left_peak.abs_diff(right_peak) < left_peak / 20,
+            "the centre tone was not balanced: {left_peak} vs {right_peak}"
+        );
+        let ratio = f32::from(left_peak) / f32::from(centre_peak);
+        assert!(
+            (ratio - 0.707).abs() < 0.02,
+            "the centre channel was downmixed at {ratio}, expected 0.707"
+        );
+
+        let mono = convert_bytes_with_options(
+            "sample-ac3-center.ac3",
+            &input,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Mono),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mono = parse_wav(&mono[0].bytes);
+        assert_eq!(mono.channels, 1);
+        assert_eq!(mono.sample_rate, 48_000);
+        assert_audible(&mono.samples);
+    }
+    #[test]
+    fn surround_downmix_uses_standard_coefficients_and_avoids_clipping() {
+        let centre_only = super::DecodedAudio {
+            samples: vec![0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+            channels: 6,
+            sample_rate: 48_000,
+            source_bits: None,
+        };
+        let stereo = super::remix_channels(centre_only.clone(), AudioChannels::Stereo);
+        assert!((stereo.samples[0] - 0.353_553).abs() < 0.001);
+        assert!((stereo.samples[1] - 0.353_553).abs() < 0.001);
+        let mono = super::remix_channels(centre_only, AudioChannels::Mono);
+        assert!((mono.samples[0] - 0.353_553).abs() < 0.001);
+
+        let loud = super::DecodedAudio {
+            samples: vec![1.0; 6 * 100],
+            channels: 6,
+            sample_rate: 48_000,
+            source_bits: None,
+        };
+        let stereo = super::remix_channels(loud, AudioChannels::Stereo);
+        let peak = stereo
+            .samples
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert!(peak <= 1.0, "the downmix clipped at {peak}");
+        assert!(peak > 0.9, "the downmix was attenuated more than needed");
+    }
+    #[test]
+    fn downmixes_51_wav_with_expected_centre_and_surround_gains() {
+        // Values are constant so the output is exactly the downmix coefficient
+        // applied to each channel. Channel order is L, R, C, LFE, BL, BR.
+        let cases: [(&str, [f32; 6], f32, f32); 7] = [
+            ("left only", [0.5, 0.0, 0.0, 0.0, 0.0, 0.0], 0.5, 0.0),
+            ("right only", [0.0, 0.5, 0.0, 0.0, 0.0, 0.0], 0.0, 0.5),
+            (
+                "centre only",
+                [0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                0.353_553,
+                0.353_553,
+            ),
+            (
+                "back left only",
+                [0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+                0.353_553,
+                0.0,
+            ),
+            (
+                "back right only",
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                0.0,
+                0.353_553,
+            ),
+            ("LFE only", [0.0, 0.0, 0.0, 0.5, 0.0, 0.0], 0.25, 0.25),
+            (
+                "stereo passthrough",
+                [0.25, 0.5, 0.0, 0.0, 0.0, 0.0],
+                0.25,
+                0.5,
+            ),
+        ];
+
+        for (name, channels, expected_left, expected_right) in cases {
+            let input = wav_channels_at(48_000, 128, &channels);
+            let converted = convert_bytes_with_options(
+                "surround.wav",
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_channels: Some(AudioChannels::Stereo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let parsed = parse_wav(&converted[0].bytes);
+            assert_eq!(parsed.channels, 2, "{name}");
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.samples.len(), 128 * 2, "{name}");
+            let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
+            let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
+            assert!(
+                (left - expected_left).abs() < 0.002,
+                "{name}: left was {left}, expected {expected_left}"
+            );
+            assert!(
+                (right - expected_right).abs() < 0.002,
+                "{name}: right was {right}, expected {expected_right}"
+            );
+        }
+    }
+    #[test]
+    fn multichannel_audio_converts_to_every_audio_target() {
+        let input = wav_channels_at(48_000, 48_000, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        for target in [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::Aiff,
+            OutputFormat::Au,
+            OutputFormat::Opus,
+            OutputFormat::Mp3,
+        ] {
+            let converted = convert_bytes_with_options(
+                "surround.wav",
+                &input,
+                target,
+                ConversionOptions::default(),
+            )
+            .unwrap();
+            let bytes = &converted[0].bytes;
+            assert!(!bytes.is_empty(), "{target:?} produced no output");
+
+            match target {
+                OutputFormat::Wav => {
+                    let parsed = parse_wav(bytes);
+                    assert_eq!(parsed.channels, 6, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert_eq!(parsed.samples.len(), 48_000 * 6, "{target:?}");
+                    assert_audible(&parsed.samples);
+                }
+                OutputFormat::Flac => {
+                    let wav = convert_bytes("surround.flac", bytes, OutputFormat::Wav).unwrap();
+                    let parsed = parse_wav(&wav[0].bytes);
+                    assert_eq!(parsed.channels, 6, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert_eq!(parsed.samples.len(), 48_000 * 6, "{target:?}");
+                    assert_audible(&parsed.samples);
+                }
+                OutputFormat::Aiff => {
+                    assert_eq!(&bytes[..4], b"FORM", "{target:?}");
+                    assert_eq!(u16::from_be_bytes(bytes[20..22].try_into().unwrap()), 6);
+                    assert_eq!(
+                        u32::from_be_bytes(bytes[22..26].try_into().unwrap()),
+                        48_000
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(bytes[42..46].try_into().unwrap()),
+                        48_000 * 6 * 2 + 8
+                    );
+                }
+                OutputFormat::Au => {
+                    assert_eq!(&bytes[..4], b".snd", "{target:?}");
+                    assert_eq!(
+                        u32::from_be_bytes(bytes[8..12].try_into().unwrap()),
+                        48_000 * 6 * 2
+                    );
+                    assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 6);
+                }
+                OutputFormat::Opus => {
+                    let wav = convert_bytes("surround.opus", bytes, OutputFormat::Wav).unwrap();
+                    let parsed = parse_wav(&wav[0].bytes);
+                    assert_eq!(parsed.channels, 6, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert!(
+                        parsed.samples.len() / 6 >= 48_000,
+                        "{target:?} was truncated"
+                    );
+                    assert_audible(&parsed.samples);
+                }
+                OutputFormat::Mp3 => {
+                    let wav = convert_bytes("surround.mp3", bytes, OutputFormat::Wav).unwrap();
+                    let parsed = parse_wav(&wav[0].bytes);
+                    assert_eq!(parsed.channels, 2, "{target:?}");
+                    assert_eq!(parsed.sample_rate, 48_000, "{target:?}");
+                    assert!(
+                        parsed.samples.len() / 2 >= 47_000,
+                        "{target:?} was truncated"
+                    );
+                    assert_audible(&parsed.samples);
+                    let left_peak = parsed
+                        .samples
+                        .iter()
+                        .step_by(2)
+                        .map(|sample| sample.unsigned_abs())
+                        .max()
+                        .unwrap();
+                    let right_peak = parsed
+                        .samples
+                        .iter()
+                        .skip(1)
+                        .step_by(2)
+                        .map(|sample| sample.unsigned_abs())
+                        .max()
+                        .unwrap();
+                    assert!(left_peak > 1_000, "the centre tone was lost from the left");
+                    assert!(
+                        right_peak > 1_000,
+                        "the centre tone was lost from the right"
+                    );
+                }
+                _ => unreachable!("unexpected audio target {target:?}"),
+            }
+        }
+    }
+    #[test]
+    fn downmix_layouts_use_explicit_coefficients() {
+        // Each case has one non-zero channel, so the result is exactly the
+        // coefficient for that layout rather than an accidental slice.
+        // Expected values: stereo left/right and mono.
+        let cases: &[(&str, &[f32], f32, f32, f32)] = &[
+            ("mono up-mix", &[0.5], 0.5, 0.5, 0.5),
+            ("stereo", &[0.5, 0.25], 0.5, 0.25, 0.375),
+            ("3.0 centre", &[0.0, 0.0, 0.5], 0.3535, 0.3535, 0.3535),
+            ("quad back left", &[0.0, 0.0, 0.5, 0.0], 0.3535, 0.0, 0.25),
+            ("quad back right", &[0.0, 0.0, 0.0, 0.5], 0.0, 0.3535, 0.25),
+            (
+                "5.0 back left",
+                &[0.0, 0.0, 0.0, 0.5, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            ("5.1 LFE", &[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], 0.25, 0.25, 0.25),
+            (
+                "6.1 back centre",
+                &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+                0.25,
+                0.25,
+                0.25,
+            ),
+            (
+                "6.1 side left",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            (
+                "7.1 back left",
+                &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            (
+                "7.1 side left",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0],
+                0.3535,
+                0.0,
+                0.25,
+            ),
+            (
+                "7.1 side right",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                0.0,
+                0.3535,
+                0.25,
+            ),
+            (
+                "extra channel above 7.1",
+                &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5],
+                0.25,
+                0.25,
+                0.25,
+            ),
+        ];
+
+        for (name, frame, expected_left, expected_right, expected_mono) in cases {
+            let audio = super::DecodedAudio {
+                samples: frame.to_vec(),
+                channels: frame.len(),
+                sample_rate: 48_000,
+                source_bits: None,
+            };
+            let stereo = super::remix_channels(audio.clone(), AudioChannels::Stereo);
+            assert_eq!(stereo.channels, 2, "{name}");
+            assert_eq!(stereo.samples.len(), 2, "{name}");
+            assert!(
+                (stereo.samples[0] - expected_left).abs() < 1e-5,
+                "{name}: left was {}, expected {expected_left}",
+                stereo.samples[0]
+            );
+            assert!(
+                (stereo.samples[1] - expected_right).abs() < 1e-5,
+                "{name}: right was {}, expected {expected_right}",
+                stereo.samples[1]
+            );
+
+            let mono = super::remix_channels(audio, AudioChannels::Mono);
+            assert_eq!(mono.channels, 1, "{name}");
+            assert_eq!(mono.samples.len(), 1, "{name}");
+            assert!(
+                (mono.samples[0] - expected_mono).abs() < 1e-5,
+                "{name}: mono was {}, expected {expected_mono}",
+                mono.samples[0]
+            );
+        }
+    }
+    #[test]
+    fn full_scale_multichannel_downmix_does_not_wrap_or_clip() {
+        for value in [1.0_f32, -1.0_f32] {
+            let input = wav_channels_at(48_000, 256, &[value; 6]);
+            let converted = convert_bytes_with_options(
+                "loud.wav",
+                &input,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_channels: Some(AudioChannels::Stereo),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let parsed = parse_wav(&converted[0].bytes);
+            assert_eq!(parsed.channels, 2);
+            assert_eq!(parsed.samples.len(), 256 * 2);
+            assert!(
+                !parsed.samples.contains(&i16::MIN),
+                "a full-scale sample wrapped to i16::MIN"
+            );
+            let peak = parsed
+                .samples
+                .iter()
+                .map(|sample| sample.unsigned_abs())
+                .max()
+                .unwrap();
+            assert!(peak > 30_000, "the downmix was unexpectedly quiet");
+
+            let direct = super::remix_channels(
+                super::DecodedAudio {
+                    samples: vec![value; 6 * 256],
+                    channels: 6,
+                    sample_rate: 48_000,
+                    source_bits: None,
+                },
+                AudioChannels::Stereo,
+            );
+            assert!(
+                direct.samples.iter().all(|sample| sample.is_finite()),
+                "the downmix produced NaN or infinity"
+            );
+            let direct_peak = direct
+                .samples
+                .iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            assert!(
+                direct_peak <= 1.0 + 1e-6,
+                "the downmix exceeded full scale at {direct_peak}"
+            );
+            assert!(direct_peak > 0.99, "the downmix was over-attenuated");
+        }
+    }
+    #[test]
+    fn hot_downmix_preserves_relative_levels() {
+        // The left side is twice the right before the mix (L + BL vs R + BR).
+        // Peak scaling must keep that 2:1 balance.
+        let frame = [1.0_f32, 0.5, 0.0, 0.0, 0.5, 0.25];
+        let samples = frame.iter().copied().cycle().take(6 * 256).collect();
+        let direct = super::remix_channels(
+            super::DecodedAudio {
+                samples,
+                channels: 6,
+                sample_rate: 48_000,
+                source_bits: None,
+            },
+            AudioChannels::Stereo,
+        );
+        assert!(direct.samples.iter().all(|sample| sample.is_finite()));
+        let left = direct.samples[0];
+        let right = direct.samples[1];
+        assert!(left <= 1.0 + 1e-6, "the downmix exceeded full scale");
+        assert!(left > 0.99, "the downmix was over-attenuated");
+        assert!(
+            (right / left - 0.5).abs() < 1e-5,
+            "peak scaling changed the channel balance: {left} vs {right}"
+        );
+    }
+    #[test]
+    fn multichannel_opus_decodes_and_downmixes_centre_and_surround() {
+        let centre = opus_surround_fixture([0.0, 0.5, 0.0, 0.0, 0.0, 0.0]);
+        let decoded = convert_bytes("centre.opus", &centre, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 6);
+        assert!(decoded.samples.len() > 10_000 * 6);
+        assert_audible(&decoded.samples);
+        let centre_peak = decoded
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(centre_peak > 1_000, "the centre channel is silent");
+
+        let stereo = convert_bytes_with_options(
+            "centre.opus",
+            &centre,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stereo = parse_wav(&stereo[0].bytes);
+        assert_eq!(stereo.channels, 2);
+        let left_peak = stereo
+            .samples
+            .iter()
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        let right_peak = stereo
+            .samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(left_peak > 1_000, "centre audio was lost from the left");
+        assert!(right_peak > 1_000, "centre audio was lost from the right");
+        assert!(
+            left_peak.abs_diff(right_peak) < left_peak / 10,
+            "centre audio was not balanced: {left_peak} vs {right_peak}"
+        );
+
+        let directory = stream_temp_dir("multichannel-opus");
+        let path = directory.join("centre.opus");
+        std::fs::write(&path, &centre).unwrap();
+        let streamed = stream_wav(
+            &path,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let streamed = parse_wav(&streamed);
+        assert_eq!(streamed.channels, 2);
+        assert_audible(&streamed.samples);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let surround = opus_surround_fixture([0.0, 0.0, 0.0, 0.5, 0.0, 0.0]);
+        let stereo = convert_bytes_with_options(
+            "surround.opus",
+            &surround,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stereo = parse_wav(&stereo[0].bytes);
+        let left_peak = stereo
+            .samples
+            .iter()
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        let right_peak = stereo
+            .samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(left_peak > 1_000, "surround audio was lost from the left");
+        assert!(
+            left_peak > right_peak * 2,
+            "a back-left signal leaked into the right channel: {left_peak} vs {right_peak}"
+        );
+    }
+    #[test]
+    fn multichannel_opus_output_preserves_51_channels() {
+        let input = wav_channels_at(48_000, 960, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        let opus = convert_bytes("centre.wav", &input, OutputFormat::Opus).unwrap();
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+        let decoded = convert_bytes("centre.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 6);
+        assert_audible(&decoded.samples);
+        let centre_peak = decoded
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(centre_peak > 1_000, "the centre channel was not preserved");
+
+        let directory = stream_temp_dir("opus-51-stream");
+        let path = directory.join("centre.wav");
+        std::fs::write(&path, &input).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        crate::streaming::convert_audio_file_to_writer(
+            &path,
+            "centre.wav",
+            OutputFormat::Opus,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let streamed =
+            convert_bytes("centre.opus", &output.into_inner(), OutputFormat::Wav).unwrap();
+        let streamed = parse_wav(&streamed[0].bytes);
+        assert_eq!(streamed.channels, 6);
+        let centre_peak = streamed
+            .samples
+            .iter()
+            .skip(2)
+            .step_by(6)
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(
+            centre_peak > 1_000,
+            "streaming Opus did not preserve the centre channel"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn multichannel_opus_output_can_be_downmixed_to_stereo() {
+        let input = wav_channels_at(48_000, 960, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        let opus = convert_bytes_with_options(
+            "centre.wav",
+            &input,
+            OutputFormat::Opus,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(opus[0].bytes.starts_with(b"OggS"));
+        let decoded = convert_bytes("centre.opus", &opus[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&decoded[0].bytes);
+        assert_eq!(decoded.channels, 2);
+        assert_audible(&decoded.samples);
+    }
+    #[test]
+    fn rejects_invalid_opus_layouts_with_a_typed_error() {
+        assert!(matches!(
+            super::opus_channels(3, 0),
+            Err(ConvertError::UnsupportedChannelLayout {
+                codec: "Opus",
+                channels: 3
+            })
+        ));
+        assert!(matches!(
+            super::opus_channels(9, 1),
+            Err(ConvertError::UnsupportedChannelLayout {
+                codec: "Opus",
+                channels: 9
+            })
+        ));
+        assert_eq!(super::opus_channels(6, 1).unwrap(), 6);
+    }
+    #[test]
+    fn multichannel_aac_reports_a_clear_error() {
+        let input = fixture("sample-aac-51.m4a");
+        let tracks = super::audio_tracks(&input, "m4a").unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].channels, 6);
+        let error = convert_bytes("sample-aac-51.m4a", &input, OutputFormat::Wav).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("multichannel AAC"),
+            "unexpected error: {message}"
+        );
+    }
+    #[test]
+    fn applies_mp4_edit_list_gapless_trimming() {
+        for (name, expected, channels, sample_rate) in [
+            // 2 s AAC: 1024 samples of encoder priming are removed, then the
+            // edit list's 88,200-sample presentation length is applied.
+            ("sample-aac.m4a", 88_200, 1, 44_100),
+            // No edit list here. The audio track's mdhd duration is 135,168
+            // samples; the movie duration is only 3,036 ms and would be wrong.
+            ("sample.m4a", 135_168, 1, 44_100),
+            // The video track's movie timing must not determine the audio
+            // track's length. This track is also 135,168 samples.
+            ("sample-video.mp4", 135_168, 1, 44_100),
+            // MP4 Opus: edit list media_time 336, duration 2,001 ms. The
+            // decoder already removed the 312-sample Opus pre-skip.
+            ("sample-vp9-opus.mp4", 96_048, 1, 48_000),
+            // MP4 AC-3: edit list skips 256 samples and presents 2 s.
+            ("sample-ac3.mp4", 96_000, 6, 48_000),
+        ] {
+            let path = fixture_path(name);
+            let input = std::fs::read(&path).unwrap();
+
+            let wav = convert_bytes(name, &input, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&wav[0].bytes);
+            assert_eq!(parsed.sample_rate, sample_rate, "{name}");
+            assert_eq!(parsed.channels, channels, "{name}");
+            assert_eq!(
+                parsed.samples.len(),
+                expected * usize::from(channels),
+                "{name} buffered"
+            );
+            assert_audible(&parsed.samples);
+
+            let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+            assert_eq!(streamed.sample_rate, sample_rate, "{name}");
+            assert_eq!(streamed.channels, channels, "{name}");
+            assert_eq!(
+                streamed.samples.len(),
+                expected * usize::from(channels),
+                "{name} streaming"
+            );
+            assert_eq!(streamed.samples, parsed.samples, "{name} differs");
+
+            let float_options = ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            };
+            let buffered_float = wav_float_samples(
+                &convert_bytes_with_options(name, &input, OutputFormat::Wav, float_options)
+                    .unwrap()[0]
+                    .bytes,
+            );
+            let streamed_float = wav_float_samples(&stream_wav(&path, float_options));
+            assert_eq!(
+                buffered_float, streamed_float,
+                "{name} float samples differ"
+            );
+            let truncation = undithered_i16(&buffered_float);
+            let buffered_dithered = parsed.samples != truncation;
+            let streamed_dithered = streamed.samples != truncation;
+            assert!(
+                    buffered_dithered && streamed_dithered,
+                    "{name} must differ from the undithered truncation (buffered: {buffered_dithered}, streaming: {streamed_dithered})"
+                );
+        }
+
+        let aac = fixture("sample-aac.m4a");
+        let aac_info =
+            super::mp4_gapless_info(crate::container::mp4_find(&aac, b"moov").unwrap(), 0)
+                .expect("the AAC edit list is present");
+        assert_eq!(aac_info.skip, 1_024, "AAC priming was not read");
+        assert_eq!(aac_info.limit, Some(88_200));
+        assert!(aac_info.limit_is_presentation);
+
+        let m4a = fixture("sample.m4a");
+        let m4a_info =
+            super::mp4_gapless_info(crate::container::mp4_find(&m4a, b"moov").unwrap(), 0)
+                .expect("the audio track duration is present");
+        assert_eq!(m4a_info.skip, 0);
+        assert_eq!(m4a_info.limit, Some(135_168));
+        assert!(!m4a_info.limit_is_presentation);
+
+        let opus = fixture("sample-vp9-opus.mp4");
+        let opus_info =
+            super::mp4_gapless_info(crate::container::mp4_find(&opus, b"moov").unwrap(), 1)
+                .expect("the Opus edit list is present");
+        assert_eq!(opus_info.skip, 336);
+        assert_eq!(opus_info.limit, Some(96_048));
+        assert!(opus_info.limit_is_presentation);
+
+        let ac3 = fixture("sample-ac3.mp4");
+        let ac3_info =
+            super::mp4_gapless_info(crate::container::mp4_find(&ac3, b"moov").unwrap(), 0)
+                .expect("the AC-3 edit list is present");
+        assert_eq!(ac3_info.skip, 256);
+        assert_eq!(ac3_info.limit, Some(96_000));
+        assert!(ac3_info.limit_is_presentation);
+
+        // The Opus decoder already consumed the 312-sample header delay, so
+        // only the remaining 24 samples of the edit list offset are skipped.
+        assert_eq!(
+            super::mp4_trim_for_kind(opus_info, super::AudioCodecKind::Opus, 312),
+            super::AudioTrim {
+                skip_frames: 24,
+                limit_frames: Some(96_048),
+                tail_padding: 0,
+            }
+        );
+    }
+    #[test]
+    fn resampler_preserves_the_passband_and_rejects_aliases() {
+        let tone = |rate: u32, frequency: f64, seconds: f64| super::DecodedAudio {
+            samples: (0..(rate as f64 * seconds) as usize)
+                .map(|frame| {
+                    (std::f64::consts::TAU * frequency * frame as f64 / f64::from(rate)).sin()
+                        as f32
+                        * 0.5
+                })
+                .collect(),
+            channels: 1,
+            sample_rate: rate,
+            source_bits: None,
+        };
+        let rms = |samples: &[f32]| {
+            (samples
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum::<f64>()
+                / samples.len() as f64)
+                .sqrt()
+        };
+
+        let passband = super::resample_audio(tone(48_000, 1_000.0, 0.5), 24_000).unwrap();
+        assert_eq!(passband.sample_rate, 24_000);
+        assert_eq!(passband.samples.len(), 12_000);
+        assert!(
+            (rms(&passband.samples) - 0.353_553).abs() < 0.03,
+            "passband RMS changed to {}",
+            rms(&passband.samples)
+        );
+        let crossings = passband
+            .samples
+            .windows(2)
+            .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
+            .count();
+        assert!(
+            (crossings as i64 - 1_000).abs() < 30,
+            "expected about 1000 zero crossings, got {crossings}"
+        );
+
+        // 20 kHz cannot exist at 24 kHz. A linear interpolator folds it to
+        // 4 kHz; the band-limited filter must remove it instead.
+        let alias = super::resample_audio(tone(48_000, 20_000.0, 0.5), 24_000).unwrap();
+        assert!(
+            rms(&alias.samples) < 0.01,
+            "20 kHz aliased through at RMS {}",
+            rms(&alias.samples)
+        );
+    }
+    fn linear_resample_reference(
+        samples: &[f32],
+        channels: usize,
+        source_rate: u32,
+        target_rate: u32,
+    ) -> Vec<f32> {
+        if channels == 0 {
+            return Vec::new();
+        }
+        let frames = samples.len() / channels;
+        if frames == 0 {
+            return Vec::new();
+        }
+        let ratio = f64::from(target_rate) / f64::from(source_rate);
+        let target_frames = ((frames as f64 * ratio).round() as usize).max(1);
+        let mut output = Vec::with_capacity(target_frames * channels);
+        for frame in 0..target_frames {
+            let position = frame as f64 / ratio;
+            let left = position.floor() as usize;
+            let right = (left + 1).min(frames - 1);
+            let fraction = (position - left as f64) as f32;
+            for channel in 0..channels {
+                let a = samples[left * channels + channel];
+                let b = samples[right * channels + channel];
+                output.push(a + (b - a) * fraction);
+            }
+        }
+        output
+    }
+    fn mono_tone(rate: u32, frequency: f64, seconds: f64) -> super::DecodedAudio {
+        let frames = (rate as f64 * seconds).round() as usize;
+        super::DecodedAudio {
+            samples: (0..frames)
+                .map(|frame| {
+                    (std::f64::consts::TAU * frequency * frame as f64 / f64::from(rate)).sin()
+                        as f32
+                        * 0.5
+                })
+                .collect(),
+            channels: 1,
+            sample_rate: rate,
+            source_bits: None,
+        }
+    }
+    fn zero_crossings(samples: &[f32]) -> usize {
+        samples
+            .windows(2)
+            .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
+            .count()
+    }
+    #[test]
+    fn resampler_rejects_high_frequency_images_at_44_1_and_48_khz() {
+        // Sweep test tones across the region above the new 22.05 kHz Nyquist.
+        // Linear interpolation folds each one back into the output, while the
+        // band-limited path rejects it. (Frequencies must stay below the 24 kHz
+        // source Nyquist; a 30 kHz test tone would already alias at 48 kHz.)
+        for (target_rate, frequency) in [
+            (44_100, 23_000.0),
+            (44_100, 23_300.0),
+            (44_100, 23_600.0),
+            (44_100, 23_900.0),
+            // A non-integer 48 -> 32 kHz ratio has a 16 kHz output Nyquist.
+            (32_000, 23_000.0),
+        ] {
+            let source = mono_tone(48_000, frequency, 0.5);
+            let old = linear_resample_reference(&source.samples, 1, 48_000, target_rate);
+            let new = super::resample_audio(source, target_rate).unwrap();
+            assert!(
+                rms(&old) > 0.2,
+                "{frequency} Hz -> {target_rate}: the linear reference did not alias: RMS {}",
+                rms(&old)
+            );
+            assert!(
+                rms(&new.samples) < 0.03,
+                "{frequency} Hz -> {target_rate} aliased through the band-limited path at RMS {}",
+                rms(&new.samples)
+            );
+            if target_rate == 32_000 {
+                // 23 kHz sampled at 48 kHz and resampled to 32 kHz folds to
+                // 9 kHz with linear interpolation: a clearly low image.
+                assert!(
+                    (zero_crossings(&old) as i64 - 9_000).abs() < 100,
+                    "the linear reference did not produce the 9 kHz image: {} crossings",
+                    zero_crossings(&old)
+                );
+            }
+        }
+    }
+    #[test]
+    fn resampler_preserves_passband_amplitude_and_frequency() {
+        for (source_rate, target_rate) in [(44_100, 48_000), (48_000, 44_100), (48_000, 32_000)] {
+            let source = mono_tone(source_rate, 10_000.0, 0.5);
+            let output = super::resample_audio(source, target_rate).unwrap();
+            assert_eq!(output.sample_rate, target_rate);
+            assert_eq!(
+                output.samples.len(),
+                ((source_rate as f64 * 0.5 * target_rate as f64 / source_rate as f64).round()
+                    as usize)
+            );
+            assert!(
+                (rms(&output.samples) - 0.353_553).abs() < 0.03,
+                "{source_rate} -> {target_rate}: passband RMS {}",
+                rms(&output.samples)
+            );
+            let crossings = zero_crossings(&output.samples);
+            let expected = (10_000.0 * 0.5 * 2.0) as i64;
+            assert!(
+                    (crossings as i64 - expected).abs() < 20,
+                    "{source_rate} -> {target_rate}: expected about {expected} crossings, got {crossings}"
+                );
+        }
+    }
+    #[test]
+    fn resampler_preserves_exact_frame_counts_and_streaming_continuity() {
+        let directory = stream_temp_dir("resampler-counts");
+        for (source_rate, frames, target_rate, expected) in [
+            (44_100, 44_100, 48_000, 48_000),
+            (48_000, 48_000, 44_100, 44_100),
+            // 48 kHz -> 32 kHz is a non-integer ratio (2/3).
+            (48_000, 48_000, 32_000, 32_000),
+            (44_100, 44_100, 32_000, 32_000),
+        ] {
+            let source = mono_tone(source_rate, 440.0, frames as f64 / source_rate as f64);
+            let direct = super::resample_audio(source, target_rate).unwrap();
+            assert_eq!(
+                direct.samples.len(),
+                expected,
+                "direct {source_rate}->{target_rate}"
+            );
+
+            let input = directory.join(format!("tone-{source_rate}-{frames}.wav"));
+            std::fs::write(&input, wav_fixture_at(source_rate, frames)).unwrap();
+            let streamed = stream_wav(
+                &input,
+                ConversionOptions {
+                    audio_sample_rate: Some(target_rate),
+                    ..Default::default()
+                },
+            );
+            let parsed = parse_wav(&streamed);
+            assert_eq!(parsed.sample_rate, target_rate);
+            assert_eq!(
+                parsed.samples.len(),
+                expected * usize::from(parsed.channels),
+                "streaming {source_rate}->{target_rate}"
+            );
+
+            let buffered = convert_bytes_with_options(
+                "tone.wav",
+                &wav_fixture_at(source_rate, frames),
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_sample_rate: Some(target_rate),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let buffered = parse_wav(&buffered[0].bytes);
+            assert_eq!(buffered.samples.len(), parsed.samples.len());
+            let max_difference = buffered
+                .samples
+                .iter()
+                .zip(&parsed.samples)
+                .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+                .max()
+                .unwrap();
+            assert!(
+                    max_difference <= 2,
+                    "streaming chunking changed samples by {max_difference} for {source_rate}->{target_rate}"
+                );
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn writes_24_bit_and_float_wav() {
+        let wav = wav_fixture();
+        let original = parse_wav(&wav);
+
+        let pcm24 = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (format, channels, rate, bits, offset, size) = wav_layout(&pcm24[0].bytes);
+        assert_eq!((format, channels, rate, bits), (1, 2, 8_000, 24));
+        assert_eq!(size, 16_000 * 3);
+        let sample = 300;
+        let bytes = &pcm24[0].bytes[offset + sample * 3..offset + sample * 3 + 3];
+        let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+        let value = (raw << 8) >> 8;
+        assert!(
+            (i32::from(original.samples[sample]) * 256 - value).abs() <= 300,
+            "24-bit sample {value} does not match {}",
+            original.samples[sample]
+        );
+
+        let float = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (format, channels, rate, bits, offset, size) = wav_layout(&float[0].bytes);
+        assert_eq!((format, channels, rate, bits), (3, 2, 8_000, 32));
+        assert_eq!(size, 16_000 * 4);
+        assert!(
+            float[0].bytes.windows(4).any(|window| window == b"fact"),
+            "a float WAV should carry a fact chunk"
+        );
+        let value = f32::from_le_bytes(
+            float[0].bytes[offset + sample * 4..offset + sample * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let expected = f32::from(original.samples[sample]) / f32::from(i16::MAX);
+        assert!((value - expected).abs() < 0.001);
+    }
+    #[test]
+    fn writes_24_bit_flac_and_rejects_float_flac() {
+        let wav = wav_fixture();
+        let flac = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&flac[0].bytes[0..4], b"fLaC");
+        let streaminfo = &flac[0].bytes[8..8 + 34];
+        let packed = u64::from_be_bytes(streaminfo[10..18].try_into().unwrap());
+        assert_eq!(((packed >> 36) & 0x1F) + 1, 24);
+
+        let back = convert_bytes("tone.flac", &flac[0].bytes, OutputFormat::Wav).unwrap();
+        let decoded = parse_wav(&back[0].bytes);
+        assert_eq!(decoded.samples.len(), 16_000);
+        assert_audible(&decoded.samples);
+
+        let error = convert_bytes_with_options(
+            "tone.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedBitDepth {
+                format: "FLAC",
+                depth: "32-bit float"
+            }
+        ));
+    }
+    #[test]
+    fn writes_wav_at_each_supported_depth_with_decodable_samples() {
+        let sample_rate = 48_000;
+        let frames = 512;
+        let mut source = Vec::with_capacity(frames);
+        for frame in 0..frames {
+            let value = ((frame as f64 / f64::from(sample_rate) * 440.0 * std::f64::consts::TAU)
+                .sin()
+                * 0.5
+                * 8_388_607.0)
+                .round() as i32;
+            source.push(value);
+        }
+        // A very low-level sample, both signs at full scale, and a tone.
+        source[0] = 1;
+        source[1] = -1;
+        source[2] = 8_388_607;
+        source[3] = -8_388_608;
+        let wav = wav_24_bit_at(sample_rate, 1, &source);
+        let expected: Vec<f32> = source
+            .iter()
+            .map(|sample| *sample as f32 / 8_388_608.0)
+            .collect();
+
+        for (depth, expected_format, expected_bits) in [
+            (AudioBitDepth::Bit16, 1, 16),
+            (AudioBitDepth::Bit24, 1, 24),
+            (AudioBitDepth::Float32, 3, 32),
+        ] {
+            let converted = convert_bytes_with_options(
+                "source.wav",
+                &wav,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_bit_depth: depth,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (format, channels, rate, bits, _, size) = wav_layout(&converted[0].bytes);
+            assert_eq!(
+                (format, channels, rate, bits),
+                (expected_format, 1, sample_rate, expected_bits),
+                "unexpected WAV header for {depth:?}"
+            );
+            assert_eq!(size, frames * usize::from(depth.bits() / 8));
+
+            match depth {
+                AudioBitDepth::Bit16 => {
+                    let parsed = parse_wav(&converted[0].bytes);
+                    assert_eq!(parsed.samples.len(), frames);
+                    for (index, (&actual, &expected)) in
+                        parsed.samples.iter().zip(&expected).enumerate()
+                    {
+                        let actual = f32::from(actual) / f32::from(i16::MAX);
+                        assert!(
+                            (actual - expected).abs() <= 2.5 / f32::from(i16::MAX),
+                            "16-bit sample {index} was {actual} instead of {expected}"
+                        );
+                    }
+                }
+                AudioBitDepth::Bit24 => {
+                    let decoded = wav_24_bit_samples(&converted[0].bytes);
+                    assert_eq!(decoded.len(), frames);
+                    for (index, (&actual, &expected)) in decoded.iter().zip(&source).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= 2,
+                            "24-bit sample {index} was {actual} instead of {expected}"
+                        );
+                    }
+                }
+                AudioBitDepth::Float32 => {
+                    let decoded = wav_float_samples(&converted[0].bytes);
+                    assert_eq!(decoded.len(), frames);
+                    for (index, (&actual, &expected)) in decoded.iter().zip(&expected).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= 1.0e-6,
+                            "float sample {index} was {actual} instead of {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn preserves_detail_below_16_bit_in_24_bit_flac_and_float_wav() {
+        let frames = 8_000;
+        let mut source = vec![1_i32; frames];
+        source[0] = -1;
+        source[1] = 2;
+        source[2] = -2;
+        source[3] = 8_388_607;
+        source[4] = -8_388_608;
+        let wav = wav_24_bit_at(48_000, 1, &source);
+
+        let flac = convert_bytes_with_options(
+            "detail.wav",
+            &wav,
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = flac_24_bit_samples(&flac[0].bytes);
+        assert_eq!(decoded.len(), frames);
+        for (index, (&actual, &expected)) in decoded.iter().zip(&source).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 1,
+                "24-bit FLAC sample {index} was {actual} instead of {expected}"
+            );
+        }
+        assert_eq!(decoded[100], 1);
+
+        let float = convert_bytes_with_options(
+            "detail.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = wav_float_samples(&float[0].bytes);
+        assert_eq!(decoded.len(), frames);
+        for (index, (&actual, &expected)) in decoded.iter().zip(&source).enumerate() {
+            let expected = expected as f32 / 8_388_608.0;
+            assert!(
+                (actual - expected).abs() <= 1.0e-7,
+                "float sample {index} was {actual} instead of {expected}"
+            );
+        }
+        assert!(decoded[100] > 0.0);
+        assert!(
+            decoded[100] < 1.0 / 32_768.0,
+            "the float output lost detail below the 16-bit LSB"
+        );
+    }
+    #[test]
+    fn dithers_16_bit_output_deterministically_without_dithering_24_bit() {
+        let source = vec![1_i32; 512];
+        let wav = wav_24_bit_at(48_000, 1, &source);
+        let convert = || {
+            convert_bytes_with_options(
+                "quiet.wav",
+                &wav,
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_bit_depth: AudioBitDepth::Bit16,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes
+        };
+        let first = convert();
+        let second = convert();
+        assert_eq!(first, second, "dither must be reproducible");
+
+        let parsed = parse_wav(&first);
+        let mut distinct = parsed.samples.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "a near-silent 16-bit signal was crushed to one value instead of dithered"
+        );
+
+        let pcm24 = convert_bytes_with_options(
+            "quiet.wav",
+            &wav,
+            OutputFormat::Wav,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = wav_24_bit_samples(&pcm24[0].bytes);
+        assert!(
+            decoded.iter().all(|sample| *sample == 1),
+            "24-bit output should be quantized without dither"
+        );
+
+        // The same rule applies when the source is a 32-bit f32 pipeline.
+        let deep = DecodedAudio {
+            samples: vec![1.0 / 8_388_608.0; 512],
+            channels: 1,
+            sample_rate: 48_000,
+            source_bits: Some(32),
+        };
+        let pcm24 = wav_24_bit_samples(&encode_wav(&deep, AudioBitDepth::Bit24).unwrap());
+        assert!(
+            pcm24.iter().all(|sample| *sample == 1),
+            "24-bit output from a 32-bit source should not be dithered"
+        );
+        let flac = flac_24_bit_samples(&encode_flac(&deep, AudioBitDepth::Bit24).unwrap());
+        assert!(
+            flac.iter().all(|sample| *sample == 1),
+            "24-bit FLAC from a 32-bit source should not be dithered"
+        );
+        let float = wav_float_samples(&encode_wav(&deep, AudioBitDepth::Float32).unwrap());
+        assert!(float
+            .iter()
+            .all(|sample| (*sample - 1.0 / 8_388_608.0).abs() <= 1.0e-7));
+    }
+    #[test]
+    fn unknown_precision_f32_to_16_bit_is_dithered() {
+        let samples = vec![1.0 / 1_048_576.0; 8_000];
+        let unknown = DecodedAudio {
+            samples: samples.clone(),
+            channels: 1,
+            sample_rate: 48_000,
+            source_bits: None,
+        };
+        let known_24 = DecodedAudio {
+            source_bits: Some(24),
+            ..unknown.clone()
+        };
+        let known_32 = DecodedAudio {
+            source_bits: Some(32),
+            ..unknown.clone()
+        };
+
+        let unknown_wav = encode_wav(&unknown, AudioBitDepth::Bit16).unwrap();
+        assert_eq!(
+            unknown_wav,
+            encode_wav(&known_24, AudioBitDepth::Bit16).unwrap(),
+            "unknown and 24-bit sources should dither identically"
+        );
+        assert_eq!(
+            unknown_wav,
+            encode_wav(&known_32, AudioBitDepth::Bit16).unwrap(),
+            "unknown and 32-bit sources should dither identically"
+        );
+        let decoded = parse_wav(&unknown_wav);
+        let truncation = undithered_i16(&samples);
+        assert_ne!(
+            decoded.samples, truncation,
+            "unknown-precision WAV matches the undithered truncation"
+        );
+        let mut distinct = decoded.samples.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "unknown-precision 16-bit output was crushed instead of dithered"
+        );
+        assert_eq!(
+            unknown_wav,
+            encode_wav(&unknown, AudioBitDepth::Bit16).unwrap(),
+            "dither must be reproducible"
+        );
+
+        let unknown_flac = encode_flac(&unknown, AudioBitDepth::Bit16).unwrap();
+        assert_eq!(
+            unknown_flac,
+            encode_flac(&known_24, AudioBitDepth::Bit16).unwrap(),
+            "unknown and 24-bit FLAC should dither identically"
+        );
+        assert_eq!(
+            unknown_flac,
+            encode_flac(&unknown, AudioBitDepth::Bit16).unwrap(),
+            "FLAC dither must be reproducible"
+        );
+        let mut reader = claxon::FlacReader::new(std::io::Cursor::new(unknown_flac)).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 16);
+        let decoded: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        let truncation: Vec<i32> = truncation.iter().map(|&sample| i32::from(sample)).collect();
+        assert_ne!(
+            decoded, truncation,
+            "unknown-precision FLAC matches the undithered truncation"
+        );
+        let mut distinct = decoded;
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 1,
+            "unknown-precision 16-bit FLAC was crushed instead of dithered"
+        );
+    }
+    #[test]
+    fn aac_16_bit_output_is_dithered_and_streaming_matches() {
+        let path = fixture_path("sample.m4a");
+        let input = std::fs::read(&path).unwrap();
+        let buffered =
+            parse_wav(&convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap()[0].bytes);
+        let streamed = parse_wav(&stream_wav(&path, ConversionOptions::default()));
+        assert_eq!(buffered.samples, streamed.samples, "sample.m4a differs");
+
+        let float_options = ConversionOptions {
+            audio_bit_depth: AudioBitDepth::Float32,
+            ..Default::default()
+        };
+        let buffered_float = wav_float_samples(
+            &convert_bytes_with_options("sample.m4a", &input, OutputFormat::Wav, float_options)
+                .unwrap()[0]
+                .bytes,
+        );
+        let streamed_float = wav_float_samples(&stream_wav(&path, float_options));
+        assert_eq!(
+            buffered_float, streamed_float,
+            "sample.m4a float samples differ"
+        );
+        let truncation = undithered_i16(&buffered_float);
+        let buffered_dithered = buffered.samples != truncation;
+        let streamed_dithered = streamed.samples != truncation;
+        assert!(
+                buffered_dithered && streamed_dithered,
+                "AAC 16-bit output must differ from the undithered truncation (buffered: {buffered_dithered}, streaming: {streamed_dithered})"
+            );
+
+        let again =
+            parse_wav(&convert_bytes("sample.m4a", &input, OutputFormat::Wav).unwrap()[0].bytes);
+        assert_eq!(
+            buffered.samples, again.samples,
+            "dither must be reproducible"
+        );
+
+        // The AAC fixture starts with the encoder's quiet pre-roll. A 16-bit
+        // conversion without dither crushes that region to zero.
+        let quiet = &buffered.samples[..512];
+        assert!(
+            quiet
+                .iter()
+                .map(|sample| sample.unsigned_abs())
+                .max()
+                .unwrap()
+                <= 4,
+            "the AAC fixture's quiet pre-roll is no longer quiet"
+        );
+        let mut distinct = quiet.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() > 1, "AAC 16-bit output was not dithered");
+        assert!(
+            quiet.iter().any(|sample| *sample != 0),
+            "AAC 16-bit output was a silent crush"
+        );
+
+        let buffered_flac = convert_bytes("sample.m4a", &input, OutputFormat::Flac)
+            .unwrap()
+            .remove(0)
+            .bytes;
+        let mut streamed_flac = std::io::Cursor::new(Vec::new());
+        crate::streaming::convert_audio_file_to_writer(
+            &path,
+            "sample.m4a",
+            OutputFormat::Flac,
+            ConversionOptions::default(),
+            &mut streamed_flac,
+        )
+        .unwrap();
+        let buffered_flac = flac_16_bit_samples(&buffered_flac);
+        let streamed_flac = flac_16_bit_samples(&streamed_flac.into_inner());
+        assert_eq!(buffered_flac, streamed_flac, "sample.m4a FLAC differs");
+        let truncation: Vec<i32> = truncation.iter().map(|&sample| i32::from(sample)).collect();
+        let buffered_dithered = buffered_flac != truncation;
+        let streamed_dithered = streamed_flac != truncation;
+        assert!(
+                buffered_dithered && streamed_dithered,
+                "AAC FLAC output must differ from the undithered truncation (buffered: {buffered_dithered}, streaming: {streamed_dithered})"
+            );
+        let mut quiet = buffered_flac[..512].to_vec();
+        quiet.sort_unstable();
+        quiet.dedup();
+        assert!(quiet.len() > 1, "AAC 16-bit FLAC was not dithered");
+    }
+    #[test]
+    fn clamps_out_of_range_samples_at_every_wav_depth() {
+        let audio = DecodedAudio {
+            samples: vec![2.0, -2.0],
+            channels: 1,
+            sample_rate: 48_000,
+            source_bits: Some(32),
+        };
+        let pcm16 = parse_wav(&encode_wav(&audio, AudioBitDepth::Bit16).unwrap());
+        assert_eq!(pcm16.samples, [i16::MAX, -i16::MAX]);
+        let pcm24 = wav_24_bit_samples(&encode_wav(&audio, AudioBitDepth::Bit24).unwrap());
+        assert_eq!(pcm24, [8_388_607, -8_388_607]);
+        let float = wav_float_samples(&encode_wav(&audio, AudioBitDepth::Float32).unwrap());
+        assert_eq!(float, [1.0, -1.0]);
+    }
+    #[test]
+    fn converts_wav_audio_to_mp3_and_back() {
+        let wav = wav_fixture_at(44_100, 44_100);
+        let mp3 = convert_bytes("tone.wav", &wav, OutputFormat::Mp3).unwrap();
+        assert_eq!(mp3[0].name, PathBuf::from("tone.mp3"));
+        assert!(
+            mp3[0].bytes.starts_with(b"ID3") || mp3[0].bytes[0] == 0xFF,
+            "the MP3 output has no MPEG frame or ID3 header"
+        );
+
+        let back = convert_bytes("tone.mp3", &mp3[0].bytes, OutputFormat::Wav).unwrap();
+        let parsed = parse_wav(&back[0].bytes);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.channels, 2);
+        assert!(
+            (parsed.samples.len() as i64 - 88_200).abs() < 2_500,
+            "MP3 round trip produced {} samples",
+            parsed.samples.len()
+        );
+        assert_audible(&parsed.samples);
+
+        // LAME has to clamp its bitrate for low sample rates instead of
+        // failing the conversion, even when the UI offers a high bitrate.
+        for bitrate in Mp3Bitrate::ALL {
+            let low_rate = convert_bytes_with_options(
+                "tone.wav",
+                &wav_fixture(),
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: bitrate,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("8 kHz MP3 at {} failed: {error}", bitrate.label()));
+            assert!(low_rate[0].bytes.len() > 100);
+        }
+    }
+    #[test]
+    fn preserves_id3v2_tags_when_re_encoding_mp3() {
+        let mp3 = convert_bytes(
+            "tone.wav",
+            &wav_fixture_at(44_100, 8_000),
+            OutputFormat::Mp3,
+        )
+        .unwrap();
+        let mut tagged = b"ID3\x04\x00\x00\x00\x00\x00\x0a".to_vec();
+        tagged.extend([0_u8; 10]);
+        tagged.extend_from_slice(&mp3[0].bytes);
+
+        let reencoded = convert_bytes("tagged.mp3", &tagged, OutputFormat::Mp3).unwrap();
+        assert!(reencoded[0].bytes.starts_with(&tagged[..20]));
+    }
+    #[test]
+    fn preserves_flac_vorbis_comments_and_pictures() {
+        let flac = convert_bytes(
+            "tone.wav",
+            &wav_fixture_at(44_100, 8_000),
+            OutputFormat::Flac,
+        )
+        .unwrap();
+        let mut blocks = flac_metadata_blocks(&flac[0].bytes).unwrap();
+        let mut comment = Vec::new();
+        comment.extend_from_slice(&4_u32.to_le_bytes());
+        comment.extend_from_slice(b"test");
+        comment.extend_from_slice(&0_u32.to_le_bytes());
+        blocks.insert(1, (4, comment.clone()));
+        let audio_start = flac_metadata_end(&flac[0].bytes).unwrap();
+        let tagged = rebuild_flac(&blocks, &flac[0].bytes[audio_start..]);
+
+        let reencoded = convert_bytes("tagged.flac", &tagged, OutputFormat::Flac).unwrap();
+        let output_blocks = flac_metadata_blocks(&reencoded[0].bytes).unwrap();
+        assert!(output_blocks
+            .iter()
+            .any(|(kind, data)| *kind == 4 && data == &comment));
+    }
+    #[test]
+    fn mp3_output_preserves_tone_channels_duration_and_bitrate() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let frames = sample_rate;
+            let wav = wav_tone_at(sample_rate, frames, channels, 1_000.0, 0.5);
+            let mp3 = convert_bytes_with_options(
+                "tone.wav",
+                &wav,
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: Mp3Bitrate::Kbps192,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes;
+            assert_mp3_tone(
+                &mp3,
+                sample_rate,
+                channels,
+                frames as usize,
+                Mp3Bitrate::Kbps192,
+            );
+        }
+
+        let wav = wav_tone_at(44_100, 44_100, 2, 1_000.0, 0.5);
+        let encode = |bitrate| {
+            convert_bytes_with_options(
+                "tone.wav",
+                &wav,
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: bitrate,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes
+        };
+        let low = encode(Mp3Bitrate::Kbps128);
+        let high = encode(Mp3Bitrate::Kbps320);
+        assert!(
+            high.len() > low.len() * 2,
+            "320 kbps produced {} bytes but 128 kbps produced {}",
+            high.len(),
+            low.len()
+        );
+        assert_mp3_tone(&low, 44_100, 2, 44_100, Mp3Bitrate::Kbps128);
+        assert_mp3_tone(&high, 44_100, 2, 44_100, Mp3Bitrate::Kbps320);
+    }
+    #[test]
+    fn converts_movie_audio_to_mp3() {
+        for name in ["sample-ac3.mkv", "sample-eac3.mkv"] {
+            let input = fixture(name);
+            let mp3 = convert_bytes_with_options(
+                name,
+                &input,
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: Mp3Bitrate::Kbps256,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0)
+            .bytes;
+            assert_eq!(mp3_first_frame_bitrate(&mp3), Some(256), "{name}");
+
+            let decoded = convert_bytes("movie.mp3", &mp3, OutputFormat::Wav).unwrap();
+            let parsed = parse_wav(&decoded[0].bytes);
+            assert_eq!(parsed.sample_rate, 48_000, "{name}");
+            assert_eq!(parsed.channels, 2, "{name}");
+            assert!(
+                parsed.samples.len() / 2 >= 90_000,
+                "{name} was truncated to {} frames",
+                parsed.samples.len() / 2
+            );
+            assert_audible(&parsed.samples);
+        }
+    }
+    #[test]
+    fn malformed_containers_return_errors_instead_of_panicking() {
+        for (name, bytes) in [
+            ("broken.webm", b"\x1a\x45\xdf\xa3".as_slice()),
+            ("broken.mkv", &[0x1A, 0x45, 0xDF, 0xA3, 0x80][..]),
+            ("broken.mp4", b"\0\0\0\x08moov".as_slice()),
+            ("broken.ac3", b"\x0b\x77".as_slice()),
+            ("empty.flac", b"".as_slice()),
+        ] {
+            let _ = convert_bytes(name, bytes, OutputFormat::Wav);
+            let _ = super::audio_tracks(bytes, "webm");
+        }
+        assert_eq!(
+            super::matroska_discard_padding(b"\x1a\x45\xdf\xa3", 1),
+            None
+        );
+        assert_eq!(super::matroska_discard_padding(b"not matroska", 1), None);
+        assert_eq!(super::mp4_gapless_info(b"\0\0\0\x08moov", 0), None);
+    }
+}

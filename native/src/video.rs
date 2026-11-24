@@ -462,3 +462,600 @@ pub(crate) fn matroska_codec_name(codec: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::convert_bytes_with_video_config;
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    use crate::options::ConversionOptions;
+
+    use crate::test_support::png_fixture;
+    use std::{
+        ffi::{OsStr, OsString},
+        path::{Path, PathBuf},
+        sync::{Mutex, OnceLock},
+    };
+    static VIDEO_ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn video_testdata(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join(name),
+        )
+        .unwrap()
+    }
+    fn real_ffmpeg() -> Option<PathBuf> {
+        let path = VideoToolConfig::default().resolve()?;
+        let output = std::process::Command::new(&path)
+            .arg("-version")
+            .output()
+            .ok()?;
+        let version = String::from_utf8_lossy(&output.stdout);
+        (output.status.success() && version.contains("ffmpeg version")).then_some(path)
+    }
+    fn generate_real_video(ffmpeg: &Path, path: &Path) {
+        let output = std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libvpx-vp9",
+                "-b:v",
+                "300k",
+                "-c:a",
+                "libopus",
+                "-shortest",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not generate the synthetic sample: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fn ffprobe_for(ffmpeg: &Path) -> Option<PathBuf> {
+        let name = if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        let path = ffmpeg.with_file_name(name);
+        path.is_file().then_some(path)
+    }
+    fn ffmpeg_stub() -> &'static Path {
+        static STUB: OnceLock<PathBuf> = OnceLock::new();
+        STUB.get_or_init(|| {
+            let directory =
+                std::env::temp_dir().join(format!("convert2it-ffmpeg-stub-{}", std::process::id()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let source = directory.join("ffmpeg_stub.rs");
+            std::fs::write(
+                &source,
+                r#"
+    use std::{env, fs, io::{self, Write}, process, thread, time::Duration};
+    fn main() {
+        let args: Vec<String> = env::args().skip(1).collect();
+        if let Ok(log) = env::var("STUB_LOG") {
+            let _ = fs::write(log, args.join("\n"));
+        }
+        if let Ok(code) = env::var("STUB_EXIT") {
+            if let Ok(stderr) = env::var("STUB_STDERR") {
+                eprintln!("{stderr}");
+            }
+            process::exit(code.parse().unwrap_or(1));
+        }
+        if let Ok(duration) = env::var("STUB_DURATION") {
+            eprintln!("Duration: {duration}");
+        }
+        if let Ok(progress) = env::var("STUB_PROGRESS") {
+            for line in progress.split('|') {
+                println!("{line}");
+            }
+        }
+        if let Ok(milliseconds) = env::var("STUB_SLEEP_MS") {
+            thread::sleep(Duration::from_millis(milliseconds.parse().unwrap_or(0)));
+        }
+        if args.iter().any(|arg| arg == "image2pipe") {
+            let path = env::var("STUB_PNG").unwrap();
+            io::stdout().write_all(&fs::read(path).unwrap()).unwrap();
+            return;
+        }
+        if let Some(output) = args.last() {
+            if env::var_os("STUB_EMPTY").is_some() {
+                let _ = fs::write(output, b"");
+            } else if let Ok(prepared) = env::var("STUB_OUTPUT") {
+                fs::copy(prepared, output).unwrap();
+            }
+        }
+    }
+    "#,
+            )
+            .unwrap();
+            let executable = directory.join(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            });
+            let status = std::process::Command::new("rustc")
+                .arg("--edition=2021")
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("rustc must be available to build the ffmpeg test stub");
+            assert!(status.success(), "could not build the ffmpeg test stub");
+            executable
+        })
+    }
+    struct EnvVars(Vec<(&'static str, Option<OsString>)>);
+    impl EnvVars {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+
+        fn set(&mut self, key: &'static str, value: impl AsRef<OsStr>) -> &mut Self {
+            self.0.push((key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+            self
+        }
+
+        fn remove(&mut self, key: &'static str) -> &mut Self {
+            self.0.push((key, std::env::var_os(key)));
+            std::env::remove_var(key);
+            self
+        }
+    }
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..).rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+    #[test]
+    fn video_thumbnail_uses_the_ffmpeg_argument_pipeline() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-thumb-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let png = directory.join("thumb.png");
+        let log = directory.join("args.log");
+        std::fs::write(&png, png_fixture()).unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_PNG", &png)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "movie.mp4",
+            &video_testdata("sample-video.mp4"),
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 1_500,
+                video_thumbnail_width: 640,
+                ..Default::default()
+            },
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("movie.png"));
+        assert_eq!(
+            image::load_from_memory(&result[0].bytes).unwrap().width(),
+            2
+        );
+
+        let args = std::fs::read_to_string(&log).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.windows(2).any(|pair| pair == ["-ss", "1.500"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-vf", "scale=640:-2:flags=lanczos"]));
+        assert!(args.contains(&"image2pipe"));
+        assert!(args.windows(2).any(|pair| pair == ["-frames:v", "1"]));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn remux_copies_streams_and_rejects_empty_ffmpeg_output() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-remux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.webm");
+        let log = directory.join("args.log");
+        let prepared_bytes = b"\x1aE\xdf\xa3stub-webm".to_vec();
+        std::fs::write(&prepared, &prepared_bytes).unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("sample-vp9-opus.webm"));
+        assert_eq!(result[0].bytes, prepared_bytes);
+        let args = std::fs::read_to_string(&log).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.windows(2).any(|pair| pair == ["-c", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:v?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
+        assert!(args.windows(2).any(|pair| pair == ["-f", "webm"]));
+
+        env.set("STUB_EMPTY", "1");
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.webm",
+            &video_testdata("sample-vp9-opus.webm"),
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::FfmpegEmptyOutput));
+
+        let invalid = directory.join("invalid.webm");
+        std::fs::write(&invalid, b"not-a-container").unwrap();
+        env.remove("STUB_EMPTY").set("STUB_OUTPUT", &invalid);
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::FfmpegInvalidOutput { container: "webm" }
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn remux_surfaces_ffmpeg_stderr_and_missing_binary() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-failure-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_EXIT", "7")
+            .set("STUB_STDERR", "stub failure details")
+            .remove("STUB_EMPTY");
+
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap_err();
+        match error {
+            ConvertError::FfmpegFailed { status, stderr } => {
+                assert_eq!(status, "7");
+                assert!(stderr.contains("stub failure details"), "{stderr}");
+            }
+            other => panic!("expected FfmpegFailed, got {other}"),
+        }
+
+        let missing = directory.join("does-not-exist");
+        let error = convert_bytes_with_video_config(
+            "sample-vp9-opus.mp4",
+            &video_testdata("sample-vp9-opus.mp4"),
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(missing),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::FfmpegNotFound { .. }));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn ffmpeg_is_discovered_on_path_and_incompatible_codecs_are_rejected() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-path-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.mp4");
+        let log = directory.join("args.log");
+        std::fs::write(&prepared, b"\0\0\0\x18ftypstub").unwrap();
+        let stub_directory = ffmpeg_stub().parent().unwrap();
+        let mut env = EnvVars::new();
+        env.set("PATH", stub_directory)
+            .set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("CONVERT2IT_FFMPEG")
+            .remove("FFMPEG")
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "sample-vp9-opus.webm",
+            &video_testdata("sample-vp9-opus.webm"),
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result[0].bytes, b"\0\0\0\x18ftypstub");
+
+        let error = validate_remux(
+            &video_testdata("sample-video.mp4"),
+            "mp4",
+            OutputFormat::Webm,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedVideoCodec {
+                stream: "video",
+                codec,
+                container: "webm"
+            } if codec == "h264"
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn incompatible_stream_copy_combinations_return_a_typed_error() {
+        let missing_ffmpeg = std::env::temp_dir().join("convert2it-definitely-missing-ffmpeg");
+        for name in ["sample-even-h264.mp4", "sample-multitrack-h264.mp4"] {
+            let error = convert_bytes_with_video_config(
+                name,
+                &video_testdata(name),
+                OutputFormat::Webm,
+                ConversionOptions::default(),
+                &VideoToolConfig::with_ffmpeg(&missing_ffmpeg),
+            )
+            .unwrap_err();
+            match error {
+                ConvertError::UnsupportedVideoCodec {
+                    stream: "video",
+                    codec,
+                    container: "webm",
+                } => assert_eq!(codec, "h264", "{name}"),
+                other => panic!("{name}: expected an unsupported-codec error, got {other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn h264_mp4_to_mp4_remuxes_with_stream_copy() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-mp4-remux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.mp4");
+        let log = directory.join("args.log");
+        std::fs::write(&prepared, b"\0\0\0\x18ftypstub").unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        let result = convert_bytes_with_video_config(
+            "sample-odd-h264.mp4",
+            &video_testdata("sample-odd-h264.mp4"),
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("sample-odd-h264.mp4"));
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.contains("-c\ncopy"), "{args}");
+        assert!(args.contains("-map\n0:v?"), "{args}");
+        assert!(args.contains("-map\n0:a?"), "{args}");
+        assert!(!args.contains("libvpx"), "{args}");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn real_ffmpeg_generated_media_remux_and_thumbnails_when_available() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let Some(ffmpeg) = real_ffmpeg() else {
+            eprintln!("skipping real-ffmpeg library test: ffmpeg is not available");
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("convert2it-real-video-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let input_path = directory.join("synthetic.mp4");
+        generate_real_video(&ffmpeg, &input_path);
+        let input = std::fs::read(&input_path).unwrap();
+        let config = VideoToolConfig::with_ffmpeg(&ffmpeg);
+
+        let webm = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(webm[0].name, PathBuf::from("synthetic.webm"));
+        assert!(!webm[0].bytes.is_empty());
+        assert!(webm[0].bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]));
+        let webm_path = directory.join("synthetic.webm");
+        std::fs::write(&webm_path, &webm[0].bytes).unwrap();
+        let ffprobe = ffprobe_for(&ffmpeg);
+        let mut webm_streams = None;
+        if let Some(ffprobe) = ffprobe.as_ref() {
+            let output = std::process::Command::new(ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=format_name:stream=codec_name,codec_type,width,height,channels",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                ])
+                .arg(&webm_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let probe = String::from_utf8_lossy(&output.stdout);
+            assert!(probe.contains("format_name=matroska,webm"), "{probe}");
+            assert!(probe.contains("codec_name=vp9"), "{probe}");
+            assert!(probe.contains("codec_name=opus"), "{probe}");
+            assert!(probe.contains("width=320"), "{probe}");
+            assert!(probe.contains("height=240"), "{probe}");
+            let streams = probe
+                .lines()
+                .filter(|line| !line.starts_with("format_name="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(streams.contains("codec_type=video"), "{streams}");
+            assert!(streams.contains("codec_type=audio"), "{streams}");
+            webm_streams = Some(streams);
+        }
+
+        let back = convert_bytes_with_video_config(
+            "synthetic.webm",
+            &webm[0].bytes,
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(back[0].name, PathBuf::from("synthetic.mp4"));
+        assert_eq!(back[0].bytes.get(4..8), Some(b"ftyp".as_slice()));
+        let back_path = directory.join("synthetic-roundtrip.mp4");
+        std::fs::write(&back_path, &back[0].bytes).unwrap();
+        if let Some(ffprobe) = ffprobe.as_ref() {
+            let output = std::process::Command::new(ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=format_name:stream=codec_name,codec_type,width,height,channels",
+                    "-of",
+                    "default=noprint_wrappers=1",
+                ])
+                .arg(&back_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let probe = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                probe.contains("format_name=") && probe.contains("mp4"),
+                "{probe}"
+            );
+            assert!(probe.contains("codec_name=vp9"), "{probe}");
+            assert!(probe.contains("codec_name=opus"), "{probe}");
+            assert!(probe.contains("width=320"), "{probe}");
+            assert!(probe.contains("height=240"), "{probe}");
+            let streams = probe
+                .lines()
+                .filter(|line| !line.starts_with("format_name="))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(webm_streams) = webm_streams.as_deref() {
+                assert_eq!(webm_streams, streams);
+            }
+        }
+
+        let thumbnails = [
+            (OutputFormat::Png, image::ImageFormat::Png),
+            (OutputFormat::Jpeg, image::ImageFormat::Jpeg),
+            (OutputFormat::Webp, image::ImageFormat::WebP),
+        ];
+        for (target, format) in thumbnails {
+            let thumbnail = convert_bytes_with_video_config(
+                "synthetic.mp4",
+                &input,
+                target,
+                ConversionOptions {
+                    video_frame_time_ms: 500,
+                    video_thumbnail_width: 160,
+                    ..Default::default()
+                },
+                &config,
+            )
+            .unwrap();
+            assert!(!thumbnail[0].bytes.is_empty());
+            assert_eq!(image::guess_format(&thumbnail[0].bytes).unwrap(), format);
+            let decoded = image::load_from_memory(&thumbnail[0].bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (160, 120));
+        }
+
+        let at_zero = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 0,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap();
+        let at_half_second = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 500,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap();
+        assert_ne!(at_zero[0].bytes, at_half_second[0].bytes);
+
+        let error = convert_bytes_with_video_config(
+            "synthetic.mp4",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                video_frame_time_ms: 10_000,
+                video_thumbnail_width: 160,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::FfmpegEmptyOutput));
+        assert_eq!(error.to_string(), "ffmpeg produced no output");
+
+        let error = convert_bytes_with_video_config(
+            "broken.mp4",
+            b"not a movie",
+            OutputFormat::Webm,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap_err();
+        match error {
+            ConvertError::FfmpegFailed { status, stderr } => {
+                assert_ne!(status, "0");
+                assert!(!stderr.is_empty());
+            }
+            other => panic!("expected a real ffmpeg failure, got {other}"),
+        }
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+}

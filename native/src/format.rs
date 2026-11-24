@@ -344,3 +344,122 @@ pub fn native_format_registry() -> Vec<FormatHandler> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input_extensions::supported_input_extensions;
+    use crate::input_format;
+
+    #[test]
+    fn native_registry_lists_pdf_archive_and_media_handlers() {
+        let registry = native_format_registry();
+        assert_eq!(registry.len(), input_format::InputFormat::SELECTABLE.len());
+        assert!(registry.iter().all(|handler| !handler.outputs.is_empty()));
+
+        let pdf = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Pdf)
+            .unwrap();
+        assert!(pdf.outputs.contains(&OutputFormat::Text));
+        assert!(pdf.outputs.contains(&OutputFormat::TextUtf16Le));
+        assert!(!pdf.outputs.contains(&OutputFormat::Png));
+
+        let archive = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Archive)
+            .unwrap();
+        assert!(archive.outputs.contains(&OutputFormat::Files));
+        assert!(archive.outputs.contains(&OutputFormat::Zip));
+
+        let video = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Video)
+            .unwrap();
+        assert!(video.outputs.contains(&OutputFormat::Png));
+        assert!(video.outputs.contains(&OutputFormat::Jpeg));
+        assert!(video.outputs.contains(&OutputFormat::Webp));
+        assert!(video.outputs.contains(&OutputFormat::Mp4));
+        assert!(video.outputs.contains(&OutputFormat::Webm));
+        assert!(!video.outputs.contains(&OutputFormat::Gif));
+
+        let any = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Any)
+            .unwrap();
+        assert_eq!(any.outputs.first(), Some(&OutputFormat::Files));
+    }
+    #[test]
+    fn recognizes_the_new_input_formats() {
+        assert!(OutputFormat::Png.supports_input("icon.svg"));
+        assert!(OutputFormat::Ico.supports_input("icon.ico"));
+        assert!(OutputFormat::Hdr.supports_input("photo.dds"));
+        assert!(OutputFormat::Wav.supports_input("song.mp3"));
+        assert!(OutputFormat::Flac.supports_input("song.m4a"));
+        assert!(OutputFormat::Aiff.supports_input("song.aiff"));
+        assert!(OutputFormat::Opus.supports_input("song.wav"));
+        assert!(OutputFormat::Mp3.supports_input("song.wav"));
+        assert!(OutputFormat::Mp3.supports_input("movie.mkv"));
+        assert!(OutputFormat::Wav.supports_input("movie.mkv"));
+        assert!(OutputFormat::Pbm.supports_input("photo.png"));
+        assert!(OutputFormat::Yaml.supports_input("config.toml"));
+    }
+    #[test]
+    fn file_picker_extensions_stay_in_sync_with_conversion_inputs() {
+        let extensions = supported_input_extensions();
+        let unique: std::collections::HashSet<_> = extensions.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            extensions.len(),
+            "the file picker lists a duplicate extension"
+        );
+
+        for extension in &extensions {
+            assert_eq!(
+                *extension,
+                extension.to_ascii_lowercase().as_str(),
+                "file picker extensions must be lowercase"
+            );
+            assert!(
+                OutputFormat::ALL
+                    .iter()
+                    .any(|format| format.supports_input(&format!("sample.{extension}"))),
+                "the file picker offers .{extension}, but no output format accepts it"
+            );
+        }
+
+        for format in OutputFormat::ALL.iter() {
+            if matches!(
+                *format,
+                OutputFormat::Zip
+                    | OutputFormat::Tar
+                    | OutputFormat::TarGz
+                    | OutputFormat::Gzip
+                    | OutputFormat::Files
+            ) {
+                continue;
+            }
+            assert!(
+                extensions
+                    .iter()
+                    .any(|extension| format.supports_input(&format!("sample.{extension}"))),
+                "{} has no input extension in the file picker",
+                format.label()
+            );
+        }
+
+        for extension in ["zip", "tar", "tgz", "gz"] {
+            assert!(
+                extensions.contains(&extension),
+                "archives must be selectable so they can be extracted"
+            );
+        }
+
+        for extension in ["ogg", "m4a", "svg"] {
+            assert!(
+                extensions.contains(&extension),
+                "the file picker is missing .{extension}"
+            );
+        }
+    }
+}

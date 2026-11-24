@@ -140,3 +140,45 @@ pub(crate) fn json_to_toml_value(value: &serde_json::Value) -> Option<toml::Valu
         serde_json::Value::Object(object) => Some(toml::Value::Table(json_object_to_toml(object))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use crate::convert::convert_bytes;
+    use crate::format::OutputFormat;
+    #[test]
+    fn converts_csv_to_json_and_back() {
+        let csv = b"name,age\nAda,36\nLin,28\n";
+        let json = convert_bytes("people.csv", csv, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json[0].bytes).unwrap();
+        assert_eq!(value[0]["name"], "Ada");
+        assert_eq!(value[1]["age"], "28");
+
+        let round_trip = convert_bytes("people.json", &json[0].bytes, OutputFormat::Csv).unwrap();
+        let mut reader = csv::Reader::from_reader(round_trip[0].bytes.as_slice());
+        let headers = reader.headers().unwrap().clone();
+        let name_column = headers.iter().position(|header| header == "name").unwrap();
+        let age_column = headers.iter().position(|header| header == "age").unwrap();
+        let first = reader.records().next().unwrap().unwrap();
+        assert_eq!(&first[name_column], "Ada");
+        assert_eq!(&first[age_column], "36");
+    }
+    #[test]
+    fn converts_between_json_yaml_and_toml() {
+        let json = br#"{"name":"Ada","age":36,"tags":["math","code"]}"#;
+
+        let yaml = convert_bytes("person.json", json, OutputFormat::Yaml).unwrap();
+        let back = convert_bytes("person.yaml", &yaml[0].bytes, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&back[0].bytes).unwrap();
+        assert_eq!(value["name"], "Ada");
+        assert_eq!(value["age"], 36);
+        assert_eq!(value["tags"][1], "code");
+
+        let toml = convert_bytes("person.json", json, OutputFormat::Toml).unwrap();
+        let back = convert_bytes("person.toml", &toml[0].bytes, OutputFormat::Json).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&back[0].bytes).unwrap();
+        assert_eq!(value["name"], "Ada");
+        assert_eq!(value["age"], 36);
+        assert_eq!(value["tags"][1], "code");
+    }
+}

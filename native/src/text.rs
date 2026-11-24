@@ -181,3 +181,46 @@ pub(crate) fn encode_text(text: &str, target: OutputFormat) -> Result<Vec<u8>, C
         _ => Err(unsupported("txt", target)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use crate::convert::convert_bytes;
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    #[test]
+    fn converts_plain_text_to_json_string_and_back() {
+        let json = convert_bytes("note.txt", b"hello\nworld", OutputFormat::Json).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<String>(&json[0].bytes).unwrap(),
+            "hello\nworld"
+        );
+        let text = convert_bytes("note.json", &json[0].bytes, OutputFormat::Text).unwrap();
+        assert_eq!(text[0].bytes, b"hello\nworld");
+    }
+    #[test]
+    fn converts_text_between_the_web_supported_unicode_encodings() {
+        let content = "Hello 🌍";
+        for target in [
+            OutputFormat::TextUtf8NoBom,
+            OutputFormat::TextUtf8Bom,
+            OutputFormat::TextUtf16Le,
+            OutputFormat::TextUtf16Be,
+            OutputFormat::TextUtf32Le,
+            OutputFormat::TextUtf32Be,
+        ] {
+            let encoded = convert_bytes("sample.txt", content.as_bytes(), target).unwrap();
+            let decoded =
+                convert_bytes("sample.txt", &encoded[0].bytes, OutputFormat::Text).unwrap();
+            assert_eq!(decoded[0].bytes, content.as_bytes());
+        }
+    }
+    #[test]
+    fn rejects_invalid_unicode_code_points_in_utf32_text() {
+        let input = [0xff, 0xfe, 0x00, 0x00, 0x00, 0xd8, 0x00, 0x00];
+        assert!(matches!(
+            convert_bytes("sample.txt", &input, OutputFormat::Text),
+            Err(ConvertError::InvalidUnicodeCodePoint(0xd800))
+        ));
+    }
+}

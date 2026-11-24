@@ -229,3 +229,244 @@ pub(crate) fn safe_archive_path(name: &str) -> Result<PathBuf, ConvertError> {
     }
     Ok(safe)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::{convert_batch, convert_batch_with_options, convert_bytes};
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    use crate::options::ConversionOptions;
+    use std::{
+        io::{Cursor, Read, Write},
+        path::PathBuf,
+    };
+    #[test]
+    fn applies_archive_compression_options() {
+        let inputs = vec![(
+            PathBuf::from("note.txt"),
+            b"the same line repeated many times\n".repeat(2_000),
+        )];
+
+        let fast_zip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Zip,
+            ConversionOptions {
+                archive_compression: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let best_zip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Zip,
+            ConversionOptions {
+                archive_compression: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            best_zip[0].bytes.len() <= fast_zip[0].bytes.len(),
+            "higher ZIP compression should not produce a larger archive"
+        );
+        assert!(zip::ZipArchive::new(Cursor::new(&best_zip[0].bytes)).is_ok());
+
+        let fast_gzip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Gzip,
+            ConversionOptions {
+                archive_compression: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let best_gzip = convert_batch_with_options(
+            &inputs,
+            OutputFormat::Gzip,
+            ConversionOptions {
+                archive_compression: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            best_gzip[0].bytes.len() <= fast_gzip[0].bytes.len(),
+            "higher GZIP compression should not produce a larger file"
+        );
+        let mut decoder = flate2::read::GzDecoder::new(Cursor::new(&best_gzip[0].bytes));
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, inputs[0].1);
+    }
+    #[test]
+    fn archives_multiple_files() {
+        let inputs = vec![
+            (PathBuf::from("one.txt"), b"one".to_vec()),
+            (PathBuf::from("two.txt"), b"two".to_vec()),
+        ];
+        let archive = convert_batch(&inputs, OutputFormat::Zip).unwrap();
+        assert_eq!(archive[0].name, PathBuf::from("converted.zip"));
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(&archive[0].bytes)).unwrap();
+        assert_eq!(zip.len(), 2);
+        let mut one = String::new();
+        zip.by_name("one.txt")
+            .unwrap()
+            .read_to_string(&mut one)
+            .unwrap();
+        assert_eq!(one, "one");
+        let mut two = String::new();
+        zip.by_name("two.txt")
+            .unwrap()
+            .read_to_string(&mut two)
+            .unwrap();
+        assert_eq!(two, "two");
+    }
+    #[test]
+    fn extracts_zip_tar_and_gzip_archives() {
+        let zip_bytes = {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("nested/one.txt", options).unwrap();
+            writer.write_all(b"one").unwrap();
+            writer.start_file("two.txt", options).unwrap();
+            writer.write_all(b"two").unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let files = convert_bytes("bundle.zip", &zip_bytes, OutputFormat::Files).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, PathBuf::from("nested/one.txt"));
+        assert_eq!(files[0].bytes, b"one");
+        assert_eq!(files[1].name, PathBuf::from("two.txt"));
+        assert_eq!(files[1].bytes, b"two");
+
+        let tar_bytes = {
+            let mut builder = tar::Builder::new(Vec::new());
+            for (name, content) in [("nested/one.txt", &b"one"[..]), ("two.txt", &b"two"[..])] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, content).unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let files = convert_bytes("bundle.tar", &tar_bytes, OutputFormat::Files).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, PathBuf::from("nested/one.txt"));
+        assert_eq!(files[0].bytes, b"one");
+
+        let gzip = convert_bytes("note.txt", b"hello", OutputFormat::Gzip).unwrap();
+        let files = convert_bytes("note.txt.gz", &gzip[0].bytes, OutputFormat::Files).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, PathBuf::from("note.txt"));
+        assert_eq!(files[0].bytes, b"hello");
+    }
+    #[test]
+    fn rejects_archive_paths_that_escape_the_output_directory() {
+        let tar_bytes = {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_path("safe.txt").unwrap();
+            header.as_mut_bytes()[..11].copy_from_slice(b"../evil.txt");
+            header.set_size(3);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &b"bad"[..]).unwrap();
+            builder.into_inner().unwrap()
+        };
+        assert!(matches!(
+            convert_bytes("bundle.tar", &tar_bytes, OutputFormat::Files),
+            Err(ConvertError::UnsafeArchivePath(_))
+        ));
+
+        for name in [
+            "../evil.txt",
+            "nested/../../evil.txt",
+            "/absolute.txt",
+            "C:\\evil.txt",
+        ] {
+            let zip_bytes = {
+                let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                let options = zip::write::SimpleFileOptions::default();
+                writer.start_file(name, options).unwrap();
+                writer.write_all(b"bad").unwrap();
+                writer.finish().unwrap().into_inner()
+            };
+            let error = convert_bytes("bundle.zip", &zip_bytes, OutputFormat::Files).unwrap_err();
+            assert!(
+                matches!(error, ConvertError::UnsafeArchivePath(_)),
+                "{name} produced {error}"
+            );
+        }
+    }
+    #[test]
+    fn rejects_duplicate_archive_entry_names() {
+        let inputs = vec![
+            (PathBuf::from("first/one.txt"), b"one".to_vec()),
+            (PathBuf::from("second/one.txt"), b"two".to_vec()),
+        ];
+        assert!(matches!(
+            convert_batch(&inputs, OutputFormat::Zip),
+            Err(ConvertError::DuplicateArchiveEntryName(name)) if name == "one.txt"
+        ));
+    }
+    #[test]
+    fn rejects_archives_with_too_many_entries() {
+        let inputs: Vec<(PathBuf, Vec<u8>)> = (0..=MAX_ARCHIVE_ENTRIES)
+            .map(|index| (PathBuf::from(format!("{index}.txt")), Vec::new()))
+            .collect();
+        assert!(matches!(
+            convert_batch(&inputs, OutputFormat::Zip),
+            Err(ConvertError::ArchiveTooManyEntries { max, .. }) if max == MAX_ARCHIVE_ENTRIES
+        ));
+    }
+    #[test]
+    fn packs_tar_archives() {
+        let inputs = vec![
+            (PathBuf::from("one.txt"), b"one".to_vec()),
+            (PathBuf::from("two.txt"), b"two".to_vec()),
+        ];
+
+        for (target, name) in [
+            (OutputFormat::Tar, "converted.tar"),
+            (OutputFormat::TarGz, "converted.tar.gz"),
+        ] {
+            let archive = convert_batch(&inputs, target).unwrap();
+            assert_eq!(archive[0].name, PathBuf::from(name));
+
+            let reader: Box<dyn Read> = if target == OutputFormat::TarGz {
+                Box::new(flate2::read::GzDecoder::new(Cursor::new(&archive[0].bytes)))
+            } else {
+                Box::new(Cursor::new(&archive[0].bytes))
+            };
+            let mut tar = tar::Archive::new(reader);
+            let mut entries = Vec::new();
+            for entry in tar.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                entries.push((path, bytes));
+            }
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, "one.txt");
+            assert_eq!(entries[0].1, b"one");
+            assert_eq!(entries[1].0, "two.txt");
+            assert_eq!(entries[1].1, b"two");
+        }
+    }
+    #[test]
+    fn compresses_gzip_files() {
+        let gzip = convert_bytes("note.txt", b"hello", OutputFormat::Gzip).unwrap();
+        assert_eq!(gzip[0].name, PathBuf::from("note.txt.gz"));
+        assert_eq!(&gzip[0].bytes[0..2], &[0x1f, 0x8b]);
+
+        let mut decoder = flate2::read::GzDecoder::new(Cursor::new(&gzip[0].bytes));
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+}

@@ -455,3 +455,164 @@ pub(crate) fn win_ansi_byte(character: char) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::{convert_bytes, convert_bytes_with_options};
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    use crate::options::ConversionOptions;
+    use crate::test_support::png_fixture;
+
+    use std::path::PathBuf;
+    fn jpeg_fixture() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(4, 3, image::Rgb([180, 90, 40]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        bytes
+    }
+    #[test]
+    fn converts_images_to_pdf() {
+        let converted = convert_bytes("sample.png", &png_fixture(), OutputFormat::Pdf).unwrap();
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].name, PathBuf::from("sample.pdf"));
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.starts_with("%PDF-"));
+        assert!(pdf.contains("/Subtype /Image"));
+        assert!(pdf.contains("/Filter /FlateDecode"));
+        assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"));
+    }
+    #[test]
+    fn embeds_jpeg_input_without_reencoding() {
+        let jpeg = jpeg_fixture();
+        let converted = convert_bytes("photo.jpg", &jpeg, OutputFormat::Pdf).unwrap();
+        assert!(converted[0]
+            .bytes
+            .windows(jpeg.len())
+            .any(|window| window == jpeg));
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/Filter /DCTDecode"));
+        assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"));
+    }
+    #[test]
+    fn image_fit_math_centers_and_crops() {
+        let contain = super::image_placement(64.0, 48.0, 595.28, 841.89, PdfImageFit::Contain);
+        assert!((contain.width - 595.28).abs() < 0.01);
+        assert!((contain.height - 446.46).abs() < 0.01);
+        assert!(contain.x.abs() < 0.01);
+        assert!((contain.y - 197.715).abs() < 0.01);
+
+        let cover = super::image_placement(64.0, 48.0, 792.0, 612.0, PdfImageFit::Cover);
+        assert!((cover.width - 816.0).abs() < 0.01);
+        assert!((cover.height - 612.0).abs() < 0.01);
+        assert!((cover.x + 12.0).abs() < 0.01);
+        assert!(cover.y.abs() < 0.01);
+    }
+    #[test]
+    fn applies_pdf_page_orientation_and_image_fit() {
+        let converted = convert_bytes_with_options(
+            "sample.png",
+            &png_fixture(),
+            OutputFormat::Pdf,
+            ConversionOptions {
+                pdf_page_size: PdfPageSize::Letter,
+                pdf_orientation: PdfOrientation::Landscape,
+                pdf_image_fit: PdfImageFit::Cover,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/MediaBox [0 0 792 612]"));
+        assert!(pdf.contains("792 0 0 792 0 -90 cm"));
+    }
+    #[test]
+    fn converts_text_to_a_paginated_pdf() {
+        let text = "Hello, PDF!\n".repeat(120);
+        let converted = convert_bytes("notes.txt", text.as_bytes(), OutputFormat::Pdf).unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("(Hello, PDF!) Tj"));
+        assert!(pdf.contains("/MediaBox [0 0 595.28 841.89]"));
+        assert!(pdf.contains("/F1 11 Tf"));
+        let pages = pdf.matches("/Type /Page").count() - pdf.matches("/Type /Pages").count();
+        assert_eq!(pages, 3);
+    }
+    #[test]
+    fn extracts_text_from_pdf_input() {
+        let pdf = convert_bytes(
+            "notes.txt",
+            b"Hello from PDF\nSecond line\n",
+            OutputFormat::Pdf,
+        )
+        .unwrap();
+        let text = convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::Text).unwrap();
+        let text = String::from_utf8(text[0].bytes.clone()).unwrap();
+        assert!(text.contains("Hello from PDF"), "extracted: {text:?}");
+        assert!(text.contains("Second line"), "extracted: {text:?}");
+
+        let utf16 = convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::TextUtf16Le).unwrap();
+        assert_eq!(&utf16[0].bytes[..2], &[0xff, 0xfe]);
+
+        assert!(matches!(
+            convert_bytes("notes.pdf", &pdf[0].bytes, OutputFormat::Png),
+            Err(ConvertError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            convert_bytes(
+                "broken.pdf",
+                b"%PDF-1.7\nnot a document",
+                OutputFormat::Text
+            ),
+            Err(ConvertError::Pdf(_))
+        ));
+    }
+    #[test]
+    fn applies_pdf_page_font_and_margin_options() {
+        let text = "Hello, PDF!\n".repeat(120);
+        let converted = convert_bytes_with_options(
+            "notes.txt",
+            text.as_bytes(),
+            OutputFormat::Pdf,
+            ConversionOptions {
+                pdf_page_size: PdfPageSize::Letter,
+                pdf_font_size: 20,
+                pdf_margin: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/MediaBox [0 0 612 792]"));
+        assert!(pdf.contains("/F1 20 Tf"));
+        let pages = pdf.matches("/Type /Page").count() - pdf.matches("/Type /Pages").count();
+        assert_eq!(pages, 6);
+    }
+    #[test]
+    fn clamps_pdf_options_to_supported_ranges() {
+        let converted = convert_bytes_with_options(
+            "notes.txt",
+            b"Hello\n",
+            OutputFormat::Pdf,
+            ConversionOptions {
+                pdf_font_size: 0,
+                pdf_margin: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pdf = String::from_utf8_lossy(&converted[0].bytes);
+        assert!(pdf.contains("/F1 1 Tf"));
+        assert!(pdf.contains("1 0 0 1 144 "));
+    }
+    #[test]
+    fn rejects_pdf_output_for_unstructured_data() {
+        let error = convert_bytes("data.csv", b"name\nvalue\n", OutputFormat::Pdf).unwrap_err();
+        assert!(matches!(error, ConvertError::Unsupported { .. }));
+    }
+}

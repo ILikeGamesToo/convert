@@ -311,3 +311,22 @@ pub fn convert_batch_with_video_config(
     }
     Ok(converted)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    #[test]
+    fn rejects_empty_batches() {
+        assert!(matches!(
+            convert_batch(&[], OutputFormat::Json),
+            Err(ConvertError::NoInputFiles)
+        ));
+    }
+    #[test]
+    fn reports_unsupported_format_pairs() {
+        let error = convert_bytes("movie.mp4", b"not a movie", OutputFormat::Pdf).unwrap_err();
+        assert!(matches!(error, ConvertError::Unsupported { .. }));
+    }
+}

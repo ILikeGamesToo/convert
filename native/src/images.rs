@@ -492,3 +492,609 @@ pub(crate) fn rasterize_svg(input: &[u8]) -> Result<image::DynamicImage, Convert
         .ok_or_else(|| ConvertError::Svg("could not read the rendered SVG pixels".to_owned()))?;
     Ok(image::DynamicImage::ImageRgba8(buffer))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::{convert_bytes, convert_bytes_with_options};
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    use crate::options::ConversionOptions;
+    use crate::test_support::{png_fixture, tiff_with_orientations};
+    use std::{io::Cursor, path::PathBuf};
+    fn detailed_png_fixture() -> Vec<u8> {
+        let mut pixels = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                (x * 4) as u8,
+                (y * 4) as u8,
+                ((x * 17 + y * 29) % 256) as u8,
+            ]);
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+    #[test]
+    fn converts_between_supported_image_formats() {
+        let result = convert_bytes("sample.png", &png_fixture(), OutputFormat::Webp).unwrap();
+        assert_eq!(result[0].name, PathBuf::from("sample.webp"));
+        let decoded =
+            image::load_from_memory_with_format(&result[0].bytes, image::ImageFormat::WebP)
+                .unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+    }
+    #[test]
+    fn applies_jpeg_quality_and_png_compression_options() {
+        let input = detailed_png_fixture();
+        let low_quality = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Jpeg,
+            ConversionOptions {
+                jpeg_quality: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let high_quality = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Jpeg,
+            ConversionOptions {
+                jpeg_quality: Some(95),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(low_quality[0].name, PathBuf::from("sample.jpg"));
+        assert_eq!(high_quality[0].name, PathBuf::from("sample.jpg"));
+        assert!(
+            high_quality[0].bytes.len() > low_quality[0].bytes.len(),
+            "higher JPEG quality should produce a larger file"
+        );
+        assert!(image::load_from_memory_with_format(
+            &high_quality[0].bytes,
+            image::ImageFormat::Jpeg
+        )
+        .is_ok());
+
+        let fast_png = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                png_compression: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let best_png = convert_bytes_with_options(
+            "sample.png",
+            &input,
+            OutputFormat::Png,
+            ConversionOptions {
+                png_compression: Some(9),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fast_png[0].name, PathBuf::from("sample.png"));
+        assert_eq!(best_png[0].name, PathBuf::from("sample.png"));
+        assert!(
+            best_png[0].bytes.len() <= fast_png[0].bytes.len(),
+            "higher PNG compression should not produce a larger file"
+        );
+        assert!(
+            image::load_from_memory_with_format(&best_png[0].bytes, image::ImageFormat::Png)
+                .is_ok()
+        );
+    }
+    #[test]
+    fn converts_to_bmp_and_tiff_outputs() {
+        for (target, extension, format) in [
+            (OutputFormat::Bmp, "bmp", image::ImageFormat::Bmp),
+            (OutputFormat::Tiff, "tiff", image::ImageFormat::Tiff),
+        ] {
+            let result = convert_bytes("sample.png", &png_fixture(), target).unwrap();
+            assert_eq!(result[0].name, PathBuf::from(format!("sample.{extension}")));
+
+            let decoded = image::load_from_memory_with_format(&result[0].bytes, format).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        }
+    }
+    #[test]
+    fn converts_bmp_and_tiff_inputs_to_png() {
+        for (extension, format) in [
+            ("bmp", image::ImageFormat::Bmp),
+            ("tif", image::ImageFormat::Tiff),
+            ("tiff", image::ImageFormat::Tiff),
+        ] {
+            let mut input = Cursor::new(Vec::new());
+            image::load_from_memory(&png_fixture())
+                .unwrap()
+                .write_to(&mut input, format)
+                .unwrap();
+
+            let result = convert_bytes(
+                &format!("sample.{extension}"),
+                &input.into_inner(),
+                OutputFormat::Png,
+            )
+            .unwrap();
+            let decoded =
+                image::load_from_memory_with_format(&result[0].bytes, image::ImageFormat::Png)
+                    .unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        }
+    }
+    #[test]
+    fn converts_png_to_the_new_image_formats() {
+        for (target, format) in [
+            (OutputFormat::Gif, image::ImageFormat::Gif),
+            (OutputFormat::Ico, image::ImageFormat::Ico),
+            (OutputFormat::Ppm, image::ImageFormat::Pnm),
+            (OutputFormat::Tga, image::ImageFormat::Tga),
+            (OutputFormat::Qoi, image::ImageFormat::Qoi),
+            (OutputFormat::Hdr, image::ImageFormat::Hdr),
+            (OutputFormat::Farbfeld, image::ImageFormat::Farbfeld),
+        ] {
+            let result = convert_bytes("sample.png", &png_fixture(), target).unwrap();
+            let decoded = image::load_from_memory_with_format(&result[0].bytes, format).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        }
+    }
+    #[test]
+    fn converts_png_to_pnm_variants() {
+        for (target, extension, magic) in [
+            (OutputFormat::Pbm, "pbm", &b"P4"[..]),
+            (OutputFormat::Pgm, "pgm", &b"P5"[..]),
+            (OutputFormat::Pam, "pam", &b"P7"[..]),
+        ] {
+            let converted = convert_bytes("sample.png", &png_fixture(), target).unwrap();
+            assert_eq!(
+                converted[0].name,
+                PathBuf::from(format!("sample.{extension}"))
+            );
+            assert!(
+                converted[0].bytes.starts_with(magic),
+                "{extension} output is missing its magic number"
+            );
+            let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (2, 2));
+            if target == OutputFormat::Pbm {
+                assert!(
+                    decoded.to_luma8().pixels().all(|pixel| pixel[0] == 0),
+                    "dark pixels should stay black in a PBM"
+                );
+            }
+        }
+    }
+    #[test]
+    fn rasterizes_svg_images_to_raster_formats() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#ff0000"/></svg>"##;
+        let result = convert_bytes("icon.svg", svg, OutputFormat::Png).unwrap();
+        assert_eq!(result[0].name, PathBuf::from("icon.png"));
+
+        let decoded =
+            image::load_from_memory_with_format(&result[0].bytes, image::ImageFormat::Png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (4, 4));
+        let pixel = decoded.to_rgba8().get_pixel(1, 1).0;
+        assert!(pixel[0] > 200 && pixel[1] < 40 && pixel[2] < 40);
+    }
+    #[test]
+    fn rejects_oversized_svgs_before_allocating_a_pixmap() {
+        let too_wide = br##"<svg xmlns="http://www.w3.org/2000/svg" width="9000" height="10"><rect width="9000" height="10"/></svg>"##;
+        assert!(matches!(
+            convert_bytes("huge.svg", too_wide, OutputFormat::Png),
+            Err(ConvertError::SvgTooLarge)
+        ));
+
+        let too_many_pixels = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8000" height="8000"><rect width="8000" height="8000"/></svg>"##;
+        assert!(matches!(
+            convert_bytes("huge.svg", too_many_pixels, OutputFormat::Png),
+            Err(ConvertError::SvgTooLarge)
+        ));
+    }
+    fn tiff_with_primary_and_thumbnail_orientations(primary: u16, thumbnail: u16) -> Vec<u8> {
+        fn push_ifd(tiff: &mut Vec<u8>, orientation: u16, next_ifd: u32) {
+            tiff.extend_from_slice(&1_u16.to_le_bytes());
+            tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+            tiff.extend_from_slice(&3_u16.to_le_bytes());
+            tiff.extend_from_slice(&1_u32.to_le_bytes());
+            tiff.extend_from_slice(&orientation.to_le_bytes());
+            tiff.extend_from_slice(&[0, 0]);
+            tiff.extend_from_slice(&next_ifd.to_le_bytes());
+        }
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        let thumbnail_ifd = 8 + 2 + 12 + 4;
+        push_ifd(&mut tiff, primary, thumbnail_ifd);
+        push_ifd(&mut tiff, thumbnail, 0);
+        tiff
+    }
+    fn jpeg_with_exif_orientations(image: &image::DynamicImage, orientations: &[u16]) -> Vec<u8> {
+        jpeg_with_exif_tiff(image, &tiff_with_orientations(orientations))
+    }
+    fn jpeg_with_exif_tiff(image: &image::DynamicImage, tiff: &[u8]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut cursor,
+                100,
+            ))
+            .unwrap();
+        let jpeg = cursor.into_inner();
+        let mut result = jpeg[..2].to_vec();
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(tiff);
+        result.extend_from_slice(&[0xFF, 0xE1]);
+        result.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        result.extend_from_slice(&segment);
+        result.extend_from_slice(&jpeg[2..]);
+        result
+    }
+    fn assert_rgb_near(actual: [u8; 3], expected: [u8; 3], tolerance: u8, label: &str) {
+        for (channel, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                actual.abs_diff(expected) <= tolerance,
+                "{label}: channel {channel} got {actual}, expected {expected}"
+            );
+        }
+    }
+    fn expected_composite(source: [u8; 3], alpha: u8, background: [u8; 3]) -> [u8; 3] {
+        let alpha = u16::from(alpha);
+        let inverse = 255 - alpha;
+        std::array::from_fn(|channel| {
+            ((u16::from(source[channel]) * alpha + u16::from(background[channel]) * inverse + 127)
+                / 255) as u8
+        })
+    }
+    #[test]
+    fn preserves_jpeg_exif_without_double_rotating() {
+        let source = image::RgbImage::from_fn(8, 8, |x, _| {
+            if x < 4 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+        let input = jpeg_with_exif_orientations(&image::DynamicImage::ImageRgb8(source), &[6]);
+
+        let rotated = convert_bytes("photo.jpg", &input, OutputFormat::Jpeg).unwrap();
+        assert_eq!(exif_orientation(&rotated[0].bytes), Some(1));
+        assert_eq!(
+            image::load_from_memory(&rotated[0].bytes).unwrap().width(),
+            8
+        );
+
+        let unrotated = convert_bytes_with_options(
+            "photo.jpg",
+            &input,
+            OutputFormat::Jpeg,
+            ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(exif_orientation(&unrotated[0].bytes), Some(6));
+    }
+    #[test]
+    fn exif_orientation_rotates_corners_and_ignores_duplicate_or_invalid_tags() {
+        let mut source = image::RgbImage::new(16, 16);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = match (x < 8, y < 8) {
+                (true, true) => image::Rgb([255, 0, 0]),
+                (false, true) => image::Rgb([0, 255, 0]),
+                (true, false) => image::Rgb([0, 0, 255]),
+                (false, false) => image::Rgb([255, 255, 0]),
+            };
+        }
+        let source = image::DynamicImage::ImageRgb8(source);
+
+        let oriented = jpeg_with_exif_orientations(&source, &[6]);
+        assert_eq!(super::exif_orientation(&oriented), Some(6));
+        let converted = convert_bytes("photo.jpg", &oriented, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (16, 16));
+        let pixels = decoded.to_rgb8();
+        assert_rgb_near(pixels.get_pixel(4, 4).0, [0, 0, 255], 35, "top-left");
+        assert_rgb_near(pixels.get_pixel(12, 4).0, [255, 0, 0], 35, "top-right");
+        assert_rgb_near(pixels.get_pixel(4, 12).0, [255, 255, 0], 35, "bottom-left");
+        assert_rgb_near(pixels.get_pixel(12, 12).0, [0, 255, 0], 35, "bottom-right");
+
+        let plain = jpeg_with_exif_orientations(&source, &[]);
+        assert_eq!(super::exif_orientation(&plain), None);
+        let plain = image::load_from_memory(
+            &convert_bytes("plain.jpg", &plain, OutputFormat::Png).unwrap()[0].bytes,
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_rgb_near(plain.get_pixel(4, 4).0, [255, 0, 0], 35, "plain top-left");
+
+        let invalid = jpeg_with_exif_orientations(&source, &[9]);
+        assert_eq!(super::exif_orientation(&invalid), Some(9));
+        let invalid = image::load_from_memory(
+            &convert_bytes("invalid.jpg", &invalid, OutputFormat::Png).unwrap()[0].bytes,
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_rgb_near(
+            invalid.get_pixel(4, 4).0,
+            [255, 0, 0],
+            35,
+            "invalid top-left",
+        );
+
+        let duplicate = jpeg_with_exif_orientations(&source, &[6, 6]);
+        assert_eq!(super::exif_orientation(&duplicate), None);
+        let duplicate = image::load_from_memory(
+            &convert_bytes("duplicate.jpg", &duplicate, OutputFormat::Png).unwrap()[0].bytes,
+        )
+        .unwrap()
+        .to_rgb8();
+        assert_rgb_near(
+            duplicate.get_pixel(4, 4).0,
+            [255, 0, 0],
+            35,
+            "duplicate top-left",
+        );
+
+        let disabled = convert_bytes_with_options(
+            "photo.jpg",
+            &oriented,
+            OutputFormat::Png,
+            ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let disabled = image::load_from_memory(&disabled[0].bytes).unwrap();
+        assert_eq!((disabled.width(), disabled.height()), (16, 16));
+        assert_rgb_near(
+            disabled.to_rgb8().get_pixel(4, 4).0,
+            [255, 0, 0],
+            35,
+            "disabled top-left",
+        );
+    }
+    #[test]
+    fn exif_orientation_ignores_thumbnail_ifd_orientation() {
+        let mut source = image::RgbImage::new(2, 1);
+        source.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        source.put_pixel(1, 0, image::Rgb([0, 0, 255]));
+        let source = image::DynamicImage::ImageRgb8(source);
+        let jpeg =
+            jpeg_with_exif_tiff(&source, &tiff_with_primary_and_thumbnail_orientations(6, 3));
+
+        assert_eq!(super::exif_orientation(&jpeg), Some(6));
+        let converted = convert_bytes("photo.jpg", &jpeg, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1, 2));
+        let pixels = decoded.to_rgb8();
+        let top = pixels.get_pixel(0, 0).0;
+        let bottom = pixels.get_pixel(0, 1).0;
+        assert!(top[0] > 200 && top[2] < 60, "top pixel is {top:?}");
+        assert!(
+            bottom[2] > 200 && bottom[0] < 60,
+            "bottom pixel is {bottom:?}"
+        );
+    }
+    #[test]
+    fn applies_exif_orientation_when_loading_images() {
+        let mut image = image::RgbImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgb([255, 0, 0]));
+        image.put_pixel(1, 0, image::Rgb([0, 0, 255]));
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0");
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&6_u16.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+        let mut segment = b"Exif\0\0".to_vec();
+        segment.extend_from_slice(&tiff);
+        let mut oriented = jpeg[..2].to_vec();
+        oriented.extend_from_slice(&[0xFF, 0xE1]);
+        oriented.extend_from_slice(&((segment.len() + 2) as u16).to_be_bytes());
+        oriented.extend_from_slice(&segment);
+        oriented.extend_from_slice(&jpeg[2..]);
+
+        assert_eq!(super::exif_orientation(&oriented), Some(6));
+        let converted = convert_bytes("photo.jpg", &oriented, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1, 2));
+        let pixels = decoded.to_rgb8();
+        let top = pixels.get_pixel(0, 0).0;
+        let bottom = pixels.get_pixel(0, 1).0;
+        assert!(top[0] > 200 && top[2] < 60, "top pixel is {top:?}");
+        assert!(
+            bottom[2] > 200 && bottom[0] < 60,
+            "bottom pixel is {bottom:?}"
+        );
+
+        let unrotated = convert_bytes_with_options(
+            "photo.jpg",
+            &oriented,
+            OutputFormat::Png,
+            ConversionOptions {
+                image_apply_exif_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = image::load_from_memory(&unrotated[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+    }
+    #[test]
+    fn composites_transparency_onto_the_configured_background() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 0]),
+        ))
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+
+        let bmp = convert_bytes_with_options(
+            "clear.png",
+            &png,
+            OutputFormat::Bmp,
+            ConversionOptions {
+                image_background: [0, 0, 255],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let decoded = image::load_from_memory(&bmp[0].bytes).unwrap().to_rgb8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 255]);
+
+        let default = convert_bytes("clear.png", &png, OutputFormat::Bmp).unwrap();
+        let decoded = image::load_from_memory(&default[0].bytes)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 255, 255]);
+    }
+    #[test]
+    fn composites_transparency_into_jpeg_and_bmp_with_two_backgrounds() {
+        let transparent = image::Rgba([255, 0, 0, 0]);
+        let semi_transparent = image::Rgba([200, 100, 50, 128]);
+        let opaque = image::Rgba([10, 200, 30, 255]);
+        let mut rgba = image::RgbaImage::new(24, 8);
+        for (x, _, pixel) in rgba.enumerate_pixels_mut() {
+            *pixel = match x {
+                0..=7 => transparent,
+                8..=15 => semi_transparent,
+                _ => opaque,
+            };
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        for background in [[0, 0, 255], [12, 34, 56]] {
+            let expected = [
+                expected_composite([255, 0, 0], 0, background),
+                expected_composite([200, 100, 50], 128, background),
+                expected_composite([10, 200, 30], 255, background),
+            ];
+            for (target, format, tolerance) in [
+                (OutputFormat::Jpeg, image::ImageFormat::Jpeg, 25),
+                (OutputFormat::Bmp, image::ImageFormat::Bmp, 0),
+            ] {
+                let converted = convert_bytes_with_options(
+                    "clear.png",
+                    &png,
+                    target,
+                    ConversionOptions {
+                        image_background: background,
+                        jpeg_quality: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let decoded = image::load_from_memory_with_format(&converted[0].bytes, format)
+                    .unwrap()
+                    .to_rgb8();
+                assert_eq!((decoded.width(), decoded.height()), (24, 8));
+                for (x, expected, label) in [
+                    (4, expected[0], "transparent area"),
+                    (12, expected[1], "semi-transparent area"),
+                    (20, expected[2], "opaque area"),
+                ] {
+                    assert_rgb_near(decoded.get_pixel(x, 4).0, expected, tolerance, label);
+                }
+            }
+        }
+    }
+    #[test]
+    fn alpha_preserving_targets_ignore_the_configured_background() {
+        let pixels = [
+            image::Rgba([255, 0, 0, 0]),
+            image::Rgba([200, 100, 50, 128]),
+            image::Rgba([10, 200, 30, 255]),
+        ];
+        let mut rgba = image::RgbaImage::new(3, 1);
+        for (x, pixel) in pixels.iter().enumerate() {
+            rgba.put_pixel(x as u32, 0, *pixel);
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+
+        for (target, format) in [
+            (OutputFormat::Png, image::ImageFormat::Png),
+            (OutputFormat::Webp, image::ImageFormat::WebP),
+        ] {
+            let converted = convert_bytes_with_options(
+                "alpha.png",
+                &png,
+                target,
+                ConversionOptions {
+                    image_background: [1, 2, 3],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let decoded = image::load_from_memory_with_format(&converted[0].bytes, format).unwrap();
+            assert!(
+                decoded.color().has_alpha(),
+                "{target:?} output lost its alpha channel"
+            );
+            let decoded = decoded.to_rgba8();
+            assert_eq!((decoded.width(), decoded.height()), (3, 1));
+            for (x, expected) in pixels.iter().enumerate() {
+                assert_eq!(*decoded.get_pixel(x as u32, 0), *expected);
+            }
+        }
+    }
+    #[test]
+    fn animated_gif_converts_to_a_single_frame() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+
+        let mut gif = Vec::new();
+        let mut encoder = GifEncoder::new(&mut gif);
+        encoder.set_repeat(Repeat::Infinite).unwrap();
+        encoder
+            .encode_frames([
+                image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    2,
+                    image::Rgba([255, 0, 0, 255]),
+                )),
+                image::Frame::new(image::RgbaImage::from_pixel(
+                    2,
+                    2,
+                    image::Rgba([0, 0, 255, 255]),
+                )),
+            ])
+            .unwrap();
+        drop(encoder);
+
+        let converted = convert_bytes("animated.gif", &gif, OutputFormat::Png).unwrap();
+        let decoded = image::load_from_memory(&converted[0].bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+        let pixel = decoded.to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            pixel[0] > 200 && pixel[2] < 60,
+            "the first GIF frame was not retained: {pixel:?}"
+        );
+    }
+}

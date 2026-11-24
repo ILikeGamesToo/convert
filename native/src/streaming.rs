@@ -20,9 +20,9 @@ use crate::audio::{
     is_end_of_stream, matroska_audio_timing_from_path, mp3_lame_bitrate, mp3_sample_rate,
     mp4_gapless_info, mp4_trim_for_kind, opus_channels, opus_sample_rate, opus_stream_info,
     probe_symphonia_file, read_mp4_moov, reorder_film_to_opus_channels, reorder_opus_channels,
-    reported_source_bits, resample_kernel_table, sample_to_i16, skip_id3v2_file, AudioBitDepth,
-    AudioChannels, AudioCodecKind, AudioTrackEntry, AudioTrim, Dither, Mp3Bitrate, OpusPcmDecoder,
-    OpusPcmEncoder, RESAMPLE_PHASES, RESAMPLE_ZERO_CROSSINGS,
+    resample_kernel_table, sample_to_i16, skip_id3v2_file, AudioBitDepth, AudioChannels,
+    AudioCodecKind, AudioTrackEntry, AudioTrim, Dither, Mp3Bitrate, OpusPcmDecoder, OpusPcmEncoder,
+    RESAMPLE_PHASES, RESAMPLE_ZERO_CROSSINGS,
 };
 use crate::container::is_mp4_extension;
 use crate::error::ConvertError;
@@ -1731,5 +1731,551 @@ impl StreamingEncoder for OpusStreamEncoder<'_> {
         })?;
         sink.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::audio::{AudioBitDepth, AudioChannels, Mp3Bitrate};
+
+    use crate::error::ConvertError;
+    use crate::format::OutputFormat;
+    use crate::options::ConversionOptions;
+    use crate::test_support::{
+        assert_audible, assert_mp3_tone, fixture_path, parse_wav, stream_temp_dir, stream_wav,
+        wav_24_bit_at, wav_24_bit_samples, wav_channels_at, wav_fixture, wav_fixture_at,
+        wav_float_samples, wav_layout, wav_tone_at,
+    };
+    use std::io::Cursor;
+    #[test]
+    fn streaming_cancellation_stops_the_conversion() {
+        let directory = stream_temp_dir("cancel");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut output = std::io::Cursor::new(Vec::new());
+        let error = super::convert_audio_file_to_writer_with_cancel(
+            &input,
+            "tone.wav",
+            OutputFormat::Wav,
+            ConversionOptions::default(),
+            &mut output,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConvertError::Cancelled));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_wav_to_wav_from_a_file() {
+        let directory = stream_temp_dir("wav-wav");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let output = stream_wav(&input, ConversionOptions::default());
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 16_000);
+        assert_audible(&parsed.samples);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_wav_to_flac_from_a_file() {
+        let directory = stream_temp_dir("wav-flac");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Flac,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let mut reader =
+            claxon::FlacReader::new(std::io::Cursor::new(output.into_inner())).unwrap();
+        let samples: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), 16_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_wav_to_opus_from_a_file() {
+        let directory = stream_temp_dir("wav-opus");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Opus,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let bytes = output.into_inner();
+        assert!(bytes.starts_with(b"OggS"));
+
+        let mut reader = opus_pure::OggOpusReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let head = reader.head().clone();
+        let channels = head.channel_count as usize;
+        let mut decoder = head.decoder(48_000).unwrap();
+        let mut trim = opus_pure::Trim::new(&head, 48_000, channels).unwrap();
+        let mut block = vec![0.0; opus_pure::MAX_PACKET_SAMPLES * channels];
+        let mut frames = 0;
+        for packet in reader.packets() {
+            let packet = packet.unwrap();
+            let decoded = decoder
+                .decode(&packet.data, opus_pure::MAX_PACKET_SAMPLES, &mut block)
+                .unwrap();
+            frames += trim.keep(&packet, &block[..decoded * channels]).len() / channels;
+        }
+        assert_eq!(frames, 48_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_wav_to_aiff_and_au_from_a_file() {
+        let directory = stream_temp_dir("wav-aiff-au");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        for target in [OutputFormat::Aiff, OutputFormat::Au] {
+            let mut output = std::io::Cursor::new(Vec::new());
+            super::convert_audio_file_to_writer(
+                &input,
+                "tone.wav",
+                target,
+                ConversionOptions::default(),
+                &mut output,
+            )
+            .unwrap();
+            let bytes = output.into_inner();
+            if target == OutputFormat::Aiff {
+                assert_eq!(&bytes[..4], b"FORM");
+                assert_eq!(
+                    u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize + 8,
+                    bytes.len()
+                );
+                assert_eq!(u32::from_be_bytes(bytes[22..26].try_into().unwrap()), 8_000);
+                assert_eq!(
+                    u32::from_be_bytes(bytes[42..46].try_into().unwrap()) as usize + 46,
+                    bytes.len()
+                );
+            } else {
+                assert_eq!(&bytes[..4], b".snd");
+                assert_eq!(
+                    u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize + 24,
+                    bytes.len()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_24_bit_flac_from_a_file() {
+        let directory = stream_temp_dir("wav-flac-24");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Bit24,
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap();
+        let mut reader =
+            claxon::FlacReader::new(std::io::Cursor::new(output.into_inner())).unwrap();
+        assert_eq!(reader.streaminfo().bits_per_sample, 24);
+        assert_eq!(reader.streaminfo().samples, Some(8_000));
+        let samples: Vec<i32> = reader.samples().map(Result::unwrap).collect();
+        assert_eq!(samples.len(), 16_000);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_wav_at_each_supported_depth_from_a_file() {
+        let directory = stream_temp_dir("wav-depth-stream");
+        let input = directory.join("quiet.wav");
+        let source = vec![1_i32; 512];
+        std::fs::write(&input, wav_24_bit_at(48_000, 1, &source)).unwrap();
+
+        for (depth, expected_format) in [
+            (AudioBitDepth::Bit16, 1),
+            (AudioBitDepth::Bit24, 1),
+            (AudioBitDepth::Float32, 3),
+        ] {
+            let mut output = std::io::Cursor::new(Vec::new());
+            super::convert_audio_file_to_writer(
+                &input,
+                "quiet.wav",
+                OutputFormat::Wav,
+                ConversionOptions {
+                    audio_bit_depth: depth,
+                    ..Default::default()
+                },
+                &mut output,
+            )
+            .unwrap();
+            let bytes = output.into_inner();
+            let (format, channels, rate, bits, _, size) = wav_layout(&bytes);
+            assert_eq!(
+                (format, channels, rate, bits),
+                (expected_format, 1, 48_000, depth.bits()),
+                "unexpected streamed WAV header for {depth:?}"
+            );
+            assert_eq!(size, 512 * usize::from(depth.bits() / 8));
+            match depth {
+                AudioBitDepth::Bit16 => {
+                    let parsed = parse_wav(&bytes);
+                    let mut distinct = parsed.samples;
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    assert!(
+                        distinct.len() > 1,
+                        "streamed 16-bit output was not dithered"
+                    );
+                }
+                AudioBitDepth::Bit24 => {
+                    assert!(
+                        wav_24_bit_samples(&bytes).iter().all(|sample| *sample == 1),
+                        "streamed 24-bit output should be quantized without dither"
+                    );
+                }
+                AudioBitDepth::Float32 => {
+                    let decoded = wav_float_samples(&bytes);
+                    assert!(decoded
+                        .iter()
+                        .all(|sample| { (*sample - 1.0 / 8_388_608.0).abs() <= 1.0e-7 }));
+                }
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streaming_flac_rejects_float_depth_with_a_typed_error() {
+        let directory = stream_temp_dir("wav-flac-float");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        let error = super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Flac,
+            ConversionOptions {
+                audio_bit_depth: AudioBitDepth::Float32,
+                ..Default::default()
+            },
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConvertError::UnsupportedBitDepth {
+                format: "FLAC",
+                depth: "32-bit float"
+            }
+        ));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_wav_to_mp3_from_a_file() {
+        let directory = stream_temp_dir("wav-mp3");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::convert_audio_file_to_writer(
+            &input,
+            "tone.wav",
+            OutputFormat::Mp3,
+            ConversionOptions::default(),
+            &mut output,
+        )
+        .unwrap();
+        let bytes = output.into_inner();
+        assert!(bytes.len() > 100);
+        assert!(bytes.starts_with(b"ID3") || bytes[0] == 0xFF);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_resampled_wav_from_a_file() {
+        let directory = stream_temp_dir("wav-resample");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_fixture()).unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.sample_rate, 44_100);
+        assert_eq!(parsed.samples.len(), 88_200);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_flac_and_mp3_input_files() {
+        let directory = stream_temp_dir("encoded-input");
+        let source = wav_fixture();
+        for (name, format) in [
+            ("tone.flac", OutputFormat::Flac),
+            ("tone.mp3", OutputFormat::Mp3),
+        ] {
+            let encoded = crate::convert::convert_bytes_with_options(
+                "tone.wav",
+                &source,
+                format,
+                ConversionOptions::default(),
+            )
+            .unwrap()
+            .remove(0)
+            .bytes;
+            let input = directory.join(name);
+            std::fs::write(&input, encoded).unwrap();
+            let output = stream_wav(&input, ConversionOptions::default());
+            let parsed = parse_wav(&output);
+            assert_eq!(parsed.sample_rate, 8_000);
+            if name == "tone.flac" {
+                assert_eq!(parsed.samples.len(), 16_000);
+                assert_eq!(parsed.samples, parse_wav(&source).samples);
+            } else {
+                assert!(parsed.samples.len() >= 15_000);
+                assert!(parsed.samples.len() <= 17_000);
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_raw_and_matroska_ac3_tracks() {
+        for (name, expected_channels) in [("sample-ac3.ac3", 6), ("sample-eac3.mkv", 6)] {
+            let input = std::path::Path::new("testdata").join(name);
+            let output = stream_wav(&input, ConversionOptions::default());
+            let parsed = parse_wav(&output);
+            assert_eq!(parsed.channels, expected_channels);
+            assert_eq!(
+                parsed.samples.len(),
+                96_768 * usize::from(expected_channels)
+            );
+            assert_audible(&parsed.samples);
+        }
+    }
+    #[test]
+    fn streams_short_and_downsampled_audio() {
+        let directory = stream_temp_dir("resample-edges");
+        for (source_rate, frames, target_rate, expected_frames) in [
+            (44_100, 44_100, 8_000, 8_000),
+            (48_000, 48_000, 44_100, 44_100),
+            (8_000, 1, 44_100, 6),
+            (8_000, 2, 48_000, 12),
+        ] {
+            let input = directory.join(format!("tone-{source_rate}-{frames}.wav"));
+            std::fs::write(&input, wav_fixture_at(source_rate, frames)).unwrap();
+            let output = stream_wav(
+                &input,
+                ConversionOptions {
+                    audio_sample_rate: Some(target_rate),
+                    ..Default::default()
+                },
+            );
+            let parsed = parse_wav(&output);
+            assert_eq!(parsed.sample_rate, target_rate);
+            assert_eq!(parsed.samples.len(), expected_frames * 2);
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_a_selected_opus_track_from_a_file() {
+        let output = stream_wav(
+            &fixture_path("sample-two-opus-tracks.webm"),
+            ConversionOptions {
+                audio_track: Some(1),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 48_480);
+        assert_audible(&parsed.samples);
+
+        let resampled = stream_wav(
+            &fixture_path("sample-two-opus-tracks.webm"),
+            ConversionOptions {
+                audio_track: Some(1),
+                audio_sample_rate: Some(44_100),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&resampled);
+        let expected_frames = (48_480.0_f64 * 44_100.0 / 48_000.0).round() as usize;
+        assert_eq!(parsed.samples.len(), expected_frames);
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn streams_mp4_gapless_audio_from_a_file() {
+        let output = stream_wav(
+            &fixture_path("sample-aac.m4a"),
+            ConversionOptions::default(),
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 88_200);
+        assert_audible(&parsed.samples);
+
+        let resampled = stream_wav(
+            &fixture_path("sample-aac.m4a"),
+            ConversionOptions {
+                audio_sample_rate: Some(48_000),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&resampled);
+        let expected_frames = (88_200.0_f64 * 48_000.0 / 44_100.0).round() as usize;
+        assert_eq!(
+            parsed.samples.len(),
+            expected_frames * usize::from(parsed.channels)
+        );
+        assert_audible(&parsed.samples);
+    }
+    #[test]
+    fn streams_ac3_to_stereo_without_clipping() {
+        let output = stream_wav(
+            &fixture_path("sample-ac3.mkv"),
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.samples.len(), 96_768 * 2);
+        assert_audible(&parsed.samples);
+        let saturated = parsed
+            .samples
+            .iter()
+            .filter(|sample| **sample == i16::MAX || **sample == i16::MIN)
+            .count();
+        assert!(
+            saturated < parsed.samples.len() / 100,
+            "the downmix hard-clipped too many samples"
+        );
+    }
+    #[test]
+    fn streams_full_scale_multichannel_without_clipping() {
+        let directory = stream_temp_dir("loud-surround");
+        let input = directory.join("loud.wav");
+        std::fs::write(&input, wav_channels_at(48_000, 2_000, &[1.0; 6])).unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.samples.len(), 2_000 * 2);
+        assert!(
+            !parsed.samples.contains(&i16::MIN),
+            "a full-scale streaming sample wrapped"
+        );
+        let peak = parsed
+            .samples
+            .iter()
+            .map(|sample| sample.unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(peak > 30_000, "the streaming downmix was too quiet");
+        assert_audible(&parsed.samples);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_multichannel_downmix_keeps_standard_level() {
+        let directory = stream_temp_dir("stream-downmix-level");
+        let input = directory.join("centre.wav");
+        std::fs::write(
+            &input,
+            wav_channels_at(48_000, 480, &[0.0, 0.0, 0.5, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        assert_eq!(parsed.channels, 2);
+        assert_eq!(parsed.sample_rate, 48_000);
+        assert_eq!(parsed.samples.len(), 480 * 2);
+        let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
+        let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
+        assert!(
+            (left - 0.3535).abs() < 0.002,
+            "streamed centre left was {left}, expected 0.707 * 0.5"
+        );
+        assert!(
+            (right - 0.3535).abs() < 0.002,
+            "streamed centre right was {right}, expected 0.707 * 0.5"
+        );
+
+        std::fs::write(
+            &input,
+            wav_channels_at(48_000, 480, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0]),
+        )
+        .unwrap();
+        let output = stream_wav(
+            &input,
+            ConversionOptions {
+                audio_channels: Some(AudioChannels::Stereo),
+                ..Default::default()
+            },
+        );
+        let parsed = parse_wav(&output);
+        let left = f32::from(parsed.samples[0]) / i16::MAX as f32;
+        let right = f32::from(parsed.samples[1]) / i16::MAX as f32;
+        assert!(
+            (left - 0.3535).abs() < 0.002,
+            "streamed surround left was {left}, expected 0.707 * 0.5"
+        );
+        assert!(
+            right.abs() < 0.002,
+            "a back-left signal leaked into the right channel: {right}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn streams_mp3_at_the_requested_bitrate() {
+        let directory = stream_temp_dir("mp3-bitrate");
+        let input = directory.join("tone.wav");
+        std::fs::write(&input, wav_tone_at(48_000, 48_000, 1, 1_000.0, 0.5)).unwrap();
+        let encode = |bitrate| {
+            let mut output = Cursor::new(Vec::new());
+            super::convert_audio_file_to_writer(
+                &input,
+                "tone.wav",
+                OutputFormat::Mp3,
+                ConversionOptions {
+                    mp3_bitrate: bitrate,
+                    ..Default::default()
+                },
+                &mut output,
+            )
+            .unwrap();
+            output.into_inner()
+        };
+        let low = encode(Mp3Bitrate::Kbps128);
+        let high = encode(Mp3Bitrate::Kbps320);
+        assert!(
+            high.len() > low.len() * 2,
+            "streaming 320 kbps produced {} bytes but 128 kbps produced {}",
+            high.len(),
+            low.len()
+        );
+        assert_mp3_tone(&low, 48_000, 1, 48_000, Mp3Bitrate::Kbps128);
+        assert_mp3_tone(&high, 48_000, 1, 48_000, Mp3Bitrate::Kbps320);
+
+        std::fs::write(&input, wav_tone_at(44_100, 44_100, 2, 1_000.0, 0.5)).unwrap();
+        let stereo = encode(Mp3Bitrate::Kbps256);
+        assert_mp3_tone(&stereo, 44_100, 2, 44_100, Mp3Bitrate::Kbps256);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

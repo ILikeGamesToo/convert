@@ -5,10 +5,7 @@
 use crate::error::ConvertError;
 use crate::format::OutputFormat;
 use crate::input_extensions;
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub(crate) fn safe_file_name(path: &str) -> String {
     Path::new(path)
