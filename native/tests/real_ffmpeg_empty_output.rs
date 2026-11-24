@@ -12,6 +12,27 @@ fn real_ffmpeg() -> Option<PathBuf> {
     (output.status.success() && version.contains("ffmpeg version")).then_some(path)
 }
 
+/// A test that cannot run has to say so where the log will show it. libtest
+/// captures the `print!` macros for a test that passes, so an `eprintln!`
+/// notice never leaves the harness and the skip reads as `ok`. Writing to the
+/// handle directly is not captured. Setting `CONVERT2IT_REQUIRE_FFMPEG=1` turns
+/// the skip into a failure, so a job that is supposed to have ffmpeg cannot go
+/// green without running these.
+fn ffmpeg_for_real_test(test: &str) -> Option<PathBuf> {
+    if let Some(ffmpeg) = real_ffmpeg() {
+        return Some(ffmpeg);
+    }
+    let notice = format!("skipped real-ffmpeg {test}: ffmpeg is not available");
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{notice}");
+    }
+    if std::env::var("CONVERT2IT_REQUIRE_FFMPEG").is_ok_and(|value| value == "1") {
+        panic!("{notice} (CONVERT2IT_REQUIRE_FFMPEG is set)");
+    }
+    None
+}
+
 fn generate_real_video(ffmpeg: &Path, path: &Path) {
     let output = Command::new(ffmpeg)
         .args([
@@ -47,8 +68,7 @@ fn generate_real_video(ffmpeg: &Path, path: &Path) {
 
 #[test]
 fn real_ffmpeg_cli_reports_zero_byte_thumbnail_output() {
-    let Some(ffmpeg) = real_ffmpeg() else {
-        eprintln!("skipping real-ffmpeg CLI integration test: ffmpeg is not available");
+    let Some(ffmpeg) = ffmpeg_for_real_test("CLI integration test") else {
         return;
     };
     let directory =
