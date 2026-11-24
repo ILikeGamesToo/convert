@@ -2,11 +2,11 @@
 
 //! ZIP, TAR, TAR.GZ and GZIP creation and extraction.
 
+use crate::convert::ConvertedFile;
 use crate::error::ConvertError;
 use crate::format::OutputFormat;
 use crate::options::ConversionOptions;
 use crate::shared::{file_extension, unsupported};
-use crate::ConvertedFile;
 use std::{
     collections::HashSet,
     io::{Cursor, Read, Write},

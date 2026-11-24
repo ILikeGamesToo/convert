@@ -2,11 +2,11 @@
 
 //! Text encoding conversions.
 
+use crate::convert::ConvertedFile;
 use crate::data::{json_to_csv, json_to_toml, parse_data_to_json, text_to_csv};
 use crate::error::ConvertError;
 use crate::format::OutputFormat;
 use crate::shared::{file_extension, is_data_extension, output_name, unsupported};
-use crate::ConvertedFile;
 
 pub(crate) fn convert_text(
     input_name: &str,

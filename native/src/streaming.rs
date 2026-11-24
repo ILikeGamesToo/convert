@@ -15,7 +15,20 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::*;
+use crate::audio::{
+    audio_track_entries_from_path, downmix_mono, downmix_stereo, extended_sample_rate,
+    is_end_of_stream, matroska_audio_timing_from_path, mp3_lame_bitrate, mp3_sample_rate,
+    mp4_gapless_info, mp4_trim_for_kind, opus_channels, opus_sample_rate, opus_stream_info,
+    probe_symphonia_file, read_mp4_moov, reorder_film_to_opus_channels, reorder_opus_channels,
+    reported_source_bits, resample_kernel_table, sample_to_i16, skip_id3v2_file, AudioBitDepth,
+    AudioChannels, AudioCodecKind, AudioTrackEntry, AudioTrim, Dither, Mp3Bitrate, OpusPcmDecoder,
+    OpusPcmEncoder, RESAMPLE_PHASES, RESAMPLE_ZERO_CROSSINGS,
+};
+use crate::container::is_mp4_extension;
+use crate::error::ConvertError;
+use crate::format::OutputFormat;
+use crate::options::ConversionOptions;
+use crate::shared::{file_extension, is_audio_extension, unsupported};
 
 /// A chunk of decoded audio. Chunks are bounded by the decoder's packet or
 /// frame size, never by the length of the file.
@@ -244,7 +257,7 @@ impl SymphoniaChunkReader {
                 }
             })?;
         let source_bits =
-            crate::reported_source_bits(codec_params.codec, codec_params.bits_per_sample);
+            crate::audio::reported_source_bits(codec_params.codec, codec_params.bits_per_sample);
         Ok(Self {
             format,
             decoder,
