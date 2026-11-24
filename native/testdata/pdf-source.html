@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PDF rasterisation fixture</title>
+<style>
+  @font-face {
+    font-family: "Abel";
+    src: url("abel-regular.ttf") format("truetype");
+  }
+  @font-face {
+    font-family: "Source Code Pro";
+    src: url("source-code-pro-regular.otf") format("opentype");
+  }
+  @page { size: A4; margin: 18mm; }
+  body { font-family: "Abel", sans-serif; color: #1a1a1a; font-size: 12pt; }
+  h1 { font-size: 20pt; margin: 0 0 4mm 0; }
+  p { line-height: 1.45; margin: 0 0 3mm 0; }
+  .accent { color: #b3261e; }
+  .code { font-family: "Source Code Pro", monospace; font-size: 9pt; }
+  svg { display: block; margin: 5mm 0; }
+  table { border-collapse: collapse; font-size: 10pt; }
+  th, td { border: 1px solid #333; padding: 2px 8px; text-align: left; }
+</style>
+</head>
+<body>
+  <h1>Rasterisation fixture: text, vectors and a table</h1>
+  <p>The quick brown fox jumps over the lazy dog. Pack my box with five dozen
+  liquor jugs. Sphinx of black quartz, judge my vow. This paragraph exists so a
+  renderer has to place real glyphs with kerning and word spacing, and it ends
+  with <span class="accent">coloured emphasis</span> that must not come out grey.</p>
+  <p>Numbers and symbols: 0123456789 &plusmn; &times; &divide; &euro; &mdash; &ldquo;quoted&rdquo;.</p>
+  <p class="code">if (renderer.reads_embedded_fonts()) { page.text_is_glyphs(); }</p>
+
+  <svg width="480" height="150" viewBox="0 0 480 150" xmlns="http://www.w3.org/2000/svg">
+    <rect x="2" y="2" width="476" height="146" fill="#f4f1ea" stroke="#222" stroke-width="2"/>
+    <circle cx="80" cy="75" r="46" fill="#4a7dbd" stroke="#112233" stroke-width="2"/>
+    <rect x="150" y="35" width="90" height="80" fill="#c8a13a" stroke="#112233" stroke-width="2"/>
+    <path d="M270 115 L315 35 L360 115 Z" fill="#3f8f5a" stroke="#112233" stroke-width="2"/>
+    <path d="M390 40 C 430 20, 460 130, 400 115" fill="none" stroke="#b3261e" stroke-width="4"/>
+  </svg>
+
+  <table>
+    <tr><th>Format</th><th>Encoder</th><th>Lossless</th></tr>
+    <tr><td>PNG</td><td>image crate</td><td>yes</td></tr>
+    <tr><td>JPEG</td><td>image crate</td><td>no</td></tr>
+    <tr><td>TIFF</td><td>image crate</td><td>yes</td></tr>
+  </table>
+</body>
+</html>

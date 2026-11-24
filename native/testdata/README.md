@@ -1,6 +1,7 @@
 # Native test fixtures
 
-These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies, and font container conversions for TrueType (glyf) and OpenType (CFF) fonts, plus AVIF and HEIC decoding.
+These files are used only by the `native` conversion tests to verify OGG, Opus, and M4A decoding, audio extraction from MP4 and WebM videos, a VP9 + Opus WebM → MP4 → WebM remux round trip, H.264/AAC fixtures for MP4 remux and typed rejection of incompatible WebM stream copies, and font container conversions for TrueType (glyf) and OpenType (CFF) fonts, plus AVIF and HEIC decoding, and PDF page rasterisation of a
+document Chrome wrote.
 - `piano.ogg` — Ogg Vorbis, CC0 1.0. Source: [`themankindproject/audiofp`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/piano.ogg); its [`CREDITS.md`](https://github.com/themankindproject/audiofp/blob/main/tests/assets/CREDITS.md) marks it CC0 and generated for that project.
 - `sample.m4a` — AAC in an audio-only M4A, 22 KB. Remuxed from the audio track of WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4) with the video track removed and the `esds` SLConfigDescriptor set to the MP4 predefined value. WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
 - `sample-video.mp4` — H.264 video with an AAC audio track, 53 KB. Copied from WPT's [`media/A4.mp4`](https://github.com/web-platform-tests/wpt/blob/master/media/A4.mp4). WPT is licensed under the [3-Clause BSD License](https://github.com/web-platform-tests/wpt/blob/master/LICENSE.md).
@@ -123,3 +124,32 @@ These files are used only by the `native` conversion tests to verify OGG, Opus, 
   # built in memory as described above, then the orientation SHORT is set to 6.
   # The committed bytes are what the tests read, so no encoder is needed to run them.
   ```
+- `sample-chrome.pdf` — a one-page A4 PDF written by Chrome 158's own PDF
+  backend from `pdf-source.html`, 55 KB. The page carries Abel text in two
+  sizes, an inline SVG with five coloured shapes, and a bordered table, so the
+  rasteriser is exercised on a document that no code in this crate produced: the
+  app's own text writer embeds no font and draws no vector art. Abel is embedded
+  as a subset (`FontFile2`, CID-keyed TrueType), and Source Code Pro, the
+  monospace line, arrives as a `Type3` font whose glyphs are content streams,
+  so the fixture covers both a font program and outlined glyphs. The test renders
+  it at one pixel per point and asserts the 594 x 841 page size (A4 is
+  594.96 x 841.92 points, floored as the web handler floors it), an opaque alpha
+  channel on every pixel, ink on more than 5% of the page, at least 100 pixels of
+  the accent red `#b3261e` from the source, and more than 50 distinct colours,
+  which is what anti-aliased glyph and vector edges produce and a page of filled
+  boxes would not. Printed from the committed HTML with:
+
+  ```sh
+  chrome --headless=new --disable-gpu --no-sandbox --no-pdf-header-footer \
+    --virtual-time-budget=10000 --user-data-dir=/tmp/chrome-print \
+    --print-to-pdf=sample-chrome.pdf pdf-source.html
+  ```
+
+  Re-printing reproduces the page but not the bytes, because Chrome stamps a
+  creation date and a document ID into the file. The text and the vector art are
+  this repository's own, the embedded subset is the SIL Open Font License 1.1
+  Abel already in this directory, and the writer is Chrome's, so the file carries
+  no third-party content of its own.
+- `pdf-source.html` — the page `sample-chrome.pdf` is printed from, kept so the
+  fixture can be regenerated. It loads `abel-regular.ttf` and
+  `source-code-pro-regular.otf` from this directory through `@font-face`.
