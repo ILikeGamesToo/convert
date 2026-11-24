@@ -95,3 +95,24 @@ These files are used only by the `native` conversion tests to verify OGG, Opus, 
   curl -L -o source-code-pro-regular.otf https://raw.githubusercontent.com/adobe-fonts/source-code-pro/release/OTF/SourceCodePro-Regular.otf
   curl -L -o abel-regular.woff2 https://fonts.gstatic.com/s/abel/v18/MwQ5bhbm2POE2V9BPQ.woff2
   ```
+- `sample-avif-quad.avif` — a 64×64 AVIF still image: four solid 32×32 quadrants (red, green, blue, white), encoded losslessly at 8-bit 4:4:4. This is the known-content fixture: the test decodes it and compares each quadrant against the source colour within a tolerance of 3 per channel. FFmpeg's `color` source writes those quadrants as 253/0/0, 0/254/0, 0/0/254 and 255/255/255, so the expected values are those and not pure 255. Generated with FFmpeg 9.1 (libaom-av1) from FFmpeg's own sources, so it contains no third-party media:
+
+  ```sh
+  ffmpeg -y -f lavfi -i color=c=0xFF0000:s=32x32:d=1 \
+    -f lavfi -i color=c=0x00FF00:s=32x32:d=1 \
+    -f lavfi -i color=c=0x0000FF:s=32x32:d=1 \
+    -f lavfi -i color=c=0xFFFFFF:s=32x32:d=1 \
+    -filter_complex "[0][1]hstack[t];[2][3]hstack[b];[t][b]vstack" \
+    -frames:v 1 -update 1 quad.png
+  ffmpeg -y -i quad.png -c:v libaom-av1 -still-picture 1 \
+    -aom-params lossless=1 -pix_fmt yuv444p -f avif sample-avif-quad.avif
+  ```
+- `sample-avif-quad-10bit.avif` — the same four quadrants coded at 10-bit 4:4:4, 368 bytes. It exercises the high-bit-depth decode path: the decoder produces a 16-bit image, and the test compares the quadrants against the same expected colours within the same tolerance:
+
+  ```sh
+  ffmpeg -y -i quad.png -c:v libaom-av1 -still-picture 1 \
+    -aom-params lossless=1 -pix_fmt yuv444p10le -f avif sample-avif-quad-10bit.avif
+  ```
+- `sample-avif-alpha-irot.avif` — a 256×256 image of black letters on a translucent white background with an `irot` quarter turn and an alpha auxiliary image item carrying the translucency, 10 KB. Decodes to 256×512 with partial alpha, so it covers the `auxC` alpha merge and the transformative properties. Copied from libavif's [`tests/data/abc_color_irot_alpha_irot.avif`](https://github.com/AOMediaCodec/libavif/blob/main/tests/data/abc_color_irot_alpha_irot.avif), whose [`tests/data/README.md`](https://github.com/AOMediaCodec/libavif/blob/main/tests/data/README.md) licenses it "same as libavif", the [2-Clause BSD License](https://github.com/AOMediaCodec/libavif/blob/main/LICENSE).
+- `sample-avif-grid.avif` — an 80×80 image stored as a 2×2 `grid` of 40×40 tiles with a non-grid alpha item, 2.4 KB. Covers grid derivation and tile assembly. Copied from libavif's [`tests/data/color_grid_alpha_nogrid.avif`](https://github.com/AOMediaCodec/libavif/blob/main/tests/data/color_grid_alpha_nogrid.avif), licensed "same as libavif" (2-Clause BSD).
+- `sample-avif-sequence.avif` — a 150×150 still plus an image sequence track (the `avis` brand), 1.2 KB. The native decoder presents the still and ignores the track, which is what this fixture pins. Copied from libavif's [`tests/data/colors-animated-8bpc.avif`](https://github.com/AOMediaCodec/libavif/blob/main/tests/data/colors-animated-8bpc.avif), licensed "same as libavif" (2-Clause BSD).
