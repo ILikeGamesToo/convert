@@ -16,6 +16,12 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 filmcraft-ac3 = "0.9"
 flacenc = "0.5"
 flate2 = "1"
+# AVIF decoding: `gamut-avif` walks the ISO BMFF container and hands the AV1
+# codestream to `rav1d`, the pure-Rust port of `dav1d`. `rav1d`'s `asm` feature
+# assembles the vendored x86 assembly with NASM, which would be a build-time
+# tool outside Rust; the portable Rust paths are used instead.
+gamut-avif = "2.0.0"
+gamut-core = "3.0.0"
 image = { version = "0.25", default-features = false, features = [
     "bmp",
     "dds",
@@ -36,6 +42,10 @@ opus-pure = "0.2.3"
 pdf-extract = "0.12"
 pdf-writer = "0.15"
 rfd = "0.15"
+rav1d = { version = "1.1.0", default-features = false, features = [
+    "bitdepth_8",
+    "bitdepth_16",
+] }
 resvg = "0.50"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,4 +61,7 @@ wuff = "0.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# Builds the AVIF container the EXIF-orientation test reads, so that test does
+# not need a committed fixture with an orientation tag.
+gamut-isobmff = "3.0.0"
 winit = { version = "0.30", default-features = false }

@@ -17,7 +17,7 @@ The same data is available from the library as `native_format_registry()`.
 
 | Area | Inputs | Native outputs | Notes |
 | --- | --- | --- | --- |
-| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. |
+| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF is decoded in-process by `gamut-avif` and `rav1d`, with no external tool. |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
 | PDF | PDF | text encodings | Text extraction uses `pdf-extract`. PDF page rasterization is not implemented. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. MP3-to-MP3 keeps its ID3v2 tag; FLAC-to-FLAC keeps Vorbis comments and pictures. |
@@ -58,9 +58,29 @@ external tools that do not have a verified native equivalent in this crate.
   transcoded as a fallback. General transcoding is not implemented. See
   `native/VIDEO_PLAN.md` for the settled decisions and
   `cargo run --bin convert2it -- --list-video` for the route table.
-- **AVIF/HEIC input:** `image` 0.25 can encode AVIF through `ravif`, but decoding
-  needs a native AV1 decoder (`dav1d`/`mp4parse`). HEIC also needs an HEVC
-  decoder and a licence review. Neither is enabled.
+- **AVIF input:** decoded in-process by `gamut-avif` (the ISO BMFF container,
+  item derivations and colour conversion) and `rav1d` (the AV1 codestream), both
+  pure Rust, so there is no external tool and no C library to install. 8-bit
+  content decodes to RGBA8 and 10/12-bit content to RGBA16, which the outputs
+  that can carry it (PNG, TIFF, Farbfeld) keep. Alpha auxiliary items, `grid`
+  tile assembly, the `clap`/`irot`/`imir` transformative properties and the AVIF
+  `Exif` item (including orientation) are handled. What is not handled: an AVIF
+  whose first `colr` is an ICC profile instead of CICP `nclx` colour is refused
+  with a typed error rather than decoded with the wrong colours (CICP colour is
+  what the decoder converts); chroma is upsampled nearest-neighbour when the
+  source is 4:2:0/4:2:2; an image *sequence* (`avis`) contributes its primary
+  still only. `rav1d` is built with `default-features = false`
+  because its `asm` feature assembles vendored x86 assembly with NASM, which
+  would be a build-time tool outside Rust — the portable Rust paths are used
+  instead.
+- **HEIC/HEIF input:** blocked on a licensing decision rather than on missing
+  code. Pure-Rust, permissively licensed HEIC decoders now exist
+  (`heifer` MIT/Apache-2.0, `zune-heic` MIT/Apache-2.0/Zlib, plus `gamut-heic`
+  MIT/Apache-2.0 for the container), so the old LGPL `libde265` blocker no
+  longer applies — but HEVC decoding carries patent licensing that a static
+  binary redistributing a decoder walks into, so adding one is the project
+  owner's call and not something to slip in. A HEIC file is therefore still
+  reported as an unsupported conversion.
 - **WOFF2 encoding:** output keeps the null `glyf`/`loca` transform, so it is
   valid and decodes everywhere, but it does not get the format's glyph
   pre-compression: the 35,220-byte Abel TTF becomes a 13,824-byte WOFF2 and a

@@ -91,6 +91,8 @@ pub enum ConvertError {
     TomlSerialize(#[from] toml::ser::Error),
     #[error(transparent)]
     Image(#[from] image::ImageError),
+    #[error("could not decode the AVIF image: {0}")]
+    Avif(String),
     #[error(transparent)]
     Csv(#[from] csv::Error),
     #[error(transparent)]

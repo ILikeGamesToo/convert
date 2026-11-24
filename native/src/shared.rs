@@ -69,3 +69,31 @@ pub(crate) fn is_video_input_extension(extension: &str) -> bool {
 pub(crate) fn is_font_extension(extension: &str) -> bool {
     input_extensions::FONT_INPUT_EXTENSIONS.contains(&extension)
 }
+
+/// Whether `bytes` begin with an ISO BMFF `ftyp` box naming the AVIF still
+/// image brand (`avif`) or the AVIF image sequence brand (`avis`), as either
+/// the major brand or one of the compatible brands.
+pub(crate) fn is_avif_input(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes")) as usize;
+    let end = if size >= 16 && size <= bytes.len() {
+        size
+    } else {
+        bytes.len()
+    };
+    let brands = bytes.get(8..end).unwrap_or(&bytes[8..12]);
+    if brands.len() >= 4 && (&brands[0..4] == b"avif" || &brands[0..4] == b"avis") {
+        return true;
+    }
+    // The major brand and the minor version are followed by the compatible
+    // brands, four bytes each.
+    brands
+        .get(8..)
+        .unwrap_or_default()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|brand| brand == b"avif" || brand == b"avis")
+}

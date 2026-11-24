@@ -8,6 +8,8 @@ use crate::options::ConversionOptions;
 use image::ImageEncoder;
 use std::io::Cursor;
 
+pub(crate) mod avif;
+
 pub(crate) const MAX_SVG_DIMENSION: u32 = 8_192;
 
 pub(crate) const MAX_SVG_PIXELS: u64 = 32_000_000;
@@ -20,13 +22,11 @@ pub(crate) fn load_image(
     input: &[u8],
     options: ConversionOptions,
 ) -> Result<image::DynamicImage, ConvertError> {
-    let mut reader = image::ImageReader::new(Cursor::new(input)).with_guessed_format()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
-    reader.limits(limits);
-    let image = reader.decode()?;
+    let image = if crate::shared::is_avif_input(input) {
+        avif::decode(input)?
+    } else {
+        decode_guessed_image(input)?
+    };
     if !options.image_apply_exif_orientation {
         return Ok(image);
     }
@@ -36,7 +36,18 @@ pub(crate) fn load_image(
     })
 }
 
-/// Reads the EXIF orientation tag from JPEG, TIFF, or PNG (`eXIf`) input.
+fn decode_guessed_image(input: &[u8]) -> Result<image::DynamicImage, ConvertError> {
+    let mut reader = image::ImageReader::new(Cursor::new(input)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
+
+/// Reads the EXIF orientation tag from JPEG, TIFF, PNG (`eXIf`) or AVIF
+/// (the `Exif` metadata item) input.
 ///
 /// A duplicated orientation tag in the primary image IFD, or across multiple
 /// primary EXIF segments, is ambiguous, so it is ignored rather than picking
@@ -44,7 +55,9 @@ pub(crate) fn load_image(
 /// missing or malformed tag; callers then leave the pixels alone.
 pub(crate) fn exif_orientation(input: &[u8]) -> Option<u16> {
     let mut orientations = Vec::new();
-    if input.starts_with(&[0xFF, 0xD8]) {
+    if crate::shared::is_avif_input(input) {
+        orientations.extend(avif::exif_orientations(input));
+    } else if input.starts_with(&[0xFF, 0xD8]) {
         let mut position = 2;
         while position + 4 <= input.len() {
             if input[position] != 0xFF {

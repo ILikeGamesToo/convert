@@ -20,6 +20,7 @@ pub enum InputFormat {
     Farbfeld,
     Dds,
     Svg,
+    Avif,
     Text,
     Csv,
     Json,
@@ -46,7 +47,7 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 36] = [
+    pub const SELECTABLE: [Self; 37] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -62,6 +63,7 @@ impl InputFormat {
         Self::Farbfeld,
         Self::Dds,
         Self::Svg,
+        Self::Avif,
         Self::Text,
         Self::Csv,
         Self::Json,
@@ -101,6 +103,7 @@ impl InputFormat {
             Self::Farbfeld => "Farbfeld image",
             Self::Dds => "DDS texture",
             Self::Svg => "SVG image",
+            Self::Avif => "AVIF image",
             Self::Text => "Plain text",
             Self::Csv => "CSV data",
             Self::Json => "JSON data",
@@ -143,6 +146,7 @@ impl InputFormat {
             Self::Farbfeld => "Farbfeld image",
             Self::Dds => "DirectDraw Surface texture",
             Self::Svg => "Scalable Vector Graphics",
+            Self::Avif => "AV1 Image File Format",
             Self::Text => "Plain text and text encodings",
             Self::Csv => "Comma-separated values",
             Self::Json => "JavaScript Object Notation",
@@ -184,6 +188,7 @@ impl InputFormat {
             Self::Farbfeld => "FF",
             Self::Dds => "DDS",
             Self::Svg => "SVG",
+            Self::Avif => "AVIF",
             Self::Text => "TXT",
             Self::Csv => "CSV",
             Self::Json => "JSON",
@@ -226,6 +231,7 @@ impl InputFormat {
             Self::Farbfeld => "ff",
             Self::Dds => "dds",
             Self::Svg => "svg",
+            Self::Avif => "avif",
             Self::Text => "txt",
             Self::Csv => "csv",
             Self::Json => "json",
@@ -268,6 +274,7 @@ impl InputFormat {
                 | Self::Farbfeld
                 | Self::Dds
                 | Self::Svg
+                | Self::Avif
         )
     }
 
@@ -339,6 +346,7 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "ff" => InputFormat::Farbfeld,
         "dds" => InputFormat::Dds,
         "svg" => InputFormat::Svg,
+        "avif" => InputFormat::Avif,
         "txt" => InputFormat::Text,
         "csv" => InputFormat::Csv,
         "json" => InputFormat::Json,
@@ -443,6 +451,9 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
         return Some(InputFormat::Ac3);
     }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        if crate::shared::is_avif_input(bytes) {
+            return Some(InputFormat::Avif);
+        }
         return Some(match &bytes[8..12] {
             b"M4A " | b"M4B " | b"M4P " => InputFormat::M4a,
             _ => InputFormat::Video,
@@ -517,6 +528,7 @@ mod tests {
             ("image.ff", InputFormat::Farbfeld),
             ("image.dds", InputFormat::Dds),
             ("image.svg", InputFormat::Svg),
+            ("image.avif", InputFormat::Avif),
             ("notes.txt", InputFormat::Text),
             ("data.csv", InputFormat::Csv),
             ("data.json", InputFormat::Json),
@@ -585,6 +597,13 @@ mod tests {
 
         let video = b"\0\0\0\x18ftypisom";
         assert_eq!(detect_from_bytes("mystery.bin", video), InputFormat::Video);
+
+        let avif = b"\0\0\0\x20ftypavif\0\0\0\0avifmif1miaf";
+        assert_eq!(detect_from_bytes("mystery.bin", avif), InputFormat::Avif);
+        assert_eq!(
+            detect_from_bytes("mystery.avif", &[0, 1, 2, 3]),
+            InputFormat::Avif
+        );
 
         let aiff = b"FORM\0\0\0\0AIFFCOMM";
         assert_eq!(detect_from_bytes("mystery.bin", aiff), InputFormat::Aiff);
