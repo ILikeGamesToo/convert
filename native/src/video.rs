@@ -6,10 +6,10 @@ use crate::container::{
     ebml_element_end, is_mp4_extension, mp4_child_boxes, mp4_find, read_ebml_element,
     read_ebml_uint, skip_ebml_element,
 };
-use crate::encode_image;
 use crate::error::ConvertError;
 use crate::ffmpeg::{ffmpeg_command, find_on_path, resolve_ffmpeg, run_ffmpeg, TempVideoPath};
 use crate::format::OutputFormat;
+use crate::images::encode_image;
 use crate::options::ConversionOptions;
 use crate::shared::{file_extension, output_name};
 use crate::ConvertedFile;
