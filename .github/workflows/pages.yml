@@ -16,6 +16,10 @@ concurrency:
 
 jobs:
   build:
+    # The site and its Pages artifact belong to the canonical repository. A fork
+    # has no Pages site, so this job can only fail there; skip it instead of
+    # reporting a red X nobody can act on.
+    if: github.repository == 'p2r3/convert'
     runs-on: ubuntu-latest
 
     steps:
@@ -61,7 +65,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.repository == 'p2r3/convert'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -9,6 +9,11 @@ permissions:
 
 jobs:
   build-electron:
+    # This job publishes the rolling release, so it belongs to the canonical
+    # repository. On a fork it would publish a release nobody asked for under
+    # the fork's name, built from the same commit the canonical repository
+    # builds.
+    if: github.repository == 'p2r3/convert'
     runs-on: ${{ matrix.os }}
 
     env:
