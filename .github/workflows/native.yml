@@ -28,6 +28,14 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
 
+    # GitHub's arm64 macOS pool intermittently cannot supply a runner: the job
+    # sits queued for about fifteen minutes and is then cancelled without
+    # running a step, annotated "The job was not acquired by Runner of type
+    # hosted even after multiple attempts". A cancelled job is not covered by
+    # continue-on-error, so a starved run stays red. macOS stays in the matrix
+    # anyway: a job that never started is a pool problem, not a reason to drop
+    # a platform the project supports.
+
     defaults:
       run:
         working-directory: native
