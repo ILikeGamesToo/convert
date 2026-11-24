@@ -2,7 +2,10 @@ name: Native
 
 on:
   push:
-    branches: ["master"]
+    # Every branch, not just `master`. A fork's work happens on branches and
+    # this project does not open pull requests from them, so a master-only
+    # trigger means a branch's first CI run is also its first review.
+    branches: ["**"]
     paths:
       - "native/**"
       - ".github/workflows/native.yml"
@@ -10,6 +13,11 @@ on:
     paths:
       - "native/**"
       - ".github/workflows/native.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
