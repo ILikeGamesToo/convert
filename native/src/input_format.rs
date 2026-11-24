@@ -21,6 +21,7 @@ pub enum InputFormat {
     Dds,
     Svg,
     Avif,
+    Heic,
     Text,
     Csv,
     Json,
@@ -47,7 +48,7 @@ pub enum InputFormat {
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 37] = [
+    pub const SELECTABLE: [Self; 38] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -64,6 +65,7 @@ impl InputFormat {
         Self::Dds,
         Self::Svg,
         Self::Avif,
+        Self::Heic,
         Self::Text,
         Self::Csv,
         Self::Json,
@@ -104,6 +106,7 @@ impl InputFormat {
             Self::Dds => "DDS texture",
             Self::Svg => "SVG image",
             Self::Avif => "AVIF image",
+            Self::Heic => "HEIC image",
             Self::Text => "Plain text",
             Self::Csv => "CSV data",
             Self::Json => "JSON data",
@@ -147,6 +150,7 @@ impl InputFormat {
             Self::Dds => "DirectDraw Surface texture",
             Self::Svg => "Scalable Vector Graphics",
             Self::Avif => "AV1 Image File Format",
+            Self::Heic => "High Efficiency Image File Format (HEVC)",
             Self::Text => "Plain text and text encodings",
             Self::Csv => "Comma-separated values",
             Self::Json => "JavaScript Object Notation",
@@ -189,6 +193,7 @@ impl InputFormat {
             Self::Dds => "DDS",
             Self::Svg => "SVG",
             Self::Avif => "AVIF",
+            Self::Heic => "HEIC",
             Self::Text => "TXT",
             Self::Csv => "CSV",
             Self::Json => "JSON",
@@ -232,6 +237,7 @@ impl InputFormat {
             Self::Dds => "dds",
             Self::Svg => "svg",
             Self::Avif => "avif",
+            Self::Heic => "heic",
             Self::Text => "txt",
             Self::Csv => "csv",
             Self::Json => "json",
@@ -275,6 +281,7 @@ impl InputFormat {
                 | Self::Dds
                 | Self::Svg
                 | Self::Avif
+                | Self::Heic
         )
     }
 
@@ -347,6 +354,7 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "dds" => InputFormat::Dds,
         "svg" => InputFormat::Svg,
         "avif" => InputFormat::Avif,
+        "heic" | "heif" => InputFormat::Heic,
         "txt" => InputFormat::Text,
         "csv" => InputFormat::Csv,
         "json" => InputFormat::Json,
@@ -454,6 +462,9 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
         if crate::shared::is_avif_input(bytes) {
             return Some(InputFormat::Avif);
         }
+        if crate::shared::is_heic_input(bytes) {
+            return Some(InputFormat::Heic);
+        }
         return Some(match &bytes[8..12] {
             b"M4A " | b"M4B " | b"M4P " => InputFormat::M4a,
             _ => InputFormat::Video,
@@ -529,6 +540,8 @@ mod tests {
             ("image.dds", InputFormat::Dds),
             ("image.svg", InputFormat::Svg),
             ("image.avif", InputFormat::Avif),
+            ("image.heic", InputFormat::Heic),
+            ("image.heif", InputFormat::Heic),
             ("notes.txt", InputFormat::Text),
             ("data.csv", InputFormat::Csv),
             ("data.json", InputFormat::Json),
@@ -603,6 +616,13 @@ mod tests {
         assert_eq!(
             detect_from_bytes("mystery.avif", &[0, 1, 2, 3]),
             InputFormat::Avif
+        );
+
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic";
+        assert_eq!(detect_from_bytes("mystery.bin", heic), InputFormat::Heic);
+        assert_eq!(
+            detect_from_bytes("mystery.heic", &[0, 1, 2, 3]),
+            InputFormat::Heic
         );
 
         let aiff = b"FORM\0\0\0\0AIFFCOMM";

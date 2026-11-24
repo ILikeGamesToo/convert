@@ -17,7 +17,7 @@ The same data is available from the library as `native_format_registry()`.
 
 | Area | Inputs | Native outputs | Notes |
 | --- | --- | --- | --- |
-| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF is decoded in-process by `gamut-avif` and `rav1d`, with no external tool. |
+| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
 | PDF | PDF | text encodings | Text extraction uses `pdf-extract`. PDF page rasterization is not implemented. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. MP3-to-MP3 keeps its ID3v2 tag; FLAC-to-FLAC keeps Vorbis comments and pictures. |
@@ -33,6 +33,48 @@ tracing, EPUB/AZW3/MOBI, office documents, Typst/Pandoc, 3D models,
 SQLite, 7z/RAR/LZH, comic archives, game formats, MIDI/module music, and
 PDF rasterization. Those handlers depend on JavaScript/WASM libraries or
 external tools that do not have a verified native equivalent in this crate.
+
+## AVIF and HEIC
+
+Both are decoded in-process by pure-Rust crates: there is no external tool, no C
+library and nothing for a user to install. Detection is by the ISO BMFF `ftyp`
+brand, so both are also selectable in the format list and reach every image
+target and PDF like any other image.
+
+**AVIF** — the container, item derivations and colour conversion come from
+`gamut-avif`; the AV1 codestream from `rav1d`, the Rust port of `dav1d`, built
+with `default-features = false` because its `asm` feature assembles vendored x86
+assembly with NASM, which would be a build-time tool outside Rust. 8-bit content
+decodes to RGBA8 and 10/12-bit content to RGBA16, which the outputs that can
+carry it (PNG, TIFF, Farbfeld) keep. Alpha auxiliary items, `grid` tile assembly,
+the `clap`/`irot`/`imir` transformative properties and the AVIF `Exif` item
+(including orientation) are handled. What is not: an AVIF whose first `colr` is
+an ICC profile instead of CICP `nclx` colour is refused with a typed error
+rather than decoded with the wrong colours, because CICP colour is what the
+decoder converts; chroma is upsampled nearest-neighbour for 4:2:0/4:2:2
+sources; an image *sequence* (`avis`) contributes its primary still only.
+
+**HEIC/HEIF** — `heifer` decodes the container and the HEVC codestream, HEVC
+included, in pure Rust and with no `unsafe`. 8-bit content decodes to RGBA8 and
+10/12-bit content to RGBA16. The `clap`/`irot`/`imir` container transforms, grid
+tiles, alpha auxiliary items and the EXIF orientation tag are applied, and
+samples are colour-managed to sRGB from an embedded ICC profile when there is one
+(phone photos are usually Display P3). What is not: an HDR file whose transfer is
+PQ or HLG is refused with a typed error rather than flattened (`heifer` has a
+separate gain-map API that this app does not drive); an image *sequence*
+contributes its primary image only; and an EXIF orientation is ignored for a file
+that also carries an `irot`/`imir` transform, because the decoder has already
+applied that one and rotating again would turn the image twice.
+
+**Why HEIC ships, and what that accepts** — the blocker used to be read as two
+problems: an LGPL/C decoder, and HEVC patent licensing. The first is gone:
+`heifer` is MIT OR Apache-2.0, has no `unsafe` and no C, and decodes real
+iPhone-style photos correctly. The second is real and was **accepted knowingly by
+the project owner**: HEVC decoding carries patent licensing that a static binary
+redistributing a decoder walks into, and a permissive copyright licence from the
+decoder author grants no patent rights. That decision is recorded here
+deliberately. Do not re-open it as though it were an oversight, and do not add a
+second HEVC implementation without the same decision.
 
 ## Known blockers
 
@@ -58,22 +100,7 @@ external tools that do not have a verified native equivalent in this crate.
   transcoded as a fallback. General transcoding is not implemented. See
   `native/VIDEO_PLAN.md` for the settled decisions and
   `cargo run --bin convert2it -- --list-video` for the route table.
-- **AVIF input:** decoded in-process by `gamut-avif` (the ISO BMFF container,
-  item derivations and colour conversion) and `rav1d` (the AV1 codestream), both
-  pure Rust, so there is no external tool and no C library to install. 8-bit
-  content decodes to RGBA8 and 10/12-bit content to RGBA16, which the outputs
-  that can carry it (PNG, TIFF, Farbfeld) keep. Alpha auxiliary items, `grid`
-  tile assembly, the `clap`/`irot`/`imir` transformative properties and the AVIF
-  `Exif` item (including orientation) are handled. What is not handled: an AVIF
-  whose first `colr` is an ICC profile instead of CICP `nclx` colour is refused
-  with a typed error rather than decoded with the wrong colours (CICP colour is
-  what the decoder converts); chroma is upsampled nearest-neighbour when the
-  source is 4:2:0/4:2:2; an image *sequence* (`avis`) contributes its primary
-  still only. `rav1d` is built with `default-features = false`
-  because its `asm` feature assembles vendored x86 assembly with NASM, which
-  would be a build-time tool outside Rust — the portable Rust paths are used
-  instead.
-- **HEIC/HEIF input:** blocked on a licensing decision rather than on missing
+- - **HEIC/HEIF input:** blocked on a licensing decision rather than on missing
   code. Pure-Rust, permissively licensed HEIC decoders now exist
   (`heifer` MIT/Apache-2.0, `zune-heic` MIT/Apache-2.0/Zlib, plus `gamut-heic`
   MIT/Apache-2.0 for the container), so the old LGPL `libde265` blocker no

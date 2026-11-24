@@ -9,6 +9,7 @@ use image::ImageEncoder;
 use std::io::Cursor;
 
 pub(crate) mod avif;
+pub(crate) mod heic;
 
 pub(crate) const MAX_SVG_DIMENSION: u32 = 8_192;
 
@@ -24,6 +25,8 @@ pub(crate) fn load_image(
 ) -> Result<image::DynamicImage, ConvertError> {
     let image = if crate::shared::is_avif_input(input) {
         avif::decode(input)?
+    } else if crate::shared::is_heic_input(input) {
+        heic::decode(input)?
     } else {
         decode_guessed_image(input)?
     };
@@ -46,7 +49,7 @@ fn decode_guessed_image(input: &[u8]) -> Result<image::DynamicImage, ConvertErro
     Ok(reader.decode()?)
 }
 
-/// Reads the EXIF orientation tag from JPEG, TIFF, PNG (`eXIf`) or AVIF
+/// Reads the EXIF orientation tag from JPEG, TIFF, PNG (`eXIf`), AVIF and HEIC
 /// (the `Exif` metadata item) input.
 ///
 /// A duplicated orientation tag in the primary image IFD, or across multiple
@@ -57,6 +60,8 @@ pub(crate) fn exif_orientation(input: &[u8]) -> Option<u16> {
     let mut orientations = Vec::new();
     if crate::shared::is_avif_input(input) {
         orientations.extend(avif::exif_orientations(input));
+    } else if crate::shared::is_heic_input(input) {
+        orientations.extend(heic::exif_orientations(input));
     } else if input.starts_with(&[0xFF, 0xD8]) {
         let mut position = 2;
         while position + 4 <= input.len() {

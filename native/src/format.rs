@@ -437,21 +437,30 @@ mod tests {
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
     }
     #[test]
-    fn registry_lists_avif_as_an_image_input() {
+    fn registry_lists_avif_and_heic_as_image_inputs() {
         assert!(OutputFormat::Png.supports_input("photo.avif"));
         assert!(OutputFormat::Pdf.supports_input("photo.avif"));
         assert!(!OutputFormat::Wav.supports_input("photo.avif"));
+        assert!(OutputFormat::Png.supports_input("photo.heic"));
+        assert!(OutputFormat::Jpeg.supports_input("photo.heif"));
+        assert!(OutputFormat::Pdf.supports_input("photo.heic"));
+        assert!(!OutputFormat::Wav.supports_input("photo.heic"));
 
-        let registry = native_format_registry();
-        let avif = registry
-            .iter()
-            .find(|handler| handler.input == input_format::InputFormat::Avif)
-            .unwrap();
-        assert_eq!(avif.canonical_extension, Some("avif"));
-        assert!(avif.outputs.contains(&OutputFormat::Png));
-        assert!(avif.outputs.contains(&OutputFormat::Jpeg));
-        assert!(avif.outputs.contains(&OutputFormat::Pdf));
-        assert!(!avif.outputs.contains(&OutputFormat::Wav));
+        for (input, extension) in [
+            (input_format::InputFormat::Avif, "avif"),
+            (input_format::InputFormat::Heic, "heic"),
+        ] {
+            let registry = native_format_registry();
+            let handler = registry
+                .iter()
+                .find(|handler| handler.input == input)
+                .unwrap();
+            assert_eq!(handler.canonical_extension, Some(extension));
+            assert!(handler.outputs.contains(&OutputFormat::Png));
+            assert!(handler.outputs.contains(&OutputFormat::Jpeg));
+            assert!(handler.outputs.contains(&OutputFormat::Pdf));
+            assert!(!handler.outputs.contains(&OutputFormat::Wav));
+        }
     }
     #[test]
     fn file_picker_extensions_stay_in_sync_with_conversion_inputs() {

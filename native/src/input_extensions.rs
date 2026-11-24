@@ -3,7 +3,7 @@
 /// Image extensions accepted by the conversion engine.
 pub const IMAGE_INPUT_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "ico", "pnm", "pbm", "pgm", "ppm",
-    "pam", "tga", "qoi", "hdr", "ff", "dds", "svg", "avif",
+    "pam", "tga", "qoi", "hdr", "ff", "dds", "svg", "avif", "heic", "heif",
 ];
 
 /// Text and data extensions accepted by the conversion engine.

@@ -93,6 +93,8 @@ pub enum ConvertError {
     Image(#[from] image::ImageError),
     #[error("could not decode the AVIF image: {0}")]
     Avif(String),
+    #[error("could not decode the HEIC image: {0}")]
+    Heic(String),
     #[error(transparent)]
     Csv(#[from] csv::Error),
     #[error(transparent)]

@@ -74,6 +74,30 @@ pub(crate) fn is_font_extension(extension: &str) -> bool {
 /// image brand (`avif`) or the AVIF image sequence brand (`avis`), as either
 /// the major brand or one of the compatible brands.
 pub(crate) fn is_avif_input(bytes: &[u8]) -> bool {
+    ftyp_has_brand(bytes, &[b"avif", b"avis"])
+}
+
+/// Whether `bytes` begin with an ISO BMFF `ftyp` box naming a HEIC/HEIF brand:
+/// HEVC images (`heic`, `heix`), HEVC images with alpha (`hevc`, `hevx`) and
+/// their sequence variants (`heis`, `hevm`, `hevs`, `msf1`), plus the generic
+/// `mif1`/`mif2` brands that AVIF files also use.
+///
+/// Because `mif1`/`mif2`/`msf1` say nothing about the codec, callers test
+/// [`is_avif_input`] first: an AVIF that declares the `avif` brand among its
+/// compatible brands is AVIF, and anything else generic is treated as HEIC.
+pub(crate) fn is_heic_input(bytes: &[u8]) -> bool {
+    ftyp_has_brand(
+        bytes,
+        &[
+            b"heic", b"heix", b"hevc", b"hevx", b"heis", b"hevm", b"hevs", b"msf1", b"mif1",
+            b"mif2",
+        ],
+    )
+}
+
+/// Whether the `ftyp` box at the start of `bytes` names any of `brands`, as the
+/// major brand or as one of the compatible brands.
+fn ftyp_has_brand(bytes: &[u8], brands: &[&[u8; 4]]) -> bool {
     if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
         return false;
     }
@@ -83,17 +107,19 @@ pub(crate) fn is_avif_input(bytes: &[u8]) -> bool {
     } else {
         bytes.len()
     };
-    let brands = bytes.get(8..end).unwrap_or(&bytes[8..12]);
-    if brands.len() >= 4 && (&brands[0..4] == b"avif" || &brands[0..4] == b"avis") {
+    let Some((major_brand, rest)) = bytes.get(8..end).and_then(|list| list.split_at_checked(4))
+    else {
+        return false;
+    };
+    if <&[u8; 4]>::try_from(major_brand).is_ok_and(|major| brands.contains(&major)) {
         return true;
     }
     // The major brand and the minor version are followed by the compatible
     // brands, four bytes each.
-    brands
-        .get(8..)
+    rest.get(4..)
         .unwrap_or_default()
         .as_chunks::<4>()
         .0
         .iter()
-        .any(|brand| brand == b"avif" || brand == b"avis")
+        .any(|brand| brands.contains(&brand))
 }
