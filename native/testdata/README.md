@@ -329,3 +329,21 @@ reader is tested against a container written by hand rather than against a
 copyrighted book, and the writer is tested against a shape it did not produce.
 Reading real books was verified outside the suite against `rbook`'s own test
 epubs, which stay in its crate; see `reports/ILGT-19.md` in the crew drive.
+
+## Tracing fixtures
+
+- `trace-logo.png` and `trace-photo.png` — the two vector-tracing fixtures, drawn
+  from arithmetic by [`make-trace-fixtures.py`](make-trace-fixtures.py) with no
+  third-party pixels, no photograph and nothing beyond the standard library's
+  `zlib`. `trace-logo.png` is 240x180 with exactly five flat colours and hard
+  edges, so a faithful trace reproduces it almost exactly; `trace-photo.png` is
+  320x240 with gradients, curved boundaries and deterministic grain, 9834
+  colours, so a trace can only approximate it. Regenerate both with:
+
+  ```sh
+  python3 make-trace-fixtures.py .
+  ```
+
+  Both are deterministic, so a regenerated file is byte-identical to the
+  committed one. `src/trace.rs` traces each one, renders the result back through
+  `resvg` and compares it against the source.

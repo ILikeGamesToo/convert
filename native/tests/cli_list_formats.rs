@@ -23,12 +23,17 @@ fn list_formats_reports_the_metadata_carried_by_each_target() {
     assert!(stdout.contains("EPUB ebook\tepub\t"), "{stdout}");
     assert!(stdout.contains("HTML document\thtml\t"), "{stdout}");
     assert!(stdout.contains("Markdown document\tmd\t"), "{stdout}");
+    // All three SVG targets write `.svg`, so the registry prints the `--format`
+    // spelling that selects one of them.
+    assert!(stdout.contains("svg-trace"), "{stdout}");
+    assert!(stdout.contains("svg-page"), "{stdout}");
     // The registry rows stay three tab-separated fields, so tooling that reads
     // them keeps working; the metadata note is a separate paragraph.
     for line in stdout.lines() {
         if line.starts_with("Metadata:")
             || line.starts_with("Video:")
             || line.starts_with("Office:")
+            || line.starts_with("SVG:")
             || line.is_empty()
         {
             continue;

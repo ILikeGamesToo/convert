@@ -17,7 +17,7 @@ The same data is available from the library as `native_format_registry()`.
 
 | Area | Inputs | Native outputs | Notes |
 | --- | --- | --- | --- |
-| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF | SVG is rasterized with a size/pixel limit. DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. EXIF and ICC profiles are carried between the targets that store them; see [Metadata](#metadata). |
+| Raster images | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, SVG, AVIF, HEIC/HEIF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PBM/PGM/PPM/PAM, TGA, QOI, HDR, Farbfeld, PDF, SVG trace | SVG input is rasterized with a size/pixel limit, and every raster input can also be traced to a new SVG with its own limits; see [Vector tracing](#vector-tracing). DDS is input-only. AVIF and HEIC are decoded in-process by pure-Rust crates, with no external tool and no C library to install. EXIF and ICC profiles are carried between the targets that store them; see [Metadata](#metadata). |
 | Text and data | TXT, CSV, JSON, YAML, TOML | PDF, text encodings, CSV, JSON, YAML, TOML | CSV/JSON/YAML/TOML conversions use the same tabular rules as the web handlers. |
 | Office documents | DOCX, XLSX/XLS, PPTX, ODT, ODS | Text and the text encodings, CSV, JSON | Content is extracted, never rendered. A document becomes Markdown-shaped text with its headings, lists and tables in reading order, a presentation becomes its slides' text in presentation order, and a workbook becomes one CSV per sheet or one JSON document. The container's own parts decide which format a file is, before its extension does. See [Office documents as data](#office-documents-as-data). |
 | PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, SVG pages, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro` or vectorise through `hayro-svg`, one file per page; see [PDF rasterisation](#pdf-rasterisation) and [PDF page SVGs](#pdf-page-svgs) for the scale, the naming and the limits. |
@@ -30,8 +30,7 @@ The same data is available from the library as `native_format_registry()`.
 
 ## Web-only handlers not yet ported
 
-The web app (`src/handlers/index.ts`) also has dedicated handlers for vector
-tracing, MOBI/AZW3, Typst/Pandoc, 3D models,
+MOBI/AZW3, Typst/Pandoc, 3D models,
 SQLite, LZH, the comic packer that builds a CBZ/CBT/CBR/CB7 from loose images, game
 formats, and MIDI/module music. Those handlers depend on
 JavaScript/WASM libraries or
@@ -139,8 +138,8 @@ already the font specimen: `OutputFormat::Svg` stays labelled "SVG font" so an
 existing font workflow resolves as it did, and `OutputFormat::SvgPage` is the
 one the PDF row offers — "SVG page" under the GUI's Image category, `--format
 svg-page` on the CLI, and `.svg` as the file extension for both. The two names
-are the whole of the split, and `--list-formats` prints extensions, so both rows
-end in `svg` while only `svg-page` selects a page from the CLI.
+are the whole of the split; see [The three SVG outputs](#the-three-svg-outputs)
+for how the font specimen, the page and the trace are told apart.
 
 Everything about page handling is shared with rasterisation: one output file per
 page named `<stem>_<page>.svg`, a zero-based page number, and each page written
@@ -155,6 +154,77 @@ permissive substitutes as the rasteriser, so a page that embeds no font still
 outlines real glyphs. The committed fixture converts to a valid 388 KB SVG, and
 `native/src/pdf.rs` asserts the viewBox, the vector fill and the absence of a
 raster fallback.
+
+## The three SVG outputs
+
+Three targets write a `.svg` file and each means something different, so each
+has its own name, label and CLI spelling. A saved setting stores the target
+rather than the extension, so nothing that already shipped changes meaning.
+
+| Target | GUI label | CLI | Input | What the document is |
+| --- | --- | --- | --- | --- |
+| `OutputFormat::Svg` | SVG font | `svg` | TTF, OTF, WOFF, WOFF2, TTC/OTC | A font specimen: one `<glyph>` per mapped codepoint, not a picture of text. |
+| `OutputFormat::SvgPage` | SVG page | `svg-page` | PDF | One document per page, carrying the page's own geometry with text as glyph outlines. |
+| `OutputFormat::SvgTrace` | SVG trace | `svg-trace` | Every raster the app decodes, SVG input excepted | Paths traced from the pixels: colour regions fitted with curves. |
+
+The GUI's format list shows each label with a description under it, so the three
+never appear as an unexplained `.SVG`, and only one of them is ever offered for
+a given input. `--list-formats` prints the CLI spelling rather than the shared
+extension, so a script reading the registry can tell them apart too. `svg` alone
+still selects the font specimen, which is what it has always selected; a raster
+image asked for `svg` gets a typed error naming the target rather than a guess.
+
+## Vector tracing
+
+Tracing turns a decoded raster into a new document: the pixels are grouped into
+colour layers, each layer's boundary is fitted with curves, and the paths are
+written back to front. `vtracer` 0.6.5 (MIT OR Apache-2.0, pure Rust) does the
+grouping and the fitting. It is handed the pixels `load_image` already decoded,
+so no new image decoder was written and every raster input — PNG, JPEG, WebP,
+GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, DDS, AVIF, HEIC — traces.
+SVG input is excluded: it is already vector, and tracing it would rasterise it
+first.
+
+One fixed configuration is used for every trace, because a preset menu hands a
+quality decision to someone who cannot evaluate it. It is `vtracer`'s default
+shape: 6-bit colour precision, a layer difference of 16, a 4-pixel speckle
+filter, spline paths with a 60-degree corner threshold, and two decimal places
+on the coordinates. Each choice was measured rather than assumed, on the two
+committed fixtures:
+
+- **Colour precision 6, layer difference 16.** Raising them to 8 bits and 48
+  levels moves the mean round-trip error by under 0.5/255 while multiplying the
+  path count (64 to 98 paths at 320x240, 256 to 1112 at 1.9 MP) and roughly
+  doubling the time. Path count is what turns a trace into a blob.
+- **Spline over polygon.** Polygon output is 3.7 times smaller — 32 KiB against
+  119 KiB for the same 64 paths on the photo fixture — and the error at native
+  size cannot tell the two apart. A trace exists to be scaled, though: rendered
+  16 times up against the logo's circle, the spline boundary sits 0.15 px (RMS,
+  worst 0.27) from the true edge while the polygon chords it at 0.33 px (worst
+  0.52) and always to the inside, which is 8 px of visible faceting at that
+  scale.
+- **A 4-pixel speckle filter.** Without it, the grain in a photograph becomes
+  thousands of one-pixel paths.
+
+Measured through the conversion path on the release build: the five-colour logo
+comes back as 5 paths and 1,501 bytes with a mean error of 0.64/255 and 99% of
+pixels exact; the synthetic photograph comes back as 64 paths and 120 KiB with a
+mean error of 5.06/255 and a 99th percentile of 19. The tests assert those
+bounds and the path counts, and they render the trace back through `resvg`
+instead of checking that a file was written.
+
+Tracing cost grows faster than the pixel count: 0.07 s at 320x240, 7.8 s at
+1.9 MP, 26 s and 400 MB at 4 MP, 59 s and 850 MB at 8 MP. The limit is therefore
+4096 pixels per side and 4,000,000 pixels in total, both checked before a pixel
+is clustered, and anything larger returns `TraceTooLarge` instead of grinding. A
+12-megapixel phone photo is refused for that reason and has to be resized first,
+which is a deliberate trade rather than a missing path.
+
+A fully transparent pixel carries no colour, and encoders commonly store black
+there, so the tracer writes white into those pixels before clustering while
+keeping the alpha. A transparent background large enough for the tracer to key
+out stays transparent; one it does not key out becomes white rather than a black
+shape.
 
 ## Office documents as data
 

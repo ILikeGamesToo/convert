@@ -27,6 +27,7 @@ use crate::shared::{
     unsupported,
 };
 use crate::text::{convert_text, encode_text};
+use crate::trace;
 use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
 use std::{
     collections::HashSet,
@@ -200,6 +201,16 @@ pub fn convert_bytes_with_video_control(
         return Ok(vec![ConvertedFile {
             name: output_name(input_name, target.extension()),
             bytes,
+        }]);
+    }
+
+    if target == OutputFormat::SvgTrace {
+        if !trace::is_traceable_extension(&extension) {
+            return Err(unsupported(&extension, target));
+        }
+        return Ok(vec![ConvertedFile {
+            name: output_name(input_name, target.extension()),
+            bytes: trace::trace(&load_image(input, options)?)?.into_bytes(),
         }]);
     }
 

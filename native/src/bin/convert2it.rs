@@ -16,7 +16,7 @@ use std::{
 use convert_to_it_native::{
     convert_batch_with_video_config, native_format_registry, native_video_routes, AudioBitDepth,
     AudioChannels, ConversionOptions, Mp3Bitrate, OutputFormat, PdfImageFit, PdfOrientation,
-    PdfPageSize, VideoToolConfig,
+    PdfPageSize, VideoToolConfig, MAX_TRACE_DIMENSION, MAX_TRACE_PIXELS,
 };
 
 const USAGE: &str = "\
@@ -105,7 +105,7 @@ fn print_format_registry() {
         let outputs = handler
             .outputs
             .iter()
-            .map(|output| output.extension())
+            .map(|output| output_token(*output))
             .collect::<Vec<_>>()
             .join(",");
         println!("{}\t{}\t{}", handler.input.label(), extension, outputs);
@@ -130,6 +130,26 @@ fn print_format_registry() {
          document, or one text file of tab-separated rows per sheet. Nothing is rendered: a \
          document is read for its content, never for its layout."
     );
+    println!();
+    println!(
+        "SVG: `svg` is the font specimen, `svg-page` is one file per PDF page, and \
+         `svg-trace` traces a raster image into paths. Tracing is limited to images of \
+         at most {max_side} pixels per side and {max_megapixels} megapixels in total.",
+        max_side = MAX_TRACE_DIMENSION,
+        max_megapixels = MAX_TRACE_PIXELS / 1_000_000,
+    );
+}
+
+/// The name a target is asked for on the command line. All three SVG targets
+/// write a `.svg` file, so the registry prints the `--format` spelling that selects
+/// one of them instead of the extension three of them share.
+fn output_token(target: OutputFormat) -> &'static str {
+    match target {
+        OutputFormat::Svg => "svg",
+        OutputFormat::SvgPage => "svg-page",
+        OutputFormat::SvgTrace => "svg-trace",
+        other => other.extension(),
+    }
 }
 
 fn print_video_routes() {

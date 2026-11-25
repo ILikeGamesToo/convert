@@ -76,10 +76,12 @@ pub enum OutputFormat {
     Html,
     /// Write the document as CommonMark.
     Markdown,
+    /// Trace a raster image into an SVG vector document.
+    SvgTrace,
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 51] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -130,6 +132,7 @@ impl OutputFormat {
         Self::Epub,
         Self::Html,
         Self::Markdown,
+        Self::SvgTrace,
     ];
 
     pub fn label(self) -> &'static str {
@@ -184,6 +187,7 @@ impl OutputFormat {
             Self::Epub => "EPUB ebook",
             Self::Html => "HTML document",
             Self::Markdown => "Markdown document",
+            Self::SvgTrace => "SVG trace",
         }
     }
 
@@ -275,7 +279,7 @@ impl OutputFormat {
             Self::Otf => "otf",
             Self::Woff => "woff",
             Self::Woff2 => "woff2",
-            Self::Svg | Self::SvgPage => "svg",
+            Self::Svg | Self::SvgPage | Self::SvgTrace => "svg",
             Self::Epub => "epub",
             Self::Html => "html",
             Self::Markdown => "md",
@@ -291,10 +295,13 @@ impl OutputFormat {
             .trim_start_matches('.')
             .to_ascii_lowercase();
         // `svg` stays the font specimen so an existing font workflow keeps
-        // resolving as it did; the PDF page target needs its own name because
-        // both write the same `.svg` extension.
+        // resolving as it did; the PDF page and image trace targets need their
+        // own names because all three write the same `.svg` extension.
         if extension == "svg-page" || extension == "svgpage" {
             return Some(Self::SvgPage);
+        }
+        if extension == "svg-trace" || extension == "svgtrace" {
+            return Some(Self::SvgTrace);
         }
         let normalized = match extension.as_str() {
             "jpeg" => "jpg",
@@ -376,6 +383,7 @@ impl OutputFormat {
             }
             Self::Html => is_epub_extension(&extension) || is_markdown_extension(&extension),
             Self::Markdown => is_epub_extension(&extension) || is_html_extension(&extension),
+            Self::SvgTrace => crate::trace::is_traceable_extension(&extension),
         }
     }
 }
@@ -592,6 +600,39 @@ mod tests {
             assert!(!handler.outputs.contains(&OutputFormat::Wav));
         }
     }
+    #[test]
+    fn the_trace_target_is_offered_for_raster_inputs_but_not_svg() {
+        assert_eq!(OutputFormat::SvgTrace.extension(), "svg");
+        assert_eq!(OutputFormat::SvgTrace.label(), "SVG trace");
+        assert_eq!(
+            OutputFormat::from_extension("svg-trace"),
+            Some(OutputFormat::SvgTrace)
+        );
+        assert_eq!(
+            OutputFormat::from_extension("svgtrace"),
+            Some(OutputFormat::SvgTrace)
+        );
+        // The name `svg` still resolves to the font specimen, as it always has.
+        assert_eq!(OutputFormat::from_extension("svg"), Some(OutputFormat::Svg));
+
+        for extension in [
+            "png", "jpg", "webp", "gif", "bmp", "tiff", "ico", "tga", "qoi", "hdr", "ff", "dds",
+            "avif", "heic",
+        ] {
+            assert!(
+                OutputFormat::SvgTrace.supports_input(&format!("sample.{extension}")),
+                ".{extension} should be traceable"
+            );
+        }
+        // SVG input is already vector, and the font and PDF targets keep their
+        // own names rather than being reached by tracing.
+        assert!(!OutputFormat::SvgTrace.supports_input("icon.svg"));
+        assert!(!OutputFormat::SvgTrace.supports_input("report.pdf"));
+        assert!(!OutputFormat::SvgTrace.supports_input("font.ttf"));
+        assert!(!OutputFormat::SvgTrace.supports_input("song.mp3"));
+        assert!(!OutputFormat::SvgTrace.supports_input("archive.zip"));
+    }
+
     #[test]
     fn file_picker_extensions_stay_in_sync_with_conversion_inputs() {
         let extensions = supported_input_extensions();

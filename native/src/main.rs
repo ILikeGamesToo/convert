@@ -363,10 +363,10 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Qoi
         | OutputFormat::Hdr
         | OutputFormat::Farbfeld => FormatCategory::Image,
-        // A PDF page rendered as SVG is a page you can look at or drop into a
-        // layout, so it belongs beside the raster targets rather than with the
-        // documents the app reads.
-        OutputFormat::SvgPage => FormatCategory::Image,
+        // A PDF page rendered as SVG, and an image traced to SVG, are both
+        // things you can look at or drop into a layout, so they belong beside
+        // the raster targets rather than with the documents the app reads.
+        OutputFormat::SvgPage | OutputFormat::SvgTrace => FormatCategory::Image,
         OutputFormat::Pdf => FormatCategory::Document,
         OutputFormat::Text
         | OutputFormat::TextUtf8NoBom
@@ -453,6 +453,7 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Epub => "EPUB",
         OutputFormat::Html => "HTML",
         OutputFormat::Markdown => "MD",
+        OutputFormat::SvgTrace => "SVG TRACE",
     }
 }
 
@@ -508,6 +509,7 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Epub => "EPUB ebook",
         OutputFormat::Html => "HTML document",
         OutputFormat::Markdown => "Markdown document",
+        OutputFormat::SvgTrace => "Traced vector image",
     }
 }
 
@@ -4366,7 +4368,8 @@ fn main() {
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
-                OutputFormat::Gzip
+                OutputFormat::Gzip,
+                OutputFormat::SvgTrace
             ]
         );
     }
@@ -4482,6 +4485,7 @@ fn main() {
             OutputFormat::Tar,
             OutputFormat::TarGz,
             OutputFormat::Gzip,
+            OutputFormat::SvgTrace,
         ];
         for input in [InputFormat::Bmp, InputFormat::Tiff] {
             assert_eq!(available_targets(Some(input)), expected);

@@ -126,6 +126,16 @@ thiserror = "2"
 tiff = "0.11"
 toml = "1.2"
 ttf-parser = "0.25"
+# `vtracer` names its path-fitting mode with `visioncortex`'s type, so the
+# configuration in `src/trace.rs` states it through the same crate rather than
+# inheriting whichever mode vtracer's own default happens to be. This is the
+# version vtracer 0.6.5 already builds on, so it adds no crate to the lock.
+visioncortex = "0.8.8"
+# Raster-to-SVG tracing. `vtracer` clusters the decoded pixels by colour and
+# fits spline paths around each cluster; it is pure Rust (MIT OR Apache-2.0)
+# with no `build.rs` and no C library. Its own `image` dependency is not used
+# here: the trace is handed the RGBA pixels the app already decoded.
+vtracer = "0.6.5"
 webbrowser = "1.2"
 # wuff decodes WOFF and WOFF2 (including the WOFF2 glyf transform) in pure Rust.
 wuff = "0.2"

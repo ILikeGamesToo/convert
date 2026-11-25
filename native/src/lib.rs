@@ -25,6 +25,7 @@ mod streaming;
 #[cfg(test)]
 mod test_support;
 mod text;
+mod trace;
 mod video;
 
 pub use archive::extract_archive;
@@ -43,6 +44,7 @@ pub use format::{native_format_registry, FormatHandler, OutputFormat};
 pub use input_extensions::supported_input_extensions;
 pub use options::ConversionOptions;
 pub use streaming::{convert_audio_file_to_writer, convert_audio_file_to_writer_with_cancel};
+pub use trace::{MAX_TRACE_DIMENSION, MAX_TRACE_PIXELS};
 pub use video::{
     native_video_routes, VideoControl, VideoProgress, VideoRoute, VideoRouteInfo, VideoToolConfig,
 };

@@ -35,6 +35,17 @@ pub enum ConvertError {
     },
     #[error("the SVG is too large to render")]
     SvgTooLarge,
+    #[error(
+        "the image is {width} x {height} pixels; tracing is limited to {max_side} pixels per side and {max_pixels} pixels in total"
+    )]
+    TraceTooLarge {
+        width: u32,
+        height: u32,
+        max_side: u32,
+        max_pixels: u64,
+    },
+    #[error("could not trace the image: {0}")]
+    Trace(String),
     #[error("could not read or write the font: {0}")]
     Font(String),
     #[error("the text needs {pages} PDF pages, more than the {max}-page limit")]
