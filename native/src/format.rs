@@ -325,13 +325,12 @@ impl OutputFormat {
     pub fn supports_input(self, file_name: &str) -> bool {
         let extension = file_extension(file_name);
         match self {
-            Self::Png | Self::Jpeg | Self::Webp => {
+            Self::Png | Self::Jpeg | Self::Webp | Self::Gif => {
                 is_image_input_extension(&extension)
                     || is_video_input_extension(&extension)
                     || is_pdf_extension(&extension)
             }
-            Self::Gif
-            | Self::Bmp
+            Self::Bmp
             | Self::Tiff
             | Self::Ico
             | Self::Ppm
@@ -486,7 +485,7 @@ mod tests {
         assert!(video.outputs.contains(&OutputFormat::Webp));
         assert!(video.outputs.contains(&OutputFormat::Mp4));
         assert!(video.outputs.contains(&OutputFormat::Webm));
-        assert!(!video.outputs.contains(&OutputFormat::Gif));
+        assert!(video.outputs.contains(&OutputFormat::Gif));
 
         let any = registry
             .iter()

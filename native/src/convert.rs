@@ -99,16 +99,16 @@ fn archive_entries(
         .collect())
 }
 
-/// Conversion entry point that accepts the reserved transcode progress and
-/// cancellation hooks. This slice's remux and thumbnail paths are synchronous,
-/// so the hooks are ignored; non-video conversions ignore them as well.
+/// Conversion entry point that accepts the progress and cancellation hooks the
+/// ffmpeg encode path uses. A stream-copy remux and a thumbnail are single fast
+/// invocations and ignore them; every other conversion ignores them as well.
 pub fn convert_bytes_with_video_control(
     input_name: &str,
     input: &[u8],
     target: OutputFormat,
     options: ConversionOptions,
     video: &VideoToolConfig,
-    _control: Option<&mut VideoControl<'_>>,
+    control: Option<&mut VideoControl<'_>>,
 ) -> Result<Vec<ConvertedFile>, ConvertError> {
     let extension = file_extension(input_name);
     if target == OutputFormat::Files {
@@ -218,7 +218,13 @@ pub fn convert_bytes_with_video_control(
         if !is_video_input_extension(&extension) {
             return Err(unsupported(&extension, target));
         }
-        return convert_video(input_name, input, target, video);
+        return convert_video(input_name, input, target, video, control);
+    }
+
+    // A GIF from a video is an animation, not a single frame, so it goes to the
+    // video encoder instead of the thumbnail path below.
+    if target == OutputFormat::Gif && is_video_input_extension(&extension) {
+        return convert_video(input_name, input, target, video, control);
     }
 
     if target.image_format().is_some() && is_video_input_extension(&extension) {

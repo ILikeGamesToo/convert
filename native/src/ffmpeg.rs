@@ -3,11 +3,16 @@
 //! Locating and running the external ffmpeg binary.
 
 use crate::error::ConvertError;
-use crate::video::VideoToolConfig;
+use crate::video::{VideoProgress, VideoToolConfig};
 use std::{
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    process::{Command, ExitStatus, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    time::Duration,
 };
 
 pub(crate) const FFMPEG_STDERR_LIMIT: usize = 8_192;
@@ -64,32 +69,128 @@ pub(crate) fn ffmpeg_stderr(bytes: &[u8]) -> String {
     }
 }
 
+fn spawn_error(error: std::io::Error, ffmpeg: &Path) -> ConvertError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        ConvertError::FfmpegNotFound {
+            path: ffmpeg.display().to_string(),
+        }
+    } else {
+        ConvertError::FfmpegSpawn(error.to_string())
+    }
+}
+
+fn status_text(status: ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated by signal".to_owned())
+}
+
 pub(crate) fn run_ffmpeg(command: &mut Command, ffmpeg: &Path) -> Result<Output, ConvertError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command.output().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ConvertError::FfmpegNotFound {
-                path: ffmpeg.display().to_string(),
-            }
-        } else {
-            ConvertError::FfmpegSpawn(error.to_string())
-        }
-    })?;
+    let output = command
+        .output()
+        .map_err(|error| spawn_error(error, ffmpeg))?;
     if !output.status.success() {
-        let status = output
-            .status
-            .code()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "terminated by signal".to_owned());
         return Err(ConvertError::FfmpegFailed {
-            status,
+            status: status_text(output.status),
             stderr: ffmpeg_stderr(&output.stderr),
         });
     }
     Ok(output)
+}
+
+/// How often a tracked encode looks at the cancellation flag while ffmpeg is
+/// quiet. ffmpeg writes a progress block about twice a second, so this only
+/// bounds the latency of a cancel between two blocks.
+const CANCEL_POLL: Duration = Duration::from_millis(200);
+
+/// Runs an encoding ffmpeg while forwarding the `out_time_us` values it writes
+/// for `-progress pipe:1` and stopping it when `cancel` is set.
+///
+/// The caller must have added `-progress pipe:1 -nostats` to the command and
+/// must have given it a file output: stdout is the progress stream, so nothing
+/// this function reads is conversion output. Cancellation kills the child and
+/// returns [`ConvertError::Cancelled`]; ffmpeg's exit status and stderr become
+/// [`ConvertError::FfmpegFailed`] exactly as in [`run_ffmpeg`].
+pub(crate) fn run_ffmpeg_tracked(
+    command: &mut Command,
+    ffmpeg: &Path,
+    cancel: &AtomicBool,
+    mut on_progress: Option<&mut dyn FnMut(VideoProgress)>,
+) -> Result<(), ConvertError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| spawn_error(error, ffmpeg))?;
+    let stdout = child.stdout.take().expect("ffmpeg stdout is piped");
+    let stderr = child.stderr.take().expect("ffmpeg stderr is piped");
+
+    // Each pipe is drained on its own thread so a full stderr buffer can never
+    // block the child while this thread is waiting for the next progress line.
+    let (sender, receiver) = mpsc::channel();
+    let progress_reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let update = line
+                .strip_prefix("out_time_us=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|microseconds| VideoProgress {
+                    out_time: Duration::from_micros(microseconds),
+                    total: None,
+                });
+            if sender.send(update).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut bytes);
+        bytes
+    });
+
+    let mut cancelled = false;
+    loop {
+        match receiver.recv_timeout(CANCEL_POLL) {
+            Ok(Some(progress)) => {
+                if let Some(callback) = on_progress.as_mut() {
+                    callback(progress);
+                }
+            }
+            Ok(None) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if cancelled {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = progress_reader.join();
+        let _ = stderr_reader.join();
+        return Err(ConvertError::Cancelled);
+    }
+    let status = child.wait().map_err(|error| spawn_error(error, ffmpeg))?;
+    let _ = progress_reader.join();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(ConvertError::FfmpegFailed {
+            status: status_text(status),
+            stderr: ffmpeg_stderr(&stderr),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) struct TempVideoPath {

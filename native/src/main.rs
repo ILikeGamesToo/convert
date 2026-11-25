@@ -16,10 +16,10 @@ use std::{
 
 use convert_to_it_native::{
     audio_output_name, audio_tracks_from_path, convert_audio_file_to_writer_with_cancel,
-    convert_batch_with_options, convert_bytes_with_video_config, input_format,
+    convert_batch_with_options, convert_bytes_with_video_control, input_format,
     input_format::InputFormat, planned_output_count, supported_input_extensions, AudioBitDepth,
     AudioChannels, AudioTrackInfo, ConversionOptions, ConvertError, Mp3Bitrate, OutputFormat,
-    PdfImageFit, PdfOrientation, PdfPageSize, VideoToolConfig,
+    PdfImageFit, PdfOrientation, PdfPageSize, VideoControl, VideoProgress, VideoToolConfig,
 };
 use eframe::egui::{self, Align, Color32, FontId, Layout, RichText, Stroke, Vec2};
 use input_format::{common_format, detect};
@@ -497,8 +497,8 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::TarGz => "Gzipped TAR archive",
         OutputFormat::Gzip => "GZIP compressed file",
         OutputFormat::Cbz => "Comic book archive (CBZ)",
-        OutputFormat::Mp4 => "MP4 video (stream copy)",
-        OutputFormat::Webm => "WebM video (stream copy)",
+        OutputFormat::Mp4 => "MP4 video (copied when possible)",
+        OutputFormat::Webm => "WebM video (copied when possible)",
         OutputFormat::Files => "Extract archive into files",
         OutputFormat::Ttf => "TrueType font",
         OutputFormat::Otf => "OpenType font",
@@ -930,16 +930,26 @@ fn video_settings(ui: &mut egui::Ui, options: &mut ConversionOptions, target: Ou
     if target == OutputFormat::Webm {
         ui.label(
             RichText::new(
-                "Compatible codecs are stream-copied without re-encoding. Incompatible codec/container pairs are rejected.",
+                "Compatible codecs are stream-copied without re-encoding; anything else is re-encoded to VP9 and Opus.",
             )
             .size(11.5)
             .color(MUTED),
         );
     } else if target == OutputFormat::Mp4 {
         ui.label(
-            RichText::new("Streams are copied into the MP4 container without re-encoding.")
-                .size(11.5)
-                .color(MUTED),
+            RichText::new(
+                "Streams that fit MP4 are copied without re-encoding; anything else is re-encoded to H.264 and AAC.",
+            )
+            .size(11.5)
+            .color(MUTED),
+        );
+    } else if target == OutputFormat::Gif {
+        ui.label(
+            RichText::new(
+                "An animated GIF: 12 frames a second, 480 px wide at most, small sources are not upscaled.",
+            )
+            .size(11.5)
+            .color(MUTED),
         );
     } else {
         number_setting(
@@ -3746,19 +3756,41 @@ fn convert_to_directory(
                 inputs.len()
             ),
         );
-        let outputs =
-            match convert_bytes_with_video_config(file_name(path), &bytes, target, options, &video)
-            {
-                Ok(outputs) => outputs,
-                Err(ConvertError::Cancelled) => {
-                    remove_written(&written);
-                    return Err(ConversionFailure::Cancelled);
-                }
-                Err(error) => {
-                    remove_written(&written);
-                    return Err(ConversionFailure::Message(error.to_string()));
-                }
+        // The ffmpeg encode path reports the encoded time as it goes and stops
+        // when the sheet's Cancel button sets the same flag, so a long video
+        // re-encode neither looks frozen nor ignores a cancel.
+        let outputs = {
+            let encoding = file_name(path);
+            let mut on_progress = |progress: VideoProgress| {
+                report(
+                    completed,
+                    format!("Encoding {encoding}... {}", encode_time(progress.out_time)),
+                );
             };
+            let mut control = VideoControl {
+                cancel,
+                on_progress: &mut on_progress,
+            };
+            convert_bytes_with_video_control(
+                encoding,
+                &bytes,
+                target,
+                options,
+                &video,
+                Some(&mut control),
+            )
+        };
+        let outputs = match outputs {
+            Ok(outputs) => outputs,
+            Err(ConvertError::Cancelled) => {
+                remove_written(&written);
+                return Err(ConversionFailure::Cancelled);
+            }
+            Err(error) => {
+                remove_written(&written);
+                return Err(ConversionFailure::Message(error.to_string()));
+            }
+        };
         drop(bytes);
         completed += 1;
 
@@ -3779,6 +3811,12 @@ fn convert_to_directory(
     }
 
     Ok(conversion_summary(&written))
+}
+
+/// Position inside the file ffmpeg has encoded so far, as `m:ss`.
+fn encode_time(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 fn conversion_summary(written: &[PathBuf]) -> String {
@@ -4780,13 +4818,14 @@ fn main() {
     }
 
     #[test]
-    fn video_files_offer_thumbnails_remux_and_audio_outputs() {
+    fn video_files_offer_thumbnails_animation_containers_and_audio_outputs() {
         assert_eq!(
             available_targets(Some(InputFormat::Video)),
             [
                 OutputFormat::Png,
                 OutputFormat::Jpeg,
                 OutputFormat::Webp,
+                OutputFormat::Gif,
                 OutputFormat::Wav,
                 OutputFormat::Flac,
                 OutputFormat::Aiff,

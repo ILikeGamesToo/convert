@@ -210,7 +210,7 @@ impl InputFormat {
             Self::Aac => "Advanced Audio Coding",
             Self::Aiff => "Audio Interchange File Format",
             Self::Ac3 => "AC-3 or E-AC-3 audio",
-            Self::Video => "MP4, MOV, MKV, or WebM with an audio track",
+            Self::Video => "MP4, MOV, MKV, WebM, AVI, WMV, or MPEG with an audio track",
             Self::Archive => "ZIP, TAR, TAR.GZ, or GZIP; archive creation only",
             Self::Rar => "RAR version 4 or 5; extraction and re-packing only",
             Self::SevenZip => "7z; extraction and re-packing only",
@@ -447,7 +447,9 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "aac" => InputFormat::Aac,
         "aiff" | "aif" => InputFormat::Aiff,
         "ac3" | "eac3" | "ec3" => InputFormat::Ac3,
-        "mp4" | "m4v" | "mov" | "mkv" | "webm" => InputFormat::Video,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "wmv" | "mpeg" | "mpg" => {
+            InputFormat::Video
+        }
         "zip" | "tar" | "gz" | "tgz" | "cbz" | "cbt" => InputFormat::Archive,
         "rar" | "cbr" => InputFormat::Rar,
         "7z" | "cb7" => InputFormat::SevenZip,

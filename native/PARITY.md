@@ -23,7 +23,7 @@ The same data is available from the library as `native_format_registry()`.
 | PDF | PDF | PNG, JPEG, WebP, GIF, BMP, TIFF, ICO, PNM, TGA, QOI, HDR, Farbfeld, SVG pages, text encodings | Text extraction uses `pdf-extract`. Pages rasterise in-process through `hayro` or vectorise through `hayro-svg`, one file per page; see [PDF rasterisation](#pdf-rasterisation) and [PDF page SVGs](#pdf-page-svgs) for the scale, the naming and the limits. |
 | Audio | WAV, FLAC, MP3, OGG/Opus, M4A/AAC, AIFF, AC-3/E-AC-3, video containers | WAV, FLAC, AIFF, AU, Opus, MP3 | Multichannel layouts are downmixed explicitly; video inputs are used for their audio track only. Tags are carried between MP3, FLAC and Opus; see [Audio tags](#audio-tags). |
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP, RAR 4/5, 7z | ZIP, CBZ, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. RAR and 7z are read-only and decoded in-process by pure-Rust crates, so nothing external is installed. An archive input re-packs into the target container instead of being nested, which is what turns a CBR or CB7 into a readable CBZ. Encrypted archives are refused with a typed error, and a decode is bounded by a 120 s deadline and a 512 MiB dictionary cap. |
-| Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
+| Video | MP4, MOV, M4V, WebM, MKV, AVI, WMV, MPEG | MP4, WebM, animated GIF, PNG/JPEG/WebP thumbnails, audio outputs | A pair whose codecs the target container already takes is stream-copied with `ffmpeg -c copy`; anything else is re-encoded (H.264/AAC for MP4, VP9/Opus for WebM, a palette GIF at 12 fps). AVI/WMV/MPEG always encode because only ffmpeg reads their codecs. The copy decision is per stream, so an AV1+PCM MP4 copies its video and encodes only the audio. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder; the GIF target produces the whole clip, not one frame. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. Frame-accurate editing, quality selection and hardware encoders are not implemented. |
 | Ebooks | EPUB 2, EPUB 3 | EPUB, HTML, Markdown, text encodings | The container identifies the format, not the extension: a ZIP whose first entry is an uncompressed `mimetype` holding `application/epub+zip` is an EPUB. The spine gives the reading order and the navigation document or NCX gives the chapter titles. DRM is refused with a typed error and never attempted. MOBI and AZW3 are recognised by their PalmDOC header and refused by name, because no maintained crate reads them; see [Ebooks](#ebooks). |
 
 | Fonts | TTF, OTF, WOFF, WOFF2, TTC/OTC | TTF, OTF, WOFF, WOFF2, SVG | Every font table is copied verbatim and only the container is rewritten, so outlines, advance widths, units-per-em, the cmap and the name table survive a conversion. TTF and OTF output relabel the container and keep the source outline format, so they differ only in file name; there is no `glyf`↔`CFF ` outline conversion (see Known gaps). A `.ttc`/`.otc` collection is converted from its first face. WOFF2 input reverses the `glyf`/`loca` transform; WOFF2 output uses the null transform the format allows. SVG output is the web handler's font specimen (one `<glyph>` per mapped codepoint), not a rasterisable text document. |
@@ -428,13 +428,17 @@ whichever track is decoded.
   checks `output.stdout.is_empty()` before decoding, so the library returned
   `FfmpegEmptyOutput`, the GUI worker surfaced `ffmpeg produced no output`,
   and the CLI exited non-zero with `convert2it: ffmpeg produced no output`.
-  The stub tests still cover empty and invalid remux files. Remux is
-  codec-copy only: MP4→WebM accepts VP8/VP9/AV1 video with Opus/Vorbis audio,
-  and WebM→MP4 accepts H.264/HEVC/VP9/AV1 video with AAC/Opus/MP3/AC-3/E-AC-3
-  audio. Incompatible combinations return a typed error; nothing is
-  transcoded as a fallback. General transcoding is not implemented. See
-  `native/VIDEO_PLAN.md` for the settled decisions and
-  `cargo run --bin convert2it -- --list-video` for the route table.
+  The stub tests still cover empty and invalid remux and encode files. A pair
+  is stream-copied only when every stream's codec fits the target: MP4→WebM
+  accepts VP8/VP9/AV1 video with Opus/Vorbis audio, and WebM→MP4 accepts
+  H.264/HEVC/VP9/AV1 video with AAC/Opus/MP3/AC-3/E-AC-3 audio. Every other
+  pair is re-encoded instead of rejected, which is what makes MP4→WebM,
+  AVI→MP4 and MP4→GIF work on an ordinary file. Without `ffmpeg` the
+  conversion still fails with `FfmpegNotFound`: there is nothing to encode
+  with. A build without libx264 encodes MP4 with the built-in MPEG-4 Part 2
+  encoder instead, at a quality cost. See `native/VIDEO_PLAN.md` for the
+  settled decisions and `cargo run --bin convert2it -- --list-video` for the
+  route table.
 - - **HEIC/HEIF input:** blocked on a licensing decision rather than on missing
   code. Pure-Rust, permissively licensed HEIC decoders now exist
   (`heifer` MIT/Apache-2.0, `zune-heic` MIT/Apache-2.0/Zlib, plus `gamut-heic`

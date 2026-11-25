@@ -13,6 +13,15 @@ pub const DATA_INPUT_EXTENSIONS: &[&str] = &["txt", "csv", "json", "yaml", "yml"
 /// are rasterised in-process for the image targets.
 pub const PDF_INPUT_EXTENSIONS: &[&str] = &["pdf"];
 
+/// Video container extensions. The first five are parsed in process for their
+/// codecs, so a target that already takes them is stream-copied; AVI, WMV and
+/// MPEG are read by ffmpeg alone and are therefore always re-encoded. They are
+/// listed for the video targets only: the audio targets decode through
+/// Symphonia, which has no AVI, ASF or MPEG program-stream demuxer.
+pub const VIDEO_INPUT_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpeg", "mpg",
+];
+
 /// Audio extensions accepted by the conversion engine, including video
 /// containers whose audio track can be extracted.
 pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
@@ -50,17 +59,25 @@ pub const OFFICE_INPUT_EXTENSIONS: &[&str] = &["docx", "xlsx", "xls", "pptx", "o
 /// "Supported files" filter. Archive inputs are included so ZIP/TAR/GZIP can be
 /// extracted with the `files` target.
 pub fn supported_input_extensions() -> Vec<&'static str> {
-    IMAGE_INPUT_EXTENSIONS
+    let mut extensions: Vec<&'static str> = Vec::new();
+    for extension in IMAGE_INPUT_EXTENSIONS
         .iter()
         .chain(DATA_INPUT_EXTENSIONS)
         .chain(PDF_INPUT_EXTENSIONS)
         .chain(AUDIO_INPUT_EXTENSIONS)
+        .chain(VIDEO_INPUT_EXTENSIONS)
         .chain(ARCHIVE_INPUT_EXTENSIONS)
         .chain(FONT_INPUT_EXTENSIONS)
         .chain(OFFICE_INPUT_EXTENSIONS)
         .chain(EPUB_INPUT_EXTENSIONS)
         .chain(HTML_INPUT_EXTENSIONS)
         .chain(MARKDOWN_INPUT_EXTENSIONS)
-        .copied()
-        .collect()
+    {
+        // The video containers that carry audio appear in both lists, and the
+        // file picker filter must not name an extension twice.
+        if !extensions.contains(extension) {
+            extensions.push(extension);
+        }
+    }
+    extensions
 }

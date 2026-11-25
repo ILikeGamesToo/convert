@@ -54,10 +54,10 @@ Options:
       --list-video            Print the automatic video routes and exit
 
 Use `--format files` to extract a ZIP, TAR, TAR.GZ, GZIP, RAR or 7z archive.
-Video remux (`mp4`/`webm`) and thumbnails (`png`/`jpg`/`webp` from video)
-require ffmpeg on PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg. This is
-stream-copy remux plus frame/thumbnail extraction. Incompatible
-codec/container pairs are rejected with an error; no re-encoding is performed.
+Video (`mp4`/`webm`/`gif`) and thumbnails (`png`/`jpg`/`webp` from video)
+require ffmpeg on PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg. A pair whose
+codecs the target already takes is stream-copied; any other pair is re-encoded,
+and without ffmpeg there is no conversion.
 ";
 
 #[derive(Debug)]
@@ -119,9 +119,9 @@ fn print_format_registry() {
     );
     println!();
     println!(
-        "Video: png/jpg/webp are frame thumbnails; mp4/webm use stream copy when compatible. \
-         Incompatible codec/container pairs are rejected without re-encoding; all require \
-         ffmpeg (PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg)."
+        "Video: png/jpg/webp are frame thumbnails; mp4/webm copy the streams when the codecs \
+         already fit and re-encode otherwise; gif is an animated 12 fps GIF. avi/wmv/mpeg are \
+         always re-encoded; all require ffmpeg (PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg)."
     );
     println!();
     println!(
@@ -153,20 +153,26 @@ fn output_token(target: OutputFormat) -> &'static str {
 }
 
 fn print_video_routes() {
+    println!("source\ttarget\troute\tvideo\taudio\tfallback");
     for route in native_video_routes() {
         println!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             route.source_extension,
-            route.target.extension(),
+            output_token(route.target),
             route.route.label(),
             route.video_codecs.join(","),
-            route.audio_codecs.join(",")
+            route.audio_codecs.join(","),
+            route
+                .fallback
+                .map(|fallback| fallback.label())
+                .unwrap_or("none")
         );
     }
     println!();
     println!(
-        "Routing is automatic: compatible streams are copied without re-encoding; \
-         incompatible codec/container pairs are rejected with an error."
+        "Routing is automatic: a source whose codecs fit the target is stream-copied; any other \
+         pair is re-encoded. The video and audio columns list the codecs the target copies \
+         without re-encoding."
     );
 }
 
