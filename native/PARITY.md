@@ -25,16 +25,21 @@ The same data is available from the library as `native_format_registry()`.
 | Archives | ZIP, TAR, TAR.GZ/TGZ, GZIP, RAR 4/5, 7z | ZIP, CBZ, TAR, TAR.GZ, GZIP, extracted files | Extraction rejects absolute paths, `..`, drive prefixes, duplicates, oversized entries and excessive entry counts. RAR and 7z are read-only and decoded in-process by pure-Rust crates, so nothing external is installed. An archive input re-packs into the target container instead of being nested, which is what turns a CBR or CB7 into a readable CBZ. Encrypted archives are refused with a typed error, and a decode is bounded by a 120 s deadline and a 512 MiB dictionary cap. |
 | Video | MP4, WebM, MKV | MP4, WebM, PNG/JPEG/WebP thumbnails, audio outputs | MP4↔WebM remux uses `ffmpeg -c copy` and copies all video/audio streams. Incompatible codec/container pairs return a typed error; nothing is transcoded as a fallback. Frame/thumbnail extraction uses `ffmpeg` and then the normal image encoder. Requires `ffmpeg` on PATH, `CONVERT2IT_FFMPEG`/`FFMPEG`, or the CLI `--ffmpeg` override. General transcoding and frame-accurate editing are not implemented. |
 
+| Ebooks | EPUB 2, EPUB 3 | EPUB, HTML, Markdown, text encodings | The container identifies the format, not the extension: a ZIP whose first entry is an uncompressed `mimetype` holding `application/epub+zip` is an EPUB. The spine gives the reading order and the navigation document or NCX gives the chapter titles. DRM is refused with a typed error and never attempted. MOBI and AZW3 are recognised by their PalmDOC header and refused by name, because no maintained crate reads them; see [Ebooks](#ebooks). |
+
 | Fonts | TTF, OTF, WOFF, WOFF2, TTC/OTC | TTF, OTF, WOFF, WOFF2, SVG | Every font table is copied verbatim and only the container is rewritten, so outlines, advance widths, units-per-em, the cmap and the name table survive a conversion. TTF and OTF output relabel the container and keep the source outline format, so they differ only in file name; there is no `glyf`↔`CFF ` outline conversion (see Known gaps). A `.ttc`/`.otc` collection is converted from its first face. WOFF2 input reverses the `glyf`/`loca` transform; WOFF2 output uses the null transform the format allows. SVG output is the web handler's font specimen (one `<glyph>` per mapped codepoint), not a rasterisable text document. |
 
 ## Web-only handlers not yet ported
 
 The web app (`src/handlers/index.ts`) also has dedicated handlers for vector
-tracing, EPUB/AZW3/MOBI, Typst/Pandoc, 3D models,
+tracing, MOBI/AZW3, Typst/Pandoc, 3D models,
 SQLite, LZH, the comic packer that builds a CBZ/CBT/CBR/CB7 from loose images, game
 formats, and MIDI/module music. Those handlers depend on
 JavaScript/WASM libraries or
 external tools that do not have a verified native equivalent in this crate.
+The ebook family is no longer on that list for EPUB: the native app reads EPUB 2
+and 3 and writes EPUB from text, Markdown and HTML, and refuses MOBI/AZW3 by
+name. See [Ebooks](#ebooks).
 
 Office documents used to be in that list and are not any more, but the native
 handler is narrower than the web app's two paths. The web app converts *between*
@@ -221,6 +226,68 @@ office formats, rendering a page to an image or a PDF, and mixed or multi-input
 output. Each of those needs either a layout engine or an office writer, and the
 one-format-in-one-format-out rule means a docx can become text but not a docx
 plus a PDF.
+
+## Ebooks
+
+EPUB 2 and EPUB 3 are read in-process by `rbook` 0.7.13 (Apache-2.0, pure Rust);
+nothing is shelled out and nothing is installed. An EPUB is a ZIP, so the
+container is what identifies it: a file is an EPUB when its first entry is
+`mimetype`, stored uncompressed, holding `application/epub+zip`. A `.epub` that
+does not say so is a corrupt container, and a ZIP named something else that does
+say so is an EPUB.
+
+Reading walks the spine in its own order, so the output follows the book rather
+than the central directory; each content document's chapter title is the
+navigation document's or NCX's label for it, falling back to the document's own
+first heading and then to `Chapter N`. The XHTML is parsed with `html5ever`, the
+browser-grade parser, and rendered three ways: plain text (with `br` as a line
+break and runs collapsed the way a rendered paragraph collapses them), CommonMark
+(headings, emphasis, links, lists, quotes, code and tables), and one HTML file
+with each content document in its own `<section class="epub-chapter">`. A
+chapter title is written above the text only when the book has more than one
+chapter and that chapter carries no heading of its own, so a one-chapter document
+does not gain an invented line.
+
+EPUB output is built from text, Markdown and HTML and **validated before it is
+returned**: the writer re-reads what it wrote and checks that the mimetype entry
+is first and stored, that the package carries a navigation document or an NCX,
+and that every spine entry resolves to a manifest item. Markdown is parsed as
+CommonMark (tables, footnotes, strikethrough and task lists included) and HTML is
+read as it is; both split into chapters at their top-level `h1`, and a document
+without one becomes a single chapter named after the file. Text becomes one
+chapter of paragraphs, and text → EPUB → text round-trips exactly.
+
+**What is not carried:** images, stylesheets, fonts and media. One conversion is
+one input format to one output format, and a container's own formats are its
+output space, so an EPUB becomes text, Markdown or a document, never a resource
+directory — and an HTML input cannot bring the images that sit beside it on disk
+because the conversion is handed bytes, not a folder. An EPUB's images are
+inlined as data URLs in the HTML output, where they can be resolved inside the
+container; they are dropped from the text and Markdown outputs, and an HTML
+input's images are dropped from EPUB output.
+
+**DRM is refused, not attempted.** An EPUB returns `EbookDrm` when
+`META-INF/rights.xml` or `META-INF/sinf.xml` exists, or when
+`META-INF/encryption.xml` declares a content cipher; the IDPF and Adobe font
+obfuscation algorithms are *not* DRM (they hide only embedded fonts) and pass
+through. A MOBI or AZW3 is refused from its PalmDOC header's encryption type.
+Nothing is decrypted, ever, and no password is ever asked for.
+
+**Limits:** an EPUB container holds at most 10,000 entries and may declare at
+most 512 MiB of uncompressed content; both are read from the ZIP central
+directory before anything is decompressed. An empty spine, or a spine whose
+documents carry no text, returns `EbookEmpty`; a container that is not a readable
+EPUB returns `EbookCorrupt`.
+
+**MOBI and AZW3 are recognised and refused.** They are PalmDOC containers and
+their detection reports them as what they are, but the conversion returns
+`EbookFormatDeferred`, which names the format as recognised and unconverted. The
+only crate for the family is `mobi` 0.8.0 (MIT, last published 2022-12-11),
+which decompresses PalmDOC and HUFF/CDIC and nothing else: it has no INDX, FDST
+or KF8 skeleton handling, so an AZW3 would come out as unassembled fragments,
+and the web handler's `foliate-mobi` is a JavaScript library rather than a
+crate. A half-assembled book is worse than a refusal, so the reader is deferred
+to a slice that can be verified against real files.
 
 ## Metadata
 

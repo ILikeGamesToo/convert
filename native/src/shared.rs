@@ -98,6 +98,24 @@ pub(crate) fn is_office_extension(extension: &str) -> bool {
     input_extensions::OFFICE_INPUT_EXTENSIONS.contains(&extension)
 }
 
+pub(crate) fn is_epub_extension(extension: &str) -> bool {
+    input_extensions::EPUB_INPUT_EXTENSIONS.contains(&extension)
+}
+
+pub(crate) fn is_html_extension(extension: &str) -> bool {
+    input_extensions::HTML_INPUT_EXTENSIONS.contains(&extension)
+}
+
+pub(crate) fn is_markdown_extension(extension: &str) -> bool {
+    input_extensions::MARKDOWN_INPUT_EXTENSIONS.contains(&extension)
+}
+
+/// HTML, XHTML, Markdown and EPUB: the documents whose text is read directly
+/// rather than decoded from a media container.
+pub(crate) fn is_ebook_extension(extension: &str) -> bool {
+    is_epub_extension(extension) || is_html_extension(extension) || is_markdown_extension(extension)
+}
+
 /// Whether `bytes` begin with an ISO BMFF `ftyp` box naming the AVIF still
 /// image brand (`avif`) or the AVIF image sequence brand (`avis`), as either
 /// the major brand or one of the compatible brands.

@@ -432,3 +432,253 @@ pub(crate) fn tiff_with_orientations(orientations: &[u16]) -> Vec<u8> {
     tiff.extend_from_slice(&0_u32.to_le_bytes());
     tiff
 }
+
+/// A ZIP container holding `entries` in the given order. `mimetype` is stored
+/// uncompressed, which is what an EPUB container requires of its first entry;
+/// everything else is deflated.
+pub(crate) fn zip_with_entries(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, bytes) in entries {
+        let method = if name == "mimetype" {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        };
+        writer
+            .start_file(
+                name.clone(),
+                zip::write::SimpleFileOptions::default().compression_method(method),
+            )
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// One chapter of a generated EPUB fixture.
+pub(crate) struct EpubFixtureChapter {
+    pub(crate) label: String,
+    pub(crate) href: String,
+    pub(crate) body: String,
+}
+
+const EPUB_CONTAINER_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"#;
+
+fn epub_chapters(bodies: &[&str]) -> Vec<EpubFixtureChapter> {
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| EpubFixtureChapter {
+            label: match index {
+                0 => "Chapter One".to_owned(),
+                1 => "Chapter Two".to_owned(),
+                other => format!("Chapter {}", other + 1),
+            },
+            href: format!("ch{}.xhtml", index + 1),
+            body: (*body).to_owned(),
+        })
+        .collect()
+}
+
+fn epub_document(label: &str, body: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <html xmlns=\"http://www.w3.org/1999/xhtml\">\n\
+         <head><title>{label}</title></head>\n\
+         <body>\n{body}\n</body>\n</html>\n"
+    )
+}
+
+fn epub_ncx(chapters: &[EpubFixtureChapter]) -> String {
+    let mut nav_map = String::new();
+    for (index, chapter) in chapters.iter().enumerate() {
+        nav_map.push_str(&format!(
+            "<navPoint id=\"nav{}\" playOrder=\"{}\"><navLabel><text>{}</text></navLabel><content src=\"{}\"/></navPoint>\n",
+            index + 1,
+            index + 1,
+            chapter.label,
+            chapter.href
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\">\n\
+         <head><meta name=\"dtb:uid\" content=\"urn:uuid:convert2it-fixture\"/></head>\n\
+         <docTitle><text>Fixture Book</text></docTitle>\n\
+         <navMap>{nav_map}</navMap>\n</ncx>\n"
+    )
+}
+
+fn epub_nav(chapters: &[EpubFixtureChapter]) -> String {
+    let mut items = String::new();
+    for chapter in chapters {
+        items.push_str(&format!(
+            "<li><a href=\"{}\">{}</a></li>\n",
+            chapter.href, chapter.label
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\">\n\
+         <head><title>Contents</title></head>\n\
+         <body><nav epub:type=\"toc\" id=\"toc\"><h1>Contents</h1><ol>\n{items}</ol></nav></body>\n</html>\n"
+    )
+}
+
+/// Builds an EPUB 2 or 3 container by hand: a stored `mimetype` first, the
+/// package with the given chapters and extra manifest items, a navigation
+/// document for EPUB 3 or an NCX for EPUB 2, and whatever extra entries the
+/// caller needs. Every byte of it is written here from the specification, so a
+/// reader test does not depend on the writer under test.
+pub(crate) fn build_epub(
+    version: u8,
+    chapters: &[EpubFixtureChapter],
+    extra_entries: &[(String, Vec<u8>)],
+    extra_manifest: &str,
+) -> Vec<u8> {
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("mimetype".to_owned(), b"application/epub+zip".to_vec()),
+        (
+            "META-INF/container.xml".to_owned(),
+            EPUB_CONTAINER_XML.as_bytes().to_vec(),
+        ),
+    ];
+
+    let mut manifest = String::new();
+    let mut spine = String::new();
+    for (index, chapter) in chapters.iter().enumerate() {
+        manifest.push_str(&format!(
+            "<item id=\"ch{}\" href=\"{}\" media-type=\"application/xhtml+xml\"/>\n",
+            index + 1,
+            chapter.href
+        ));
+        spine.push_str(&format!("<itemref idref=\"ch{}\"/>\n", index + 1));
+        entries.push((
+            format!("OEBPS/{}", chapter.href),
+            epub_document(&chapter.label, &chapter.body).into_bytes(),
+        ));
+    }
+    manifest.push_str(extra_manifest);
+
+    let spine_attribute = if version == 2 {
+        manifest.push_str(
+            "<item id=\"ncx\" href=\"toc.ncx\" media-type=\"application/x-dtbncx+xml\"/>\n",
+        );
+        entries.push(("OEBPS/toc.ncx".to_owned(), epub_ncx(chapters).into_bytes()));
+        " toc=\"ncx\""
+    } else {
+        manifest.push_str(
+            "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n",
+        );
+        entries.push((
+            "OEBPS/nav.xhtml".to_owned(),
+            epub_nav(chapters).into_bytes(),
+        ));
+        ""
+    };
+
+    let modified = if version == 2 {
+        String::new()
+    } else {
+        "<meta property=\"dcterms:modified\">2020-01-01T00:00:00Z</meta>\n".to_owned()
+    };
+    let package = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <package xmlns=\"http://www.idpf.org/2007/opf\" version=\"{version}.0\" unique-identifier=\"uid\">\n\
+         <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n\
+         <dc:title>Fixture Book</dc:title>\n\
+         <dc:language>en</dc:language>\n\
+         <dc:identifier id=\"uid\">urn:uuid:convert2it-fixture</dc:identifier>\n\
+         {modified}</metadata>\n\
+         <manifest>\n{manifest}</manifest>\n\
+         <spine{spine_attribute}>\n{spine}</spine>\n\
+         </package>\n"
+    );
+    entries.push(("OEBPS/content.opf".to_owned(), package.into_bytes()));
+    entries.extend(extra_entries.iter().cloned());
+    zip_with_entries(&entries)
+}
+
+const EPUB_CHAPTER_ONE: &str = "<p>A quiet beginning.</p>\n\
+    <p>We had tea &amp; cake.<br/>first line<br/>second line</p>\n\
+    <p>Some <em>quiet</em> emphasis.</p>";
+
+const EPUB_CHAPTER_TWO: &str = "<h2>The second chapter</h2>\n<p>It continues.</p>";
+
+/// A two-chapter EPUB 2 with an NCX and no navigation document.
+pub(crate) fn epub_fixture() -> Vec<u8> {
+    build_epub(
+        2,
+        &epub_chapters(&[EPUB_CHAPTER_ONE, EPUB_CHAPTER_TWO]),
+        &[],
+        "",
+    )
+}
+
+/// The same book as EPUB 3: a navigation document in the manifest and no NCX.
+pub(crate) fn epub3_fixture() -> Vec<u8> {
+    build_epub(
+        3,
+        &epub_chapters(&[EPUB_CHAPTER_ONE, EPUB_CHAPTER_TWO]),
+        &[],
+        "",
+    )
+}
+
+/// An EPUB 2 whose chapters are exactly `bodies`, which is how a book with no
+/// readable text and a book with one chapter are both generated.
+pub(crate) fn epub2_with_bodies(bodies: &[&str]) -> Vec<u8> {
+    build_epub(2, &epub_chapters(bodies), &[], "")
+}
+
+/// An EPUB 3 carrying one image, referenced from the first chapter.
+pub(crate) fn epub_with_image() -> Vec<u8> {
+    let mut chapters = epub_chapters(&[
+        "<p>A picture follows.</p><p><img src=\"img/pic.png\" alt=\"dot\"/></p>",
+        EPUB_CHAPTER_TWO,
+    ]);
+    chapters[0].href = "text/ch1.xhtml".to_owned();
+    build_epub(
+        3,
+        &chapters,
+        &[("OEBPS/text/img/pic.png".to_owned(), png_fixture())],
+        "<item id=\"pic\" href=\"text/img/pic.png\" media-type=\"image/png\"/>\n",
+    )
+}
+
+/// An EPUB 3 with a `META-INF/encryption.xml` holding `method_xml`, and
+/// optionally an Adobe `rights.xml` beside it.
+pub(crate) fn epub_with_encryption(method_xml: &str, rights: bool) -> Vec<u8> {
+    let encryption = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <encryption xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\" \
+         xmlns:enc=\"http://www.w3.org/2001/04/xmlenc#\">\n\
+         <enc:EncryptedData>\n{method_xml}\n\
+         <enc:CipherData><enc:CipherReference URI=\"OEBPS/ch1.xhtml\"/></enc:CipherData>\n\
+         </enc:EncryptedData>\n</encryption>\n"
+    );
+    let mut extra = vec![(
+        "META-INF/encryption.xml".to_owned(),
+        encryption.into_bytes(),
+    )];
+    if rights {
+        extra.push((
+            "META-INF/rights.xml".to_owned(),
+            b"<?xml version=\"1.0\"?><rights/>".to_vec(),
+        ));
+    }
+    build_epub(
+        3,
+        &epub_chapters(&[EPUB_CHAPTER_ONE, EPUB_CHAPTER_TWO]),
+        &extra,
+        "",
+    )
+}

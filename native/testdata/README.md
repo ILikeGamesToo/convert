@@ -318,3 +318,14 @@ tree clean.
   4096-byte mini-stream cutoff so it lives in ordinary sectors.
 - `sample-office.ods` — an OpenDocument spreadsheet with one sheet of two
   columns, read through the same path as the xlsx.
+
+## Ebooks
+
+No EPUB, MOBI or AZW3 file is committed. Ebook fixtures are built in
+`native/src/test_support.rs`, byte for byte from the specification — a stored
+`mimetype` entry first, `META-INF/container.xml`, the OPF package, a navigation
+document for EPUB 3 or an NCX for EPUB 2, and the content documents — so the
+reader is tested against a container written by hand rather than against a
+copyrighted book, and the writer is tested against a shape it did not produce.
+Reading real books was verified outside the suite against `rbook`'s own test
+epubs, which stay in its crate; see `reports/ILGT-19.md` in the crew drive.

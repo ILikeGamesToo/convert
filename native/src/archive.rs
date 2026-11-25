@@ -73,6 +73,15 @@ pub(crate) fn gzip_bytes(input: &[u8], compression: Option<u8>) -> Result<Vec<u8
     Ok(encoder.finish()?)
 }
 
+/// A ZIP container's three signatures. An EPUB is a ZIP under a different
+/// name, so an archive target accepts it by its bytes instead of refusing the
+/// extension it happened to arrive with.
+fn starts_with_zip_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+}
+
 /// Whether `bytes` are an archive this module can extract, judged by magic
 /// bytes alone. An archive target that receives one of these re-packs its
 /// files instead of wrapping the archive in a second container.
@@ -114,7 +123,10 @@ pub fn extract_archive(input_name: &str, input: &[u8]) -> Result<Vec<ConvertedFi
             &mut names,
             &mut total_bytes,
         )?;
-    } else if lower_name.ends_with(".zip") || lower_name.ends_with(".cbz") {
+    } else if lower_name.ends_with(".zip")
+        || lower_name.ends_with(".cbz")
+        || starts_with_zip_magic(input)
+    {
         extract_zip_entries(input, &mut outputs, &mut names, &mut total_bytes)?;
     } else if lower_name.ends_with(".gz") {
         let name = Path::new(input_name)
@@ -156,7 +168,8 @@ pub fn archive_entry_count(input_name: &str, input: &[u8]) -> Result<usize, Conv
     if lower_name.ends_with(".tar") || lower_name.ends_with(".cbt") {
         return count_tar_entries(Cursor::new(input));
     }
-    if lower_name.ends_with(".zip") || lower_name.ends_with(".cbz") {
+    if lower_name.ends_with(".zip") || lower_name.ends_with(".cbz") || starts_with_zip_magic(input)
+    {
         let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
         let mut count = 0;
         for index in 0..archive.len() {

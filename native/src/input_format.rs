@@ -58,12 +58,19 @@ pub enum InputFormat {
     Pptx,
     Odt,
     Ods,
+    /// EPUB 2 or 3, recognised by the container's `mimetype` entry rather than
+    /// by the extension.
+    Epub,
+    /// HTML or XHTML.
+    Html,
+    /// CommonMark or GitHub-flavoured Markdown.
+    Markdown,
     Any,
     Mixed,
 }
 
 impl InputFormat {
-    pub const SELECTABLE: [Self; 46] = [
+    pub const SELECTABLE: [Self; 49] = [
         Self::Any,
         Self::Png,
         Self::Jpeg,
@@ -110,6 +117,9 @@ impl InputFormat {
         Self::Pptx,
         Self::Odt,
         Self::Ods,
+        Self::Epub,
+        Self::Html,
+        Self::Markdown,
     ];
 
     pub fn label(self) -> &'static str {
@@ -159,6 +169,9 @@ impl InputFormat {
             Self::Pptx => "PowerPoint presentation",
             Self::Odt => "OpenDocument text",
             Self::Ods => "OpenDocument spreadsheet",
+            Self::Epub => "EPUB ebook",
+            Self::Html => "HTML document",
+            Self::Markdown => "Markdown document",
             Self::Any => "Any file",
             Self::Mixed => "Mixed formats",
         }
@@ -211,6 +224,9 @@ impl InputFormat {
             Self::Pptx => "Office Open XML presentation",
             Self::Odt => "OpenDocument text document",
             Self::Ods => "OpenDocument spreadsheet",
+            Self::Epub => "Electronic Publication",
+            Self::Html => "Hypertext Markup Language",
+            Self::Markdown => "CommonMark or GitHub-flavoured Markdown",
             Self::Any | Self::Mixed => "Archive creation only",
         }
     }
@@ -262,6 +278,9 @@ impl InputFormat {
             Self::Pptx => "PPTX",
             Self::Odt => "ODT",
             Self::Ods => "ODS",
+            Self::Epub => "EPUB",
+            Self::Html => "HTML",
+            Self::Markdown => "MD",
             Self::Any => "ANY",
             Self::Mixed => "MIXED",
         }
@@ -314,6 +333,9 @@ impl InputFormat {
             Self::Pptx => "pptx",
             Self::Odt => "odt",
             Self::Ods => "ods",
+            Self::Epub => "epub",
+            Self::Html => "html",
+            Self::Markdown => "md",
             Self::Any | Self::Mixed => return None,
         })
     }
@@ -440,6 +462,9 @@ fn from_extension(name: &str) -> Option<InputFormat> {
         "odt" => InputFormat::Odt,
         "ods" => InputFormat::Ods,
         "ttc" | "otc" => InputFormat::Ttf,
+        "epub" => InputFormat::Epub,
+        "html" | "htm" | "xhtml" => InputFormat::Html,
+        "md" | "markdown" => InputFormat::Markdown,
         _ => return None,
     })
 }
@@ -545,6 +570,9 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
     if bytes.starts_with(&[0x1f, 0x8b]) {
         return Some(InputFormat::Archive);
     }
+    if crate::ebook::is_epub_container(bytes) {
+        return Some(InputFormat::Epub);
+    }
     if bytes.starts_with(b"PK\x03\x04")
         || bytes.starts_with(b"PK\x05\x06")
         || bytes.starts_with(b"PK\x07\x08")
@@ -566,10 +594,28 @@ fn sniff(bytes: &[u8]) -> Option<InputFormat> {
     if bytes.len() >= 262 && &bytes[257..262] == b"ustar" {
         return Some(InputFormat::Archive);
     }
+    if looks_like_html(bytes) {
+        return Some(InputFormat::Html);
+    }
     if looks_like_svg(bytes) {
         return Some(InputFormat::Svg);
     }
     None
+}
+
+/// Whether the content opens as an HTML document: an HTML doctype, an `html`
+/// root, or an XML declaration followed by one. A text file that merely
+/// mentions `<html>` somewhere does not qualify.
+fn looks_like_html(bytes: &[u8]) -> bool {
+    let lower = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    let mut trimmed = lower.trim_start_matches('\u{feff}').trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<?xml") {
+        let Some(declaration_end) = rest.find("?>") else {
+            return false;
+        };
+        trimmed = rest[declaration_end + 2..].trim_start();
+    }
+    trimmed.starts_with("<html") || trimmed.starts_with("<!doctype html")
 }
 
 fn looks_like_svg(bytes: &[u8]) -> bool {
@@ -660,6 +706,12 @@ mod tests {
             ("comic.cb7", InputFormat::SevenZip),
             ("comic.cbz", InputFormat::Archive),
             ("comic.cbt", InputFormat::Archive),
+            ("book.epub", InputFormat::Epub),
+            ("page.html", InputFormat::Html),
+            ("page.htm", InputFormat::Html),
+            ("page.xhtml", InputFormat::Html),
+            ("book.md", InputFormat::Markdown),
+            ("book.markdown", InputFormat::Markdown),
         ];
         for (name, expected) in cases {
             assert_eq!(detect_from_bytes(name, b""), expected, "{name}");
@@ -730,6 +782,34 @@ mod tests {
         assert_eq!(
             detect_from_bytes("mystery.ogg", &ogg_opus),
             InputFormat::Opus
+        );
+    }
+
+    #[test]
+    fn recognizes_an_epub_by_its_container_and_html_by_its_root() {
+        let epub = crate::test_support::epub3_fixture();
+        assert_eq!(detect_from_bytes("mystery.bin", &epub), InputFormat::Epub);
+        assert_eq!(detect_from_bytes("mystery.zip", &epub), InputFormat::Epub);
+
+        let zip =
+            crate::test_support::zip_with_entries(&[("entry.txt".to_owned(), b"hello".to_vec())]);
+        assert_eq!(detect_from_bytes("mystery.bin", &zip), InputFormat::Archive);
+
+        assert_eq!(
+            detect_from_bytes("page.bin", b"<!DOCTYPE html><html><body></body></html>"),
+            InputFormat::Html
+        );
+        assert_eq!(
+            detect_from_bytes(
+                "page.bin",
+                b"<?xml version=\"1.0\"?>\n<html xmlns=\"http://www.w3.org/1999/xhtml\"></html>"
+            ),
+            InputFormat::Html
+        );
+        // A text file that mentions markup is still text.
+        assert_eq!(
+            detect_from_bytes("notes.txt", b"this paragraph mentions <html> in prose"),
+            InputFormat::Text
         );
     }
 

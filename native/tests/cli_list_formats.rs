@@ -20,6 +20,9 @@ fn list_formats_reports_the_metadata_carried_by_each_target() {
         stdout.contains("audio keeps title, artist, album, track"),
         "{stdout}"
     );
+    assert!(stdout.contains("EPUB ebook\tepub\t"), "{stdout}");
+    assert!(stdout.contains("HTML document\thtml\t"), "{stdout}");
+    assert!(stdout.contains("Markdown document\tmd\t"), "{stdout}");
     // The registry rows stay three tab-separated fields, so tooling that reads
     // them keeps working; the metadata note is a separate paragraph.
     for line in stdout.lines() {

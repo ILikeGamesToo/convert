@@ -4,8 +4,9 @@
 
 use crate::input_format;
 use crate::shared::{
-    file_extension, is_archive_name, is_audio_extension, is_data_extension, is_font_extension,
-    is_image_input_extension, is_office_extension, is_pdf_extension, is_video_input_extension,
+    file_extension, is_archive_name, is_audio_extension, is_data_extension, is_ebook_extension,
+    is_epub_extension, is_font_extension, is_html_extension, is_image_input_extension,
+    is_markdown_extension, is_office_extension, is_pdf_extension, is_video_input_extension,
 };
 use crate::video::{native_video_routes, VideoRouteInfo};
 use serde::{Deserialize, Serialize};
@@ -68,10 +69,17 @@ pub enum OutputFormat {
     Svg,
     /// Write each PDF page as a standalone SVG vector document.
     SvgPage,
+    /// Write the document as an EPUB 3 ebook, one content document per chapter,
+    /// with a navigation document and an NCX.
+    Epub,
+    /// Write the document as one self-contained HTML file.
+    Html,
+    /// Write the document as CommonMark.
+    Markdown,
 }
 
 impl OutputFormat {
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 50] = [
         Self::Png,
         Self::Jpeg,
         Self::Webp,
@@ -119,6 +127,9 @@ impl OutputFormat {
         Self::Woff2,
         Self::Svg,
         Self::SvgPage,
+        Self::Epub,
+        Self::Html,
+        Self::Markdown,
     ];
 
     pub fn label(self) -> &'static str {
@@ -170,6 +181,9 @@ impl OutputFormat {
             Self::Woff2 => "WOFF2 font",
             Self::Svg => "SVG font",
             Self::SvgPage => "SVG page",
+            Self::Epub => "EPUB ebook",
+            Self::Html => "HTML document",
+            Self::Markdown => "Markdown document",
         }
     }
 
@@ -262,6 +276,9 @@ impl OutputFormat {
             Self::Woff => "woff",
             Self::Woff2 => "woff2",
             Self::Svg | Self::SvgPage => "svg",
+            Self::Epub => "epub",
+            Self::Html => "html",
+            Self::Markdown => "md",
         }
     }
 
@@ -287,6 +304,8 @@ impl OutputFormat {
             "tgz" => "tar.gz",
             "gzip" => "gz",
             "text" => "txt",
+            "htm" | "xhtml" => "html",
+            "markdown" => "md",
             _ => extension.as_str(),
         };
         Self::ALL
@@ -323,6 +342,7 @@ impl OutputFormat {
                 is_data_extension(&extension)
                     || extension == "pdf"
                     || is_office_extension(&extension)
+                    || is_ebook_extension(&extension)
             }
             Self::Csv | Self::Json => {
                 is_data_extension(&extension) || is_office_extension(&extension)
@@ -334,7 +354,10 @@ impl OutputFormat {
             | Self::TextUtf16Be
             | Self::TextUtf32Le
             | Self::TextUtf32Be => {
-                extension == "txt" || extension == "pdf" || is_office_extension(&extension)
+                extension == "txt"
+                    || extension == "pdf"
+                    || is_office_extension(&extension)
+                    || is_ebook_extension(&extension)
             }
             Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus | Self::Mp3 => {
                 is_audio_extension(&extension)
@@ -346,6 +369,13 @@ impl OutputFormat {
                 is_font_extension(&extension)
             }
             Self::SvgPage => is_pdf_extension(&extension),
+            Self::Epub => {
+                extension == "txt"
+                    || is_markdown_extension(&extension)
+                    || is_html_extension(&extension)
+            }
+            Self::Html => is_epub_extension(&extension) || is_markdown_extension(&extension),
+            Self::Markdown => is_epub_extension(&extension) || is_html_extension(&extension),
         }
     }
 }
@@ -471,6 +501,60 @@ mod tests {
         assert!(OutputFormat::Pbm.supports_input("photo.png"));
         assert!(OutputFormat::Yaml.supports_input("config.toml"));
     }
+    #[test]
+    fn epub_html_and_markdown_route_between_the_text_formats() {
+        assert_eq!(OutputFormat::Epub.extension(), "epub");
+        assert_eq!(OutputFormat::Epub.label(), "EPUB ebook");
+        assert_eq!(OutputFormat::Html.extension(), "html");
+        assert_eq!(OutputFormat::Html.label(), "HTML document");
+        assert_eq!(OutputFormat::Markdown.extension(), "md");
+        assert_eq!(OutputFormat::Markdown.label(), "Markdown document");
+
+        assert!(OutputFormat::Epub.supports_input("notes.txt"));
+        assert!(OutputFormat::Epub.supports_input("page.html"));
+        assert!(OutputFormat::Epub.supports_input("book.md"));
+        assert!(!OutputFormat::Epub.supports_input("photo.png"));
+        assert!(OutputFormat::Html.supports_input("book.epub"));
+        assert!(OutputFormat::Html.supports_input("page.md"));
+        assert!(OutputFormat::Markdown.supports_input("book.epub"));
+        assert!(OutputFormat::Markdown.supports_input("page.html"));
+        assert!(OutputFormat::Text.supports_input("book.epub"));
+        assert!(OutputFormat::TextUtf16Le.supports_input("page.md"));
+        assert!(!OutputFormat::Csv.supports_input("book.epub"));
+
+        assert_eq!(
+            OutputFormat::from_extension("htm"),
+            Some(OutputFormat::Html)
+        );
+        assert_eq!(
+            OutputFormat::from_extension("markdown"),
+            Some(OutputFormat::Markdown)
+        );
+        assert_eq!(
+            OutputFormat::from_extension(".epub"),
+            Some(OutputFormat::Epub)
+        );
+
+        let registry = native_format_registry();
+        let epub = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Epub)
+            .unwrap();
+        assert_eq!(epub.canonical_extension, Some("epub"));
+        assert!(epub.outputs.contains(&OutputFormat::Text));
+        assert!(epub.outputs.contains(&OutputFormat::Markdown));
+        assert!(epub.outputs.contains(&OutputFormat::Html));
+        assert!(!epub.outputs.contains(&OutputFormat::Epub));
+        assert!(!epub.outputs.contains(&OutputFormat::Csv));
+
+        let html = registry
+            .iter()
+            .find(|handler| handler.input == input_format::InputFormat::Html)
+            .unwrap();
+        assert!(html.outputs.contains(&OutputFormat::Epub));
+        assert!(html.outputs.contains(&OutputFormat::Markdown));
+    }
+
     #[test]
     fn cbz_is_a_zip_comic_target_for_archive_inputs_only() {
         assert_eq!(OutputFormat::Cbz.extension(), "cbz");

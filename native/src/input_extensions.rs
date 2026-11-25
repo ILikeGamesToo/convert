@@ -24,6 +24,16 @@ pub const AUDIO_INPUT_EXTENSIONS: &[&str] = &[
 /// because their first face is converted.
 pub const FONT_INPUT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2", "ttc", "otc"];
 
+/// EPUB containers. An EPUB is a ZIP, so the container is what tells it apart
+/// from an archive: the extension only decides when the bytes cannot.
+pub const EPUB_INPUT_EXTENSIONS: &[&str] = &["epub"];
+
+/// HTML and XHTML documents.
+pub const HTML_INPUT_EXTENSIONS: &[&str] = &["html", "htm", "xhtml"];
+
+/// Markdown documents, which are read as CommonMark.
+pub const MARKDOWN_INPUT_EXTENSIONS: &[&str] = &["md", "markdown"];
+
 /// Archive extensions accepted for extraction and re-packing. The comic
 /// extensions name the same four containers: CBR is a RAR, CBZ a ZIP, CBT a
 /// TAR and CB7 a 7z.
@@ -48,6 +58,9 @@ pub fn supported_input_extensions() -> Vec<&'static str> {
         .chain(ARCHIVE_INPUT_EXTENSIONS)
         .chain(FONT_INPUT_EXTENSIONS)
         .chain(OFFICE_INPUT_EXTENSIONS)
+        .chain(EPUB_INPUT_EXTENSIONS)
+        .chain(HTML_INPUT_EXTENSIONS)
+        .chain(MARKDOWN_INPUT_EXTENSIONS)
         .copied()
         .collect()
 }

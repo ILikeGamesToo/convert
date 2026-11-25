@@ -8,6 +8,7 @@ mod container;
 mod convert;
 mod data;
 mod document;
+mod ebook;
 mod error;
 mod ffmpeg;
 mod fonts;

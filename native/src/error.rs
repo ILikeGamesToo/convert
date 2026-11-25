@@ -133,6 +133,22 @@ pub enum ConvertError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
+    #[error("the ebook is encrypted with DRM ({scheme}); this app cannot remove it")]
+    EbookDrm { scheme: String },
+    #[error("could not read the ebook: {message}")]
+    EbookCorrupt { message: String },
+    #[error("the ebook contains no readable text")]
+    EbookEmpty,
+    #[error(
+        "{format} input is recognised but not converted by this build; it reads and writes EPUB only"
+    )]
+    EbookFormatDeferred { format: &'static str },
+    #[error("could not write the EPUB: {0}")]
+    EbookWrite(String),
+    #[error("the ebook holds {count} entries, more than the {max}-entry limit")]
+    EbookTooManyEntries { count: usize, max: usize },
+    #[error("the ebook expands to more than {max} bytes")]
+    EbookTooLarge { max: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

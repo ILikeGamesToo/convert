@@ -396,6 +396,8 @@ fn format_category(format: OutputFormat) -> FormatCategory {
         | OutputFormat::Woff
         | OutputFormat::Woff2
         | OutputFormat::Svg => FormatCategory::Font,
+        OutputFormat::Epub | OutputFormat::Html => FormatCategory::Document,
+        OutputFormat::Markdown => FormatCategory::Text,
     }
 }
 
@@ -448,6 +450,9 @@ fn format_extension(format: OutputFormat) -> &'static str {
         OutputFormat::Woff2 => "WOFF2",
         OutputFormat::Svg => "SVG",
         OutputFormat::SvgPage => "SVG PAGE",
+        OutputFormat::Epub => "EPUB",
+        OutputFormat::Html => "HTML",
+        OutputFormat::Markdown => "MD",
     }
 }
 
@@ -500,6 +505,9 @@ fn format_description(format: OutputFormat) -> &'static str {
         OutputFormat::Woff2 => "WOFF2 font",
         OutputFormat::Svg => "SVG font specimen",
         OutputFormat::SvgPage => "SVG page",
+        OutputFormat::Epub => "EPUB ebook",
+        OutputFormat::Html => "HTML document",
+        OutputFormat::Markdown => "Markdown document",
     }
 }
 
@@ -4383,7 +4391,34 @@ fn main() {
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,
-                OutputFormat::Gzip
+                OutputFormat::Gzip,
+                OutputFormat::Epub
+            ]
+        );
+    }
+
+    #[test]
+    fn epub_files_offer_text_and_markup_outputs_only() {
+        // An ebook becomes text or a document, never an image: there is no
+        // layout path, and one conversion is one input format to one output.
+        // The archive targets every input offers stay available, so an EPUB can
+        // still be re-packed as one.
+        assert_eq!(
+            available_targets(Some(InputFormat::Epub)),
+            [
+                OutputFormat::Text,
+                OutputFormat::TextUtf8NoBom,
+                OutputFormat::TextUtf8Bom,
+                OutputFormat::TextUtf16Le,
+                OutputFormat::TextUtf16Be,
+                OutputFormat::TextUtf32Le,
+                OutputFormat::TextUtf32Be,
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip,
+                OutputFormat::Html,
+                OutputFormat::Markdown,
             ]
         );
     }

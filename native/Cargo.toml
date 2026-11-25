@@ -45,6 +45,20 @@ hayro = "0.9.0"
 # so a page that embeds nothing still outlines real glyphs.
 hayro-svg = "0.9.0"
 heifer = { version = "0.5.1", default-features = false }
+# EPUB reading and writing. `rbook` parses the container, the OPF package and
+# the spine for EPUB 2 and 3, and writes the same structure back; every byte of
+# it is pure Rust. It is built without its default `threadsafe` and `prelude`
+# features because neither is used here, and with `write` because building an
+# EPUB needs the writer.
+rbook = { version = "0.7.13", default-features = false, features = ["write"] }
+# HTML and XHTML parsing for the text, Markdown and EPUB paths. `html5ever` is
+# the browser-grade parser: it applies the implied end tags, entity decoding and
+# table fix-ups a tolerant reader needs. `markup5ever_rcdom` supplies the tree
+# those document walks traverse; it is documented as basic and unsupported,
+# which is fine for reading a tree, and is the only published DOM for this
+# parser.
+html5ever = "0.40"
+markup5ever_rcdom = "0.40"
 image = { version = "0.25", default-features = false, features = [
     "bmp",
     "dds",
@@ -71,6 +85,11 @@ pdf-writer = "0.15"
 # a second reader for no gain: `docx-rs` and `docx-rust` are writers first, and
 # `umya-spreadsheet` would duplicate `calamine`'s job with twenty more crates.
 quick-xml = "0.42"
+# Markdown input is parsed as CommonMark with the tables, footnotes,
+# strikethrough and task-list extensions GitHub-flavoured Markdown adds. Its
+# HTML is read back into the same tree the HTML path uses, so there is one
+# XHTML writer for both.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 rav1d = { version = "1.1.0", default-features = false, features = [
     "bitdepth_8",
     "bitdepth_16",

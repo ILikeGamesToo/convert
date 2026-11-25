@@ -21,9 +21,10 @@ use crate::office;
 use crate::options::ConversionOptions;
 use crate::pdf;
 use crate::shared::{
-    file_extension, is_archive_name, is_audio_extension, is_font_extension,
-    is_image_input_extension, is_pdf_extension, is_video_input_extension, output_name,
-    page_output_name, safe_file_name, unsupported,
+    file_extension, is_archive_name, is_audio_extension, is_ebook_extension, is_epub_extension,
+    is_font_extension, is_html_extension, is_image_input_extension, is_markdown_extension,
+    is_pdf_extension, is_video_input_extension, output_name, page_output_name, safe_file_name,
+    unsupported,
 };
 use crate::text::{convert_text, encode_text};
 use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
@@ -135,6 +136,39 @@ pub fn convert_bytes_with_video_control(
             bytes: gzip_bytes(input, options.archive_compression)?,
         }]);
     }
+    // Ebooks are containers whose own formats are text and markup, so they are
+    // routed before the text handler: the container decides what is inside, and
+    // the extension decides whether bytes that are not a container are HTML or
+    // Markdown. A MOBI or AZW3 is refused by name rather than reported as
+    // unsupported, because the container is recognised and the format is not.
+    if crate::ebook::is_ebook_target(target) {
+        if is_epub_extension(&extension) || crate::ebook::is_epub_container(input) {
+            return crate::ebook::convert_epub(input_name, input, target);
+        }
+        if crate::ebook::is_mobi_container(input) {
+            return Err(crate::ebook::refuse_mobi(input));
+        }
+        if target == OutputFormat::Epub && (extension == "txt" || is_ebook_extension(&extension)) {
+            return crate::ebook::convert_to_epub(input_name, input, &extension);
+        }
+        if (is_html_extension(&extension) || is_markdown_extension(&extension))
+            && matches!(
+                target,
+                OutputFormat::Html
+                    | OutputFormat::Markdown
+                    | OutputFormat::Text
+                    | OutputFormat::TextUtf8NoBom
+                    | OutputFormat::TextUtf8Bom
+                    | OutputFormat::TextUtf16Le
+                    | OutputFormat::TextUtf16Be
+                    | OutputFormat::TextUtf32Le
+                    | OutputFormat::TextUtf32Be
+            )
+        {
+            return crate::ebook::convert_document(input_name, input, &extension, target);
+        }
+    }
+
     if target.is_font_target() {
         if !is_font_extension(&extension) && sniff_font(input).is_none() {
             return Err(unsupported(&extension, target));
