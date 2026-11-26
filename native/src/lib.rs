@@ -46,5 +46,6 @@ pub use options::ConversionOptions;
 pub use streaming::{convert_audio_file_to_writer, convert_audio_file_to_writer_with_cancel};
 pub use trace::{MAX_TRACE_DIMENSION, MAX_TRACE_PIXELS};
 pub use video::{
-    native_video_routes, VideoControl, VideoProgress, VideoRoute, VideoRouteInfo, VideoToolConfig,
+    native_video_routes, video_container_source, VideoContainerSource, VideoControl, VideoProgress,
+    VideoRoute, VideoRouteInfo, VideoToolConfig,
 };

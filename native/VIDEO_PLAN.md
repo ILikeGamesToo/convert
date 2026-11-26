@@ -12,6 +12,8 @@ frame/thumbnail extraction:
 - Stream-copy remux when the target container already takes every source
   codec, and ffmpeg re-encoding of the streams that it does not.
 - PNG/JPEG/WebP thumbnails from video.
+- Animated GIF input to MP4, and MP3/M4A input to an audio-only MP4, without a
+  second input kind.
 - Existing output validation behavior.
 
 There is no frame-accurate editing, trimming, scaling or cropping control,
@@ -82,6 +84,25 @@ Defaults, and why:
 - 480 px wide at most, never upscaled. A GIF is palette data with no inter-frame
   compression worth the name, so a 1080p source is megabytes a second.
 - Infinite looping (`-loop 0`), which is what the format is used for.
+
+### Non-video sources into MP4
+
+A GIF and an MP3 or an M4A are not video containers, but the MP4 target holds
+them, so they are routed through the same conversion instead of gaining a
+decoder or a second kind. `video_container_source(target, extension)` is the one
+place that says which sources a container target accepts; the registry, the
+CLI, the converter and the route table all read it.
+
+- **GIF → MP4** encodes: the container holds no frame of an image, so the
+  images kind's frames are encoded to H.264 with the same settings as any other
+  MP4 encode, at the source size, with the GIF's own per-frame delays. A GIF is
+  read here and nowhere else in the video path; there is no GIF parser.
+- **MP3/M4A → MP4** copies: `-map 0:a -map 0:v:0? -c copy
+  -disposition:v:0 attached_pic`. The audio stream is carried bit for bit, and a
+  cover picture stays album art instead of becoming a one-frame video track. A
+  source with no picture exercises the optional map and nothing is added.
+- Only MP4 is offered. A WebM target would need Opus or Vorbis audio and VP9
+  frames, which is a re-encode of both, not a container job.
 
 ### Stream preservation
 
@@ -157,8 +178,16 @@ Coverage:
 - an incompatible pair with no ffmpeg returning `FfmpegNotFound`;
 - empty and invalid ffmpeg output errors;
 - CLI and GUI end-to-end remux/thumbnail tests;
-- `--list-video` listing the copy lists, the encode routes, and each row's
-  fallback.
+- a GIF→MP4 conversion checked with `ffprobe` for H.264 at the source size and
+  about one frame per source frame, and a real animation whose duration is
+  kept;
+- MP3 and M4A into MP4 with the audio stream hashed before and after the
+  conversion, so a re-encode or a dropped stream cannot pass, plus the attached
+  picture asserted where the source has one and absent where it does not;
+- the stub argument pipeline for both new routes: libx264 for a GIF and
+  `-c copy` with the attached-picture map for audio;
+- `--list-video` listing the copy lists, the encode routes, each row's
+  fallback, and the three new source rows.
 
 Real-FFmpeg tests skip with an explicit message when ffmpeg is unavailable.
 
@@ -170,6 +199,7 @@ Real-FFmpeg tests skip with an explicit message when ffmpeg is unavailable.
 - Bundling ffmpeg and the associated licensing work.
 - Frame-accurate trimming/editing and scaling/cropping controls.
 - Animated GIF from an animated GIF, and animated WebP.
-- Audio-only sources into MP4: `mp3 → mp4` is a real request in the popularity
-  data, but it is an audio route into a container, not a video re-encode, so it
-  needs its own decision.
+- Audio into WebM, and FLAC/WAV/AIFF/Opus into MP4: each needs a re-encode to
+  the container's codec, and a quality control that does not exist yet.
+- Animated GIF from an animated GIF with a transparency-preserving path (APNG
+  or a second palette pass keyed on the source's alpha), and animated WebP.

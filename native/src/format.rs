@@ -8,7 +8,7 @@ use crate::shared::{
     is_epub_extension, is_font_extension, is_html_extension, is_image_input_extension,
     is_markdown_extension, is_office_extension, is_pdf_extension, is_video_input_extension,
 };
-use crate::video::{native_video_routes, VideoRouteInfo};
+use crate::video::{native_video_routes, video_container_source, VideoRouteInfo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -368,7 +368,13 @@ impl OutputFormat {
             Self::Wav | Self::Flac | Self::Aiff | Self::Au | Self::Opus | Self::Mp3 => {
                 is_audio_extension(&extension)
             }
-            Self::Mp4 | Self::Webm => is_video_input_extension(&extension),
+            // A GIF's frames and an audio-only stream fill an MP4 as well, so
+            // the container targets accept them; see
+            // [`crate::video::video_container_source`].
+            Self::Mp4 | Self::Webm => {
+                is_video_input_extension(&extension)
+                    || video_container_source(self, &extension).is_some()
+            }
             Self::Zip | Self::Tar | Self::TarGz | Self::Gzip => true,
             Self::Cbz | Self::Files => is_archive_name(file_name),
             Self::Ttf | Self::Otf | Self::Woff | Self::Woff2 | Self::Svg => {
@@ -599,6 +605,47 @@ mod tests {
             assert!(!handler.outputs.contains(&OutputFormat::Wav));
         }
     }
+    #[test]
+    fn a_gif_and_the_audio_kinds_reach_the_mp4_container() {
+        // The GIF kind keeps every image target and gains MP4, which encodes
+        // its frames; WebM would need a VP9 encode and stays out.
+        assert!(OutputFormat::Gif.supports_input("animation.gif"));
+        assert!(OutputFormat::Mp4.supports_input("animation.gif"));
+        assert!(!OutputFormat::Webm.supports_input("animation.gif"));
+        // Only the audio kinds MP4 holds without re-encoding.
+        assert!(OutputFormat::Mp4.supports_input("song.mp3"));
+        assert!(OutputFormat::Mp4.supports_input("song.m4a"));
+        assert!(!OutputFormat::Mp4.supports_input("song.flac"));
+        assert!(!OutputFormat::Webm.supports_input("song.mp3"));
+        // The route must not leak into the image targets.
+        assert!(!OutputFormat::Png.supports_input("song.mp3"));
+        assert!(!OutputFormat::Gif.supports_input("song.mp3"));
+
+        let registry = native_format_registry();
+        let handler = |input| {
+            registry
+                .iter()
+                .find(|handler| handler.input == input)
+                .unwrap()
+        };
+        for input in [
+            input_format::InputFormat::Gif,
+            input_format::InputFormat::Mp3,
+            input_format::InputFormat::M4a,
+        ] {
+            assert!(
+                handler(input).outputs.contains(&OutputFormat::Mp4),
+                "{} does not offer MP4",
+                input.label()
+            );
+            assert!(
+                !handler(input).outputs.contains(&OutputFormat::Webm),
+                "{} must not offer WebM",
+                input.label()
+            );
+        }
+    }
+
     #[test]
     fn the_trace_target_is_offered_for_raster_inputs_but_not_svg() {
         assert_eq!(OutputFormat::SvgTrace.extension(), "svg");

@@ -119,6 +119,35 @@ pub struct VideoRouteInfo {
     pub fallback: Option<VideoRoute>,
 }
 
+/// A source that is not a video container but still fills one, and how it gets
+/// there. The image kind already reads an animated GIF and the audio kind
+/// already reads MP3 and M4A, so these pairs are a route between media that
+/// already exist rather than a decoder, a second kind or a second data path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoContainerSource {
+    /// An animated image. MP4 holds no frame of an image, so its frames are
+    /// encoded into the container's video codec.
+    Image,
+    /// An audio-only stream. MP4 holds MP3 and AAC as they are, so the stream
+    /// is copied and nothing is re-encoded.
+    Audio,
+}
+
+/// The non-video sources a video container target accepts. Only MP4 is offered
+/// for now: it carries MP3 and AAC unchanged, and H.264 is a reasonable codec
+/// for a GIF's frames. A WebM target would have to re-encode audio to Opus or
+/// Vorbis first, which is a different slice.
+pub fn video_container_source(
+    target: OutputFormat,
+    extension: &str,
+) -> Option<VideoContainerSource> {
+    match (target, extension) {
+        (OutputFormat::Mp4, "gif") => Some(VideoContainerSource::Image),
+        (OutputFormat::Mp4, "mp3" | "m4a") => Some(VideoContainerSource::Audio),
+        _ => None,
+    }
+}
+
 pub(crate) const REMUX_VIDEO_TO_MP4: &[&str] = &["h264", "hevc", "vp9", "av1"];
 
 pub(crate) const REMUX_AUDIO_TO_MP4: &[&str] = &["aac", "opus", "mp3", "ac3", "eac3"];
@@ -147,7 +176,9 @@ fn remux_codecs(
 
 /// Routes advertised by the native registry. A parsed container whose codecs
 /// the target can hold is stream-copied and re-encoded otherwise; every other
-/// video container and every GIF output is encoded outright.
+/// video container and every GIF output is encoded outright. The non-video
+/// sources follow the same rule: an animated image is encoded, and an
+/// audio-only stream is copied because the container takes its codec as it is.
 pub fn native_video_routes() -> Vec<VideoRouteInfo> {
     let mut routes = Vec::new();
     for source_extension in PARSED_VIDEO_CONTAINERS
@@ -182,6 +213,20 @@ pub fn native_video_routes() -> Vec<VideoRouteInfo> {
             fallback: None,
         });
     }
+    for (source_extension, route, audio_codecs) in [
+        ("gif", VideoRoute::Transcode, &[][..]),
+        ("mp3", VideoRoute::Remux, REMUX_AUDIO_TO_MP4),
+        ("m4a", VideoRoute::Remux, REMUX_AUDIO_TO_MP4),
+    ] {
+        routes.push(VideoRouteInfo {
+            source_extension,
+            target: OutputFormat::Mp4,
+            route,
+            video_codecs: &[],
+            audio_codecs,
+            fallback: None,
+        });
+    }
     routes
 }
 
@@ -207,10 +252,15 @@ pub(crate) fn convert_video(
     }
 }
 
-/// Chooses the route. A GIF is always encoded, and so is a container the
-/// native parser cannot read; a parsed container is copied only when every
-/// stream's codec is on the target's copy list.
+/// Chooses the route. An audio-only source is copied, because the target
+/// container holds its codec as it is and re-encoding would lose quality for
+/// nothing. A GIF is always encoded, and so is a container the native parser
+/// cannot read; a parsed container is copied only when every stream's codec is
+/// on the target's copy list.
 fn plan_video(input: &[u8], extension: &str, target: OutputFormat) -> VideoPlan {
+    if video_container_source(target, extension) == Some(VideoContainerSource::Audio) {
+        return VideoPlan::Remux;
+    }
     let Some((video_allowed, audio_allowed)) = remux_codecs(target) else {
         return VideoPlan::Encode;
     };
@@ -263,8 +313,28 @@ pub(crate) fn remux_video(
     let mut command = ffmpeg_command(&ffmpeg);
     command
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
-        .arg(input_path.path())
-        .args(["-map", "0:v?", "-map", "0:a?", "-c", "copy"]);
+        .arg(input_path.path());
+    match video_container_source(target, &extension) {
+        // An audio source is the audio track, plus its cover picture if one is
+        // stored with it. The picture is marked as an attached picture so it
+        // stays album art instead of becoming a one-frame video track that a
+        // player would try to draw.
+        Some(VideoContainerSource::Audio) => {
+            command.args([
+                "-map",
+                "0:a",
+                "-map",
+                "0:v:0?",
+                "-disposition:v:0",
+                "attached_pic",
+                "-c",
+                "copy",
+            ]);
+        }
+        _ => {
+            command.args(["-map", "0:v?", "-map", "0:a?", "-c", "copy"]);
+        }
+    }
     match target {
         OutputFormat::Mp4 => {
             command.args(["-movflags", "+faststart", "-f", "mp4"]);
@@ -1326,6 +1396,83 @@ mod tests {
     }
 
     #[test]
+    fn a_gif_and_an_audio_file_fill_the_mp4_container() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-container-source-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let prepared = directory.join("prepared.mp4");
+        let log = directory.join("args.log");
+        std::fs::write(&prepared, b"\0\0\0\x18ftypstub-container").unwrap();
+        let mut env = EnvVars::new();
+        env.set("STUB_LOG", &log)
+            .set("STUB_OUTPUT", &prepared)
+            .remove("STUB_EXIT")
+            .remove("STUB_EMPTY");
+
+        assert_eq!(
+            video_container_source(OutputFormat::Mp4, "gif"),
+            Some(VideoContainerSource::Image)
+        );
+        assert_eq!(
+            video_container_source(OutputFormat::Mp4, "mp3"),
+            Some(VideoContainerSource::Audio)
+        );
+        assert_eq!(
+            video_container_source(OutputFormat::Mp4, "m4a"),
+            Some(VideoContainerSource::Audio)
+        );
+        // WebM needs Opus or Vorbis audio and a VP9 encode, so it stays out.
+        assert_eq!(video_container_source(OutputFormat::Webm, "gif"), None);
+        assert_eq!(video_container_source(OutputFormat::Webm, "mp3"), None);
+        assert_eq!(video_container_source(OutputFormat::Mp4, "flac"), None);
+
+        // A GIF is encoded: an MP4 holds no frame of an image.
+        let result = convert_bytes_with_video_config(
+            "clip.gif",
+            b"GIF89a-the-stub-never-reads-this",
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+        )
+        .unwrap();
+        assert_eq!(result[0].name, PathBuf::from("clip.mp4"));
+        assert_eq!(result[0].bytes, b"\0\0\0\x18ftypstub-container");
+        let args = std::fs::read_to_string(&log).unwrap();
+        assert!(args.contains("-c:v\nlibx264"), "{args}");
+        assert!(args.contains("-pix_fmt\nyuv420p"), "{args}");
+        assert!(args.contains("-movflags\n+faststart"), "{args}");
+        assert!(!args.contains("copy"), "{args}");
+
+        // An audio source is copied, never re-encoded, and a cover picture
+        // stays an attached picture instead of becoming a video track.
+        for (input, output) in [("song.mp3", "song.mp4"), ("track.m4a", "track.mp4")] {
+            let result = convert_bytes_with_video_config(
+                input,
+                b"\xff\xfb-the-stub-never-reads-this",
+                OutputFormat::Mp4,
+                ConversionOptions::default(),
+                &VideoToolConfig::with_ffmpeg(ffmpeg_stub()),
+            )
+            .unwrap();
+            assert_eq!(result[0].name, PathBuf::from(output));
+            let args = std::fs::read_to_string(&log).unwrap();
+            assert!(args.contains("-c\ncopy"), "{input}: {args}");
+            assert!(args.contains("-map\n0:a"), "{input}: {args}");
+            assert!(args.contains("-map\n0:v:0?"), "{input}: {args}");
+            assert!(
+                args.contains("-disposition:v:0\nattached_pic"),
+                "{input}: {args}"
+            );
+            assert!(args.contains("-f\nmp4"), "{input}: {args}");
+            assert!(!args.contains("libx264"), "{input}: {args}");
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn cancelling_an_encode_kills_ffmpeg_and_reports_progress() {
         let _lock = VIDEO_ENV_LOCK.lock().unwrap();
         let directory =
@@ -1741,6 +1888,276 @@ mod tests {
                 assert!(!stderr.is_empty());
             }
             other => panic!("expected a real ffmpeg failure, got {other}"),
+        }
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The audio stream, copied out with ffmpeg and hashed, so a remux that
+    /// re-encoded or dropped it cannot pass.
+    fn copied_audio_md5(ffmpeg: &Path, path: &Path) -> String {
+        let output = std::process::Command::new(ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:a", "-c", "copy", "-f", "md5", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not hash the audio of {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn real_ffmpeg_makes_an_animated_gif_from_mp4_mov_and_webm() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let Some(ffmpeg) = ffmpeg_for_real_test("library video-to-GIF test") else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-real-video-to-gif-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = VideoToolConfig::with_ffmpeg(&ffmpeg);
+
+        // A moving MPEG-4 Part 2 clip, which every ffmpeg build can encode,
+        // and a stream copy of it in a MOV container. The WebM source is the
+        // committed VP9/Opus fixture, so each of the three demanded containers
+        // is read as its own container rather than as one sniffed shape.
+        let mp4_path = directory.join("moving.mp4");
+        let output = std::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-c:v",
+                "mpeg4",
+                "-q:v",
+                "5",
+                "-an",
+            ])
+            .arg(&mp4_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not generate the MP4 sample: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mov_path = directory.join("moving.mov");
+        let output = std::process::Command::new(&ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&mp4_path)
+            .args(["-map", "0:v?", "-c", "copy"])
+            .arg(&mov_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not write the MOV sample: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let webm_path = directory.join("moving.webm");
+        generate_real_video(&ffmpeg, &webm_path);
+
+        for name in ["moving.mp4", "moving.mov", "moving.webm"] {
+            let bytes = std::fs::read(directory.join(name)).unwrap();
+            let converted = convert_bytes_with_video_config(
+                name,
+                &bytes,
+                OutputFormat::Gif,
+                ConversionOptions::default(),
+                &config,
+            )
+            .unwrap();
+            let expected = format!("{}.gif", &name[..name.rfind('.').unwrap()]);
+            assert_eq!(converted[0].name, PathBuf::from(&expected));
+            assert!(
+                converted[0].bytes.starts_with(b"GIF89a")
+                    || converted[0].bytes.starts_with(b"GIF87a"),
+                "{name} did not produce a GIF"
+            );
+            let decoder =
+                image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&converted[0].bytes))
+                    .expect("the encoded bytes decode as a GIF");
+            let frames = image::AnimationDecoder::into_frames(decoder)
+                .collect_frames()
+                .expect("every GIF frame decodes");
+            assert!(
+                (11..=13).contains(&frames.len()),
+                "{name}: expected about twelve frames for a one-second source, got {}",
+                frames.len()
+            );
+            assert_eq!(
+                (frames[0].buffer().width(), frames[0].buffer().height()),
+                (320, 240),
+                "{name}"
+            );
+            assert!(
+                frames[0].buffer().as_raw() != frames[6].buffer().as_raw(),
+                "{name}: the frames are identical, so the animation carries one image"
+            );
+        }
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn real_ffmpeg_wraps_audio_and_encodes_a_gif_into_mp4() {
+        let _lock = VIDEO_ENV_LOCK.lock().unwrap();
+        let Some(ffmpeg) = ffmpeg_for_real_test("library container-source test") else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-real-container-source-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = VideoToolConfig::with_ffmpeg(&ffmpeg);
+        let ffprobe = ffprobe_for(&ffmpeg);
+
+        // Audio, both with and without a cover picture. `metadata-tone.mp3`
+        // carries an ID3 APIC frame and `metadata-tone.m4a` a cover track, so
+        // the attached-picture handling is exercised on real files.
+        for name in [
+            "metadata-tone.mp3",
+            "metadata-tone.m4a",
+            "sample-aac.m4a",
+            // Six channels, so a downmix or an encoder slip cannot pass.
+            "sample-aac-51.m4a",
+        ] {
+            let input = video_testdata(name);
+            let source_path = directory.join(name);
+            std::fs::write(&source_path, &input).unwrap();
+            let converted = convert_bytes_with_video_config(
+                name,
+                &input,
+                OutputFormat::Mp4,
+                ConversionOptions::default(),
+                &config,
+            )
+            .unwrap();
+            let output_name = format!("{}.mp4", &name[..name.rfind('.').unwrap()]);
+            assert_eq!(converted[0].name, PathBuf::from(&output_name));
+            assert_eq!(converted[0].bytes.get(4..8), Some(b"ftyp".as_slice()));
+            let output_path = directory.join(&output_name);
+            std::fs::write(&output_path, &converted[0].bytes).unwrap();
+            assert_eq!(
+                copied_audio_md5(&ffmpeg, &source_path),
+                copied_audio_md5(&ffmpeg, &output_path),
+                "{name}: the audio stream did not survive the remux intact"
+            );
+            if let Some(ffprobe) = ffprobe.as_ref() {
+                let probe = ffprobe_streams(ffprobe, &output_path);
+                assert!(
+                    probe.contains("codec_type=audio"),
+                    "{name} left no audio stream: {probe}"
+                );
+                // The cover picture is still album art, not a video track a
+                // player would draw.
+                let disposition = std::process::Command::new(ffprobe)
+                    .args([
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "stream_disposition=attached_pic",
+                        "-of",
+                        "default=noprint_wrappers=1",
+                    ])
+                    .arg(&output_path)
+                    .output()
+                    .unwrap();
+                let disposition = String::from_utf8_lossy(&disposition.stdout);
+                let attached = disposition.matches("attached_pic=1").count();
+                let expected = if name.starts_with("metadata-tone") {
+                    1
+                } else {
+                    0
+                };
+                assert_eq!(attached, expected, "{name}: {disposition}");
+            }
+        }
+
+        // A GIF becomes an H.264 MP4 that keeps the animation's frames and
+        // timing.
+        let gif_path = directory.join("animation.gif");
+        let output = std::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-loop",
+                "0",
+            ])
+            .arg(&gif_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg could not generate the GIF sample: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let gif = std::fs::read(&gif_path).unwrap();
+        let converted = convert_bytes_with_video_config(
+            "animation.gif",
+            &gif,
+            OutputFormat::Mp4,
+            ConversionOptions::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(converted[0].name, PathBuf::from("animation.mp4"));
+        assert_eq!(converted[0].bytes.get(4..8), Some(b"ftyp".as_slice()));
+        let mp4_path = directory.join("animation.mp4");
+        std::fs::write(&mp4_path, &converted[0].bytes).unwrap();
+        if let Some(ffprobe) = ffprobe.as_ref() {
+            let probe = ffprobe_streams(ffprobe, &mp4_path);
+            assert!(probe.contains("codec_name=h264"), "{probe}");
+            assert!(probe.contains("width=320"), "{probe}");
+            assert!(probe.contains("height=240"), "{probe}");
+            let frames: u32 = probe
+                .lines()
+                .find_map(|line| line.strip_prefix("nb_frames="))
+                .and_then(|value| value.parse().ok())
+                .expect("ffprobe reports the MP4 frame count");
+            assert!(
+                (9..=11).contains(&frames),
+                "expected about ten frames for a one-second ten-fps GIF, got {frames}"
+            );
+            let duration = std::process::Command::new(ffprobe)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                ])
+                .arg(&mp4_path)
+                .output()
+                .unwrap();
+            let seconds: f64 = String::from_utf8_lossy(&duration.stdout)
+                .trim()
+                .parse()
+                .expect("ffprobe reports a duration");
+            assert!(
+                (0.9..=1.1).contains(&seconds),
+                "expected about one second of animation, got {seconds}"
+            );
         }
 
         std::fs::remove_dir_all(&directory).unwrap();

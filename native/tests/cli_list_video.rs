@@ -28,6 +28,16 @@ fn list_video_reports_copy_lists_and_encode_routes() {
     // fall back from.
     assert!(stdout.contains("avi\tmp4\ttranscode\t\t\tnone"), "{stdout}");
     assert!(stdout.contains("mp4\tgif\ttranscode\t\t\tnone"), "{stdout}");
+    // Non-video sources: a GIF is encoded, an audio-only stream is copied.
+    assert!(stdout.contains("gif\tmp4\ttranscode\t\t\tnone"), "{stdout}");
+    assert!(
+        stdout.contains("mp3\tmp4\tremux\t\taac,opus,mp3,ac3,eac3\tnone"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("m4a\tmp4\tremux\t\taac,opus,mp3,ac3,eac3\tnone"),
+        "{stdout}"
+    );
     for row in stdout.lines().filter(|line| line.contains('\t')) {
         let columns: Vec<&str> = row.split('\t').collect();
         assert_eq!(columns.len(), 6, "wrong column count in {row:?}");

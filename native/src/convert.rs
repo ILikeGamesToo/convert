@@ -28,7 +28,9 @@ use crate::shared::{
 };
 use crate::text::{convert_text, encode_text};
 use crate::trace;
-use crate::video::{convert_video, extract_video_frame, VideoControl, VideoToolConfig};
+use crate::video::{
+    convert_video, extract_video_frame, video_container_source, VideoControl, VideoToolConfig,
+};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -215,7 +217,12 @@ pub fn convert_bytes_with_video_control(
     }
 
     if target.is_video_target() {
-        if !is_video_input_extension(&extension) {
+        // A GIF and an audio-only file are not video containers, but the
+        // target is: the image kind's frames are encoded and the audio stream
+        // is copied. Both are routed here rather than through a second path.
+        if !is_video_input_extension(&extension)
+            && video_container_source(target, &extension).is_none()
+        {
             return Err(unsupported(&extension, target));
         }
         return convert_video(input_name, input, target, video, control);

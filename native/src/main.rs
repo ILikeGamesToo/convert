@@ -4793,27 +4793,41 @@ fn main() {
 
     #[test]
     fn audio_files_offer_audio_and_archive_outputs() {
-        let expected = [
+        let audio = [
             OutputFormat::Wav,
             OutputFormat::Flac,
             OutputFormat::Aiff,
             OutputFormat::Au,
             OutputFormat::Opus,
             OutputFormat::Mp3,
-            OutputFormat::Zip,
-            OutputFormat::Tar,
-            OutputFormat::TarGz,
-            OutputFormat::Gzip,
         ];
+        // MP3 and M4A also fill an MP4 container, which copies the stream
+        // rather than decoding it.
+        for input in [InputFormat::Mp3, InputFormat::M4a] {
+            let mut expected = audio.to_vec();
+            expected.push(OutputFormat::Mp4);
+            expected.extend([
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip,
+            ]);
+            assert_eq!(available_targets(Some(input)), expected, "{input:?}");
+        }
         for input in [
-            InputFormat::Mp3,
             InputFormat::Flac,
             InputFormat::Ogg,
             InputFormat::Opus,
-            InputFormat::M4a,
             InputFormat::Aiff,
         ] {
-            assert_eq!(available_targets(Some(input)), expected);
+            let mut expected = audio.to_vec();
+            expected.extend([
+                OutputFormat::Zip,
+                OutputFormat::Tar,
+                OutputFormat::TarGz,
+                OutputFormat::Gzip,
+            ]);
+            assert_eq!(available_targets(Some(input)), expected, "{input:?}");
         }
     }
 
@@ -5103,6 +5117,7 @@ fn main() {
                 OutputFormat::Au,
                 OutputFormat::Opus,
                 OutputFormat::Mp3,
+                OutputFormat::Mp4,
                 OutputFormat::Zip,
                 OutputFormat::Tar,
                 OutputFormat::TarGz,

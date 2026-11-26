@@ -23,6 +23,16 @@ fn list_formats_reports_the_metadata_carried_by_each_target() {
     assert!(stdout.contains("EPUB ebook\tepub\t"), "{stdout}");
     assert!(stdout.contains("HTML document\thtml\t"), "{stdout}");
     assert!(stdout.contains("Markdown document\tmd\t"), "{stdout}");
+    // The GIF and audio rows reach the MP4 container and nothing else new.
+    for row in ["GIF image\tgif\t", "MP3 audio\tmp3\t", "M4A audio\tm4a\t"] {
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(row))
+            .unwrap_or_else(|| panic!("{row} is missing from\n{stdout}"));
+        let outputs: Vec<&str> = line.split('\t').nth(2).unwrap().split(',').collect();
+        assert!(outputs.contains(&"mp4"), "{line}");
+        assert!(!outputs.contains(&"webm"), "{line}");
+    }
     // All three SVG targets write `.svg`, so the registry prints the `--format`
     // spelling that selects one of them.
     assert!(stdout.contains("svg-trace"), "{stdout}");

@@ -120,8 +120,10 @@ fn print_format_registry() {
     println!();
     println!(
         "Video: png/jpg/webp are frame thumbnails; mp4/webm copy the streams when the codecs \
-         already fit and re-encode otherwise; gif is an animated 12 fps GIF. avi/wmv/mpeg are \
-         always re-encoded; all require ffmpeg (PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg)."
+         already fit and re-encode otherwise; gif is an animated 12 fps GIF. A GIF's frames \
+         become an MP4 instead of a single thumbnail, and mp3/m4a are copied into an MP4 \
+         container without re-encoding. avi/wmv/mpeg are always re-encoded; all require ffmpeg \
+         (PATH, CONVERT2IT_FFMPEG/FFMPEG, or --ffmpeg)."
     );
     println!();
     println!(
@@ -172,7 +174,8 @@ fn print_video_routes() {
     println!(
         "Routing is automatic: a source whose codecs fit the target is stream-copied; any other \
          pair is re-encoded. The video and audio columns list the codecs the target copies \
-         without re-encoding."
+         without re-encoding. A GIF is encoded because an MP4 holds no frame of an image, and \
+         an audio-only source is copied because the MP4 container takes its codec as it is."
     );
 }
 
@@ -868,6 +871,93 @@ fn main() {
         let error = run(cli).unwrap_err();
         assert!(error.contains("ffmpeg produced no output"), "{error}");
         assert!(std::fs::read_dir(&empty_output).unwrap().next().is_none());
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn real_ffmpeg_cli_wraps_audio_and_encodes_a_gif_when_available() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let Some(ffmpeg) = ffmpeg_for_real_test("CLI container-source test") else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "convert2it-cli-container-source-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("out");
+        std::fs::create_dir_all(&output).unwrap();
+        let ffmpeg_text = ffmpeg.to_string_lossy().into_owned();
+        let output_text = output.to_string_lossy().into_owned();
+
+        let mp3 = directory.join("tone.mp3");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join("metadata-tone.mp3"),
+            &mp3,
+        )
+        .unwrap();
+        let gif = directory.join("animation.gif");
+        let generated = std::process::Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=10:duration=1",
+                "-loop",
+                "0",
+            ])
+            .arg(&gif)
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "ffmpeg could not generate the GIF sample: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        for input in [&mp3, &gif] {
+            let cli = parse(&[
+                "--format",
+                "mp4",
+                "--ffmpeg",
+                ffmpeg_text.as_str(),
+                "--output",
+                output_text.as_str(),
+                input.to_string_lossy().as_ref(),
+            ])
+            .unwrap()
+            .unwrap();
+            run(cli).unwrap();
+        }
+
+        let wrapped = std::fs::read(output.join("tone.mp4")).unwrap();
+        assert_eq!(wrapped.get(4..8), Some(b"ftyp".as_slice()));
+        let animated = std::fs::read(output.join("animation.mp4")).unwrap();
+        assert_eq!(animated.get(4..8), Some(b"ftyp".as_slice()));
+
+        // The CLI wrote a copy of the MP3's audio, not a re-encode.
+        let hash = |input: &Path| {
+            let hashed = std::process::Command::new(&ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(input)
+                .args(["-map", "0:a", "-c", "copy", "-f", "md5", "-"])
+                .output()
+                .unwrap();
+            assert!(hashed.status.success());
+            String::from_utf8_lossy(&hashed.stdout).trim().to_owned()
+        };
+        assert_eq!(
+            hash(&mp3),
+            hash(&output.join("tone.mp4")),
+            "the CLI's MP4 does not carry the source audio intact"
+        );
 
         std::fs::remove_dir_all(&directory).unwrap();
     }
